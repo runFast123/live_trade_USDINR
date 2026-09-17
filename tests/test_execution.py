@@ -1,0 +1,282 @@
+"""Tests for the two-leg order sequence.
+
+This is the code that actually places orders, so it is worth being exact about
+what each outcome must do. Nothing here touches a network: the broker is a stub
+that returns whatever fill the test wants.
+
+The cases that matter are the unhappy ones. A near leg that half fills must not
+produce an oversized far leg. A far leg that fails must halt rather than retry.
+A fill that cannot be read must halt rather than be assumed.
+"""
+from __future__ import annotations
+
+import unittest
+from datetime import date
+
+from rollover import rule
+from rollover.broker import BUY, SELL, InstrumentInfo, OrderOutcome
+from rollover.config import RollConfig
+from rollover.engine import HALTED, RollEngine
+from rollover.money import D
+from rollover.quotes import Quote
+
+
+class StubLog:
+    def __init__(self):
+        self.lines = []
+
+    def _add(self, level, message):
+        self.lines.append((level, message))
+
+    def info(self, m): self._add("INFO", m)
+    def warn(self, m): self._add("WARN", m)
+    def error(self, m): self._add("ERROR", m)
+    def alert(self, m): self._add("ALERT", m)
+
+    def text(self):
+        return "\n".join(f"{lvl} {msg}" for lvl, msg in self.lines)
+
+
+class StubBroker:
+    """Returns scripted outcomes and records exactly what was asked of it.
+
+    It mirrors the real broker's contract, including that the dry-run guard
+    lives in place_leg rather than in the engine. That placement is deliberate:
+    it means any future call site is safe by default, so the stub has to honour
+    it or the dry-run tests would be checking the wrong thing.
+    """
+
+    def __init__(self, outcomes, cfg=None):
+        self.outcomes = list(outcomes)
+        self.cfg = cfg
+        self.calls = []          # every request the engine made
+        self.sent = []           # the subset that would reach the exchange
+        self.logged_in = True
+        self.scrip_file_date = date.today()
+
+    def place_leg(self, info, side, qty, limit_price, label):
+        self.calls.append({"token": info.token, "side": side, "qty": qty,
+                           "price": limit_price, "label": label})
+        if self.cfg is not None and self.cfg.dry_run:
+            return OrderOutcome(sent=False, filled_qty=0, requested_qty=qty,
+                                order_ref=None, certain=True, detail="dry run")
+        self.sent.append(self.calls[-1])
+        if not self.outcomes:
+            raise AssertionError(f"unexpected extra order: {label}")
+        return self.outcomes.pop(0)
+
+    def market_open(self): return True
+    def long_qty(self, token): return 1000
+    def refresh_scrip_master_if_stale(self): return False
+    def load_scrip_master(self, force=False): return None
+    def instrument(self, token):
+        return instrument(token, "USDINR" + token)
+
+
+def outcome(filled, requested, certain=True, sent=True, detail="") -> OrderOutcome:
+    return OrderOutcome(sent=sent, filled_qty=filled, requested_qty=requested,
+                        order_ref="X1", certain=certain,
+                        detail=detail or f"filled {filled} of {requested}")
+
+
+def instrument(token, desc):
+    return InstrumentInfo(token=token, symbol="USDINR", sec_desc=desc,
+                          segment="13", lot_size=1000, expiry=date(2026, 9, 28),
+                          instrument="FUTCUR", price_divisor=D("10000000"),
+                          tick=D("0.0025"), tick_units=D("25000"),
+                          low_range=D("93"), high_range=D("99"))
+
+
+class ExecutionCase(unittest.TestCase):
+    def build(self, outcomes, **cfg_kw):
+        cfg_kw.setdefault("dry_run", False)
+        cfg_kw.setdefault("use_live_feed", False)
+        self.cfg = RollConfig(near_token="1769", far_token="1584", **cfg_kw)
+        self.log = StubLog()
+        self.broker = StubBroker(outcomes, self.cfg)
+
+        engine = RollEngine(self.cfg, self.log, ".", broker=self.broker)
+        engine.session.near = instrument("1769", "USDINR26SEPFUT")
+        engine.session.far = instrument("1584", "USDINR26NOVFUT")
+
+        self.near_q = Quote("1769", D("95.9400"), D("95.9450"), 0.0, D("1"),
+                            bid_qty=5000, ask_qty=5000)
+        self.far_q = Quote("1584", D("96.2370"), D("96.2375"), 0.0, D("1"),
+                           bid_qty=5000, ask_qty=5000)
+        self.decision = rule.compute(self.near_q, self.far_q, self.cfg)
+        return engine
+
+
+class TestHappyPath(ExecutionCase):
+    def test_both_legs_fill_and_the_clip_is_counted(self):
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertEqual(len(self.broker.calls), 2)
+        near, far = self.broker.calls
+        self.assertEqual((near["token"], near["side"], near["qty"]),
+                         ("1769", SELL, 1000))
+        self.assertEqual((far["token"], far["side"], far["qty"]),
+                         ("1584", BUY, 1000))
+        self.assertEqual(engine.session.clips_done_today, 1)
+        self.assertIsNone(engine.session.halted_reason)
+        self.assertIn("ROLL COMPLETE", self.log.text())
+
+    def test_the_near_leg_is_sold_before_the_far_leg_is_bought(self):
+        """Near first leaves a failed roll flat, not long two contracts."""
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(self.broker.calls[0]["side"], SELL)
+        self.assertEqual(self.broker.calls[1]["side"], BUY)
+
+    def test_the_limit_prices_from_the_rule_are_the_ones_sent(self):
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(self.broker.calls[0]["price"], self.decision.sell_limit)
+        self.assertEqual(self.broker.calls[1]["price"], self.decision.buy_limit)
+
+    def test_in_flight_is_cleared_afterwards(self):
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertFalse(engine.session.in_flight)
+
+
+class TestNearLegOutcomes(ExecutionCase):
+    def test_a_near_leg_that_does_not_fill_stops_there(self):
+        engine = self.build([outcome(0, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertEqual(len(self.broker.calls), 1)     # no far leg
+        self.assertIsNone(engine.session.halted_reason)
+        self.assertEqual(engine.session.clips_done_today, 0)
+        self.assertIn("No exposure changed", self.log.text())
+
+    def test_a_partial_near_fill_sizes_the_far_leg_to_what_filled(self):
+        """The far leg must follow the fill, not the request."""
+        engine = self.build([outcome(300, 1000), outcome(300, 300)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertEqual(self.broker.calls[0]["qty"], 1000)
+        self.assertEqual(self.broker.calls[1]["qty"], 300)
+        self.assertEqual(engine.session.clips_done_today, 1)
+        self.assertIsNone(engine.session.halted_reason)
+
+    def test_an_unconfirmable_near_fill_halts(self):
+        engine = self.build([outcome(0, 1000, certain=False,
+                                     detail="never appeared in the order book")])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertEqual(len(self.broker.calls), 1)
+        self.assertIsNotNone(engine.session.halted_reason)
+        self.assertIn("could not be confirmed", engine.session.halted_reason)
+
+    def test_a_rejected_near_leg_does_not_send_the_far_leg(self):
+        engine = self.build([outcome(0, 1000, sent=False,
+                                     detail="rejected before reaching the exchange")])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(len(self.broker.calls), 1)
+        self.assertEqual(engine.session.clips_done_today, 0)
+
+
+class TestFarLegFailure(ExecutionCase):
+    def test_a_far_leg_that_does_not_fill_halts_and_alerts(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertIsNotNone(engine.session.halted_reason)
+        self.assertIn("HALF ROLLED", engine.session.halted_reason)
+        self.assertIn("ALERT", self.log.text())
+        self.assertEqual(engine.session.clips_done_today, 0)
+
+    def test_a_partly_filled_far_leg_also_halts(self):
+        engine = self.build([outcome(1000, 1000), outcome(400, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertIsNotNone(engine.session.halted_reason)
+        self.assertIn("short 600", engine.session.halted_reason)
+
+    def test_it_does_not_retry_the_far_leg(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(len(self.broker.calls), 2)     # no third order
+
+    def test_auto_unwind_buys_the_near_leg_back(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000),
+                             outcome(1000, 1000)],
+                            auto_unwind_on_leg2_failure=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertEqual(len(self.broker.calls), 3)
+        unwind = self.broker.calls[2]
+        self.assertEqual((unwind["token"], unwind["side"], unwind["qty"]),
+                         ("1769", BUY, 1000))
+        self.assertIn("bought back", engine.session.halted_reason)
+
+    def test_a_failed_unwind_says_so_loudly(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000),
+                             outcome(0, 1000)],
+                            auto_unwind_on_leg2_failure=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertIn("unwind also failed", engine.session.halted_reason)
+        self.assertIn("terminal immediately", engine.session.halted_reason)
+
+    def test_the_unwind_price_is_above_the_offer(self):
+        """Buying back has to cross, so it is priced through the ask."""
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000),
+                             outcome(1000, 1000)],
+                            auto_unwind_on_leg2_failure=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertGreater(self.broker.calls[2]["price"], self.near_q.ask)
+
+
+class TestDryRun(ExecutionCase):
+    def test_no_order_reaches_the_exchange(self):
+        engine = self.build([], dry_run=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(self.broker.sent, [])
+
+    def test_the_guard_is_in_the_broker_so_every_call_site_is_covered(self):
+        """place_leg is still reached; it is place_leg that refuses to send."""
+        engine = self.build([], dry_run=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertTrue(self.broker.calls)
+        self.assertEqual(self.broker.sent, [])
+
+    def test_it_still_reports_what_it_would_have_done(self):
+        engine = self.build([], dry_run=True)
+        engine._execute(self.decision, self.near_q, self.far_q)
+        text = self.log.text()
+        self.assertIn("DRY RUN", text)
+        self.assertIn("No orders reached the exchange", text)
+        self.assertEqual(engine.session.clips_done_today, 1)
+
+
+class TestHaltBehaviour(ExecutionCase):
+    def test_a_halt_disarms_and_shows_the_state(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000)])
+        engine.arm()
+        self.assertTrue(engine.armed)
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertFalse(engine.armed)
+        self.assertEqual(engine._state, HALTED)
+
+    def test_arming_is_refused_while_halted(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        engine.arm()
+        self.assertFalse(engine.armed)
+
+    def test_clearing_the_halt_lifts_it(self):
+        engine = self.build([outcome(1000, 1000), outcome(0, 1000)])
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertIsNotNone(engine.session.halted_reason)
+
+        # clear_halt restarts the watch loop, which would connect; keep it still.
+        engine.start = lambda: None
+        engine.clear_halt()
+        self.assertIsNone(engine.session.halted_reason)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

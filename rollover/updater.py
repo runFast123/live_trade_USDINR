@@ -187,38 +187,67 @@ def can_install() -> Tuple[bool, str]:
     return True, ""
 
 
-def install_and_restart(new_exe: str) -> None:
-    """Swap the running executable for the new one and start it again.
+def write_swap_script(target: str, new_exe: str, backup: str,
+                      script_path: Optional[str] = None,
+                      relaunch: bool = True) -> str:
+    """Write the batch file that replaces the executable, and return its path.
 
-    Windows will not let a running executable be overwritten, so a small batch
-    file waits for this process to exit, keeps the old build alongside as
-    .old.exe, moves the new one into place and launches it.
+    Windows will not let a running executable be overwritten, so the swap has
+    to outlive this process. The script waits until the target is no longer
+    locked, keeps the old build alongside as .old.exe, moves the new one into
+    place, and puts the old one back if that move fails.
+
+    It gives up after about two minutes. An app that has not closed by then is
+    not merely slow, and leaving a script spinning forever behind the user's
+    back is worse than abandoning the update.
+
+    Kept separate from running it so the swap can be exercised in a test
+    without replacing anything real.
     """
+    if script_path is None:
+        script_path = os.path.join(tempfile.gettempdir(), "roll_app_update.cmd")
+
+    lines = [
+        "@echo off",
+        "setlocal",
+        f'set "TARGET={target}"',
+        f'set "NEWEXE={new_exe}"',
+        f'set "BACKUP={backup}"',
+        "set /a TRIES=0",
+        ":wait",
+        "set /a TRIES+=1",
+        "if %TRIES% GTR 60 goto giveup",
+        "ping -n 2 127.0.0.1 >nul",
+        # Appending nothing to the file fails while it is still running.
+        '2>nul (>>"%TARGET%" call ) || goto wait',
+        'if exist "%BACKUP%" del /q "%BACKUP%"',
+        'move /y "%TARGET%" "%BACKUP%" >nul',
+        'move /y "%NEWEXE%" "%TARGET%" >nul',
+        'if errorlevel 1 move /y "%BACKUP%" "%TARGET%" >nul',
+    ]
+    if relaunch:
+        lines.append('start "" "%TARGET%"')
+    lines += [
+        "goto done",
+        ":giveup",
+        'del /q "%NEWEXE%"',
+        ":done",
+        'del /q "%~f0"',
+    ]
+
+    with open(script_path, "w", encoding="ascii", newline="\r\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return script_path
+
+
+def install_and_restart(new_exe: str) -> None:
+    """Swap the running executable for the new one and start it again."""
     ok, why = can_install()
     if not ok:
         raise UpdateError(why)
 
     target = os.path.abspath(sys.executable)
-    backup = target + ".old.exe"
-
-    script = os.path.join(tempfile.gettempdir(), "roll_app_update.cmd")
-    with open(script, "w", encoding="ascii") as fh:
-        fh.write(
-            "@echo off\r\n"
-            "setlocal\r\n"
-            f'set "TARGET={target}"\r\n'
-            f'set "NEWEXE={new_exe}"\r\n'
-            f'set "BACKUP={backup}"\r\n'
-            ":wait\r\n"
-            'ping -n 2 127.0.0.1 >nul\r\n'
-            '2>nul (>>"%TARGET%" call ) || goto wait\r\n'
-            'if exist "%BACKUP%" del /q "%BACKUP%"\r\n'
-            'move /y "%TARGET%" "%BACKUP%" >nul\r\n'
-            'move /y "%NEWEXE%" "%TARGET%" >nul\r\n'
-            'if errorlevel 1 move /y "%BACKUP%" "%TARGET%" >nul\r\n'
-            'start "" "%TARGET%"\r\n'
-            'del /q "%~f0"\r\n'
-        )
+    script = write_swap_script(target, new_exe, target + ".old.exe")
 
     subprocess.Popen(["cmd", "/c", script],
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)

@@ -23,9 +23,18 @@ not below the 0.30 limit, so nothing is sent.
 python -m unittest discover -s tests -t .
 ```
 
-141 tests. [tests/test_realdata.py](tests/test_realdata.py) is built from real
-captured responses: the scrip master row, the `MultipleTouchline` payload,
-`MarketStatus` and `NetPosition`.
+194 tests, covering the rule, the gates, the order sequence, the price feed and
+the updater.
+
+- [tests/test_realdata.py](tests/test_realdata.py) uses real captured responses:
+  the scrip master row, the `MultipleTouchline` payload, `MarketStatus` and
+  `NetPosition`.
+- [tests/test_feed.py](tests/test_feed.py) uses a real websocket message, which
+  is the only documentation the FIX tags have.
+- [tests/test_execution.py](tests/test_execution.py) covers the two-leg order
+  sequence: partial fills, unreadable fills, and the half-rolled halt.
+- [tests/test_update_install.py](tests/test_update_install.py) runs the real
+  swap script against throwaway files.
 
 ## Install and run
 
