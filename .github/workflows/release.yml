@@ -1,0 +1,82 @@
+name: Build and release
+
+# Tag a commit to publish a build the app can update itself to:
+#   git tag v1.0.1 && git push origin v1.0.1
+#
+# The app will only install a release that publishes a SHA256, so the checksum
+# below is not optional decoration.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pillow
+
+      - name: Run the tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Check the version matches the tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CODE=$(python -c "import rollover; print(rollover.__version__)")
+          echo "tag=$TAG  code=$CODE"
+          if [ "$TAG" != "$CODE" ]; then
+            echo "::error::tag $TAG does not match rollover.__version__ $CODE"
+            exit 1
+          fi
+
+      - name: Generate the icon
+        run: python tools/make_icon.py
+
+      - name: Build
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name roll_app `
+            --icon assets/icon.ico `
+            --add-data "assets;assets" `
+            --collect-all choice_api `
+            --hidden-import websocket --hidden-import tkinter `
+            --exclude-module PyQt5 --exclude-module PyQt6 `
+            --exclude-module PySide2 --exclude-module PySide6 `
+            --exclude-module matplotlib --exclude-module scipy `
+            --exclude-module IPython --exclude-module zmq `
+            --exclude-module notebook --exclude-module jupyter `
+            --exclude-module pytest `
+            roll_app.py
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd dist
+          sha256sum roll_app.exe | tee roll_app.exe.sha256
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/roll_app.exe
+            dist/roll_app.exe.sha256
+          body_path: ${{ github.workspace }}/dist/roll_app.exe.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

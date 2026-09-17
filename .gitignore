@@ -1,0 +1,9 @@
+config.json
+session.json
+logs/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+smoke_logs/
