@@ -60,6 +60,14 @@ DANGER_HOVER = "#ff5d66"
 BUY = BRAND_GREEN       # near leg, the side being sold out of
 SELL = BRAND_GOLD       # far leg, the side being bought into
 
+# Tick flash: a price that moves is briefly tinted, the way every market data
+# screen does it, so a change is noticed rather than merely rendered.
+UP = BRAND_GREEN
+DOWN = BRAND_RED
+UP_TINT = "#10271a"
+DOWN_TINT = "#2b1215"
+FLASH_SECONDS = 0.9
+
 # ---------------------------------------------------------------- spacing
 PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL = 4, 8, 14, 20, 28
 RADIUS = 10

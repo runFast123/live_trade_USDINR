@@ -69,12 +69,15 @@ class RollWindow(tk.Toplevel):
         self._refresh_id = None
         self._last_log_count = -1
         self._updates: "queue.Queue[tuple]" = queue.Queue()
+        # Last seen price per cell, so a change can be shown rather than just
+        # rendered: {cell key: (price, direction, moved_at, delta)}
+        self._ticks: dict = {}
         self._release = None
         self._updating = False
         self._build()
         self._start_update_check()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._refresh_id = self.after(300, self._refresh)
+        self._refresh_id = self.after(200, self._refresh)
 
     # ------------------------------------------------------------------ build
     def _build(self) -> None:
@@ -117,6 +120,10 @@ class RollWindow(tk.Toplevel):
         self.clock = tk.Label(right, text="", bg=T.BG, fg=T.FAINT,
                               font=self.fonts.mono)
         self.clock.pack(side="right", padx=T.PAD_M)
+
+        self.source_pill = T.Pill(right, self.fonts, width=124, height=30)
+        self.source_pill.pack(side="right", padx=(0, T.PAD_S))
+        self.source_pill.set("connecting", T.MUTED)
 
         self.update_button = T.Button(right, "Update", self._do_update, self.fonts,
                                       kind="primary", width=172, height=30)
@@ -162,16 +169,25 @@ class RollWindow(tk.Toplevel):
             cells = {"name": name, "meta": meta}
             for i, (field, caption) in enumerate((("bid", "BID"), ("ask", "ASK"))):
                 cell = tk.Frame(prices, bg=T.SURFACE)
-                cell.grid(row=0, column=i, sticky="we")
-                tk.Label(cell, text=caption, bg=T.SURFACE, fg=T.FAINT,
-                         font=self.fonts.label, anchor="w").pack(fill="x")
+                cell.grid(row=0, column=i, sticky="we", padx=(0, T.PAD_S))
+
+                head = tk.Frame(cell, bg=T.SURFACE)
+                head.pack(fill="x")
+                tk.Label(head, text=caption, bg=T.SURFACE, fg=T.FAINT,
+                         font=self.fonts.label).pack(side="left")
+                delta = tk.Label(head, text="", bg=T.SURFACE, fg=T.SURFACE,
+                                 font=self.fonts.ui_small)
+                delta.pack(side="right")
+
                 value = tk.Label(cell, text="--", bg=T.SURFACE, fg=T.TEXT,
-                                 font=self.fonts.mono_large, anchor="w")
+                                 font=self.fonts.mono_large, anchor="w",
+                                 padx=4)
                 value.pack(fill="x")
                 size = tk.Label(cell, text="", bg=T.SURFACE, fg=T.MUTED,
                                 font=self.fonts.ui_small, anchor="w")
                 size.pack(fill="x")
                 cells[field] = value
+                cells[field + "_delta"] = delta
                 cells[field + "_size"] = size
 
             cells["age"] = tk.Label(top, text="", bg=T.SURFACE, fg=T.FAINT,
@@ -188,9 +204,14 @@ class RollWindow(tk.Toplevel):
         left.pack(side="left")
         tk.Label(left, text="ROLL COST", bg=T.SURFACE, fg=T.FAINT,
                  font=self.fonts.label, anchor="w").pack(fill="x")
-        self.cost = tk.Label(left, text="--", bg=T.SURFACE, fg=T.TEXT,
+        hero = tk.Frame(left, bg=T.SURFACE)
+        hero.pack(fill="x")
+        self.cost = tk.Label(hero, text="--", bg=T.SURFACE, fg=T.TEXT,
                              font=self.fonts.mono_hero, anchor="w")
-        self.cost.pack(fill="x")
+        self.cost.pack(side="left")
+        self.cost_delta = tk.Label(hero, text="", bg=T.SURFACE, fg=T.SURFACE,
+                                   font=self.fonts.ui_medium)
+        self.cost_delta.pack(side="left", padx=(T.PAD_S, 0), anchor="s", pady=(0, 8))
         self.cost_rupees = tk.Label(left, text="", bg=T.SURFACE, fg=T.MUTED,
                                     font=self.fonts.ui, anchor="w")
         self.cost_rupees.pack(fill="x")
@@ -491,7 +512,7 @@ class RollWindow(tk.Toplevel):
             self._draw_log()
         finally:
             if self.winfo_exists():
-                self._refresh_id = self.after(400, self._refresh)
+                self._refresh_id = self.after(200, self._refresh)
 
     def _draw(self, snap) -> None:
         if snap is None:
@@ -499,13 +520,17 @@ class RollWindow(tk.Toplevel):
 
         self.state_pill.set(snap.state.lower(),
                             STATE_COLOUR.get(snap.state, T.MUTED))
+
+        source = snap.quote_source or "connecting"
+        self.source_pill.set(source,
+                             T.SUCCESS if source == "live feed" else T.WARN)
         self.note.configure(text=snap.halted_reason or snap.note,
                             fg=T.DANGER if snap.halted_reason else T.MUTED)
         self.halt_button.set_enabled(bool(snap.halted_reason))
 
         for key, info, quote in (("near", snap.near, snap.near_quote),
                                  ("far", snap.far, snap.far_quote)):
-            self._draw_leg(self.leg_widgets[key], info, quote)
+            self._draw_leg(self.leg_widgets[key], info, quote, key)
 
         self._draw_cost(snap)
         self._draw_gates(snap.report)
@@ -518,7 +543,53 @@ class RollWindow(tk.Toplevel):
             self.arm_timer.configure(text="")
             self.arm_button.set_text("ARM")
 
-    def _draw_leg(self, cells, info, quote) -> None:
+    def _draw_price(self, key: str, value, delta_label, price) -> None:
+        """Show a price, tinted for a moment whenever it moves.
+
+        The loop redraws several times per quote, so the flash is keyed off the
+        price changing and a timestamp, not off the redraw. Without this the
+        numbers update correctly but the panel looks frozen.
+        """
+        seen = self._ticks.get(key)
+        now = time.monotonic()
+
+        if seen is None:
+            self._ticks[key] = (price, 0, 0.0, None)
+        elif price != seen[0]:
+            direction = 1 if price > seen[0] else -1
+            self._ticks[key] = (price, direction, now, price - seen[0])
+
+        _, direction, moved_at, change = self._ticks[key]
+        lit = direction and (now - moved_at) < T.FLASH_SECONDS
+
+        if lit:
+            colour = T.UP if direction > 0 else T.DOWN
+            tint = T.UP_TINT if direction > 0 else T.DOWN_TINT
+            value.configure(text=money(price), fg=colour, bg=tint)
+            delta_label.configure(
+                text=f"{'+' if change > 0 else ''}{money(change)}", fg=colour)
+        else:
+            value.configure(text=money(price), fg=T.TEXT, bg=T.SURFACE)
+            delta_label.configure(text="", fg=T.SURFACE)
+
+    def _draw_delta(self, key: str, label, value) -> None:
+        """Show how much a number just moved, then let it fade."""
+        seen = self._ticks.get(key)
+        now = time.monotonic()
+        if seen is None:
+            self._ticks[key] = (value, 0, 0.0, None)
+        elif value != seen[0]:
+            self._ticks[key] = (value, 1 if value > seen[0] else -1, now,
+                                value - seen[0])
+
+        _, direction, moved_at, change = self._ticks[key]
+        if direction and (now - moved_at) < T.FLASH_SECONDS:
+            label.configure(text=f"{'+' if change > 0 else ''}{money(change)}",
+                            fg=T.UP if direction > 0 else T.DOWN)
+        else:
+            label.configure(text="", fg=T.SURFACE)
+
+    def _draw_leg(self, cells, info, quote, key: str) -> None:
         if info is None:
             cells["name"].configure(text="--")
             cells["meta"].configure(text="")
@@ -532,14 +603,16 @@ class RollWindow(tk.Toplevel):
 
         if quote is None:
             for field in ("bid", "ask"):
-                cells[field].configure(text="--", fg=T.FAINT)
+                cells[field].configure(text="--", fg=T.FAINT, bg=T.SURFACE)
+                cells[field + "_delta"].configure(text="")
                 cells[field + "_size"].configure(text="")
             cells["age"].configure(text="no quote", fg=T.DANGER)
             return
 
         for field, price, size in (("bid", quote.bid, quote.bid_qty),
                                    ("ask", quote.ask, quote.ask_qty)):
-            cells[field].configure(text=money(price), fg=T.TEXT)
+            self._draw_price(f"{key}_{field}", cells[field],
+                             cells[field + "_delta"], price)
             if size is None:
                 cells[field + "_size"].configure(text="")
             else:
@@ -547,15 +620,23 @@ class RollWindow(tk.Toplevel):
                 cells[field + "_size"].configure(
                     text=f"{size:,} resting", fg=T.MUTED if enough else T.WARN)
 
-        age = quote.age()
-        fresh = age <= self.cfg.max_quote_age_sec
-        cells["age"].configure(text=f"{age:.1f}s ago",
-                               fg=T.FAINT if fresh else T.DANGER)
+        # On the websocket the quote is always current, so what is worth
+        # showing is when the book last moved. On the polled fallback it is how
+        # old the snapshot is, which is the thing to worry about.
+        moved = quote.since_move()
+        if moved is not None:
+            cells["age"].configure(text=f"moved {moved:.1f}s ago", fg=T.FAINT)
+        else:
+            age = quote.age()
+            fresh = age <= self.cfg.max_quote_age_sec
+            cells["age"].configure(text=f"read {age:.1f}s ago",
+                                   fg=T.FAINT if fresh else T.DANGER)
 
     def _draw_cost(self, snap) -> None:
         dec = snap.decision
         if dec is None:
             self.cost.configure(text="--", fg=T.FAINT)
+            self.cost_delta.configure(text="", fg=T.SURFACE)
             self.cost_rupees.configure(text="")
             self.verdict.configure(text="NO DATA", fg=T.DANGER)
             self.verdict_note.configure(text="")
@@ -564,8 +645,11 @@ class RollWindow(tk.Toplevel):
             return
 
         ready = snap.report.ok if snap.report else False
+        # The cost keeps its own colour, which says whether it qualifies. The
+        # movement is shown beside it instead, so the two never fight.
         self.cost.configure(text=money(dec.roll_cost),
                             fg=T.SUCCESS if dec.qualifies else T.TEXT)
+        self._draw_delta("roll_cost", self.cost_delta, dec.roll_cost)
         self.cost_rupees.configure(
             text=f"Rs {money(dec.cost_per_lot, 2)} for {self.cfg.lots} lot"
                  f"{'s' if self.cfg.lots != 1 else ''}")

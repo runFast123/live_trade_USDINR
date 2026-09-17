@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import re
 import time
+import urllib.error
+import urllib.request
+from datetime import timedelta
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -160,10 +163,18 @@ def _iter_records(node: Any):
 class Broker:
     """Thin, defensive wrapper over the kkunal ChoiceClient."""
 
+    SCRIP_URL = ("https://scripmaster.choiceindia.com/scripmaster/"
+                 "SCRIP_MASTER_{stamp}.csv")
+
     def __init__(self, cfg, log):
         self.cfg = cfg
         self.log = log
         self.client = None
+        # Which day's scrip master is in memory. The file changes every trading
+        # day: contracts expire out of it, new ones appear, and every circuit
+        # band moves. An app left running overnight must not keep yesterday's.
+        self.scrip_loaded_on: Optional[date] = None
+        self.scrip_file_date: Optional[date] = None
 
     # ------------------------------------------------------------- connection
     #
@@ -263,13 +274,60 @@ class Broker:
         self.log.info("Login complete.")
         self.load_scrip_master()
 
-    def load_scrip_master(self) -> None:
-        if self.client.scrip_master.is_loaded:
+    def published_scrip_date(self) -> Optional[date]:
+        """Which day's scrip master is actually published right now.
+
+        The library's fetch quietly falls back to previous days, so asking
+        directly is the only way to know whether what got loaded is current.
+        """
+        for back in range(3):
+            day = date.today() - timedelta(days=back)
+            url = self.SCRIP_URL.format(stamp=day.strftime("%d%b%Y"))
+            request = urllib.request.Request(
+                url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    if 200 <= response.status < 300:
+                        return day
+            except (urllib.error.URLError, OSError, ValueError):
+                continue
+        return None
+
+    def load_scrip_master(self, force: bool = False) -> None:
+        loaded = self.client.scrip_master.is_loaded
+        if loaded and not force and self.scrip_loaded_on == date.today():
             return
+
         self.log.info("Fetching scrip master...")
+        # A refresh replaces the file wholesale rather than merging into a
+        # day-old index, which would leave expired contracts behind.
+        if force or self.scrip_loaded_on not in (None, date.today()):
+            master = self.client.scrip_master
+            master.symbol_to_rows.clear()
+            master.token_to_details.clear()
+            master.all_rows.clear()
+            master.is_loaded = False
+
         if not self.client.scrip_master.fetch():
             raise BrokerError("could not download the scrip master; contracts cannot "
                               "be verified, so the app will not trade")
+
+        self.scrip_loaded_on = date.today()
+        self.scrip_file_date = self.published_scrip_date()
+        if self.scrip_file_date == date.today():
+            self.log.info(f"Scrip master loaded for {self.scrip_file_date}.")
+        else:
+            self.log.warn(
+                f"The newest published scrip master is {self.scrip_file_date}, "
+                f"not {date.today()}. Contract details may be a day behind.")
+
+    def refresh_scrip_master_if_stale(self) -> bool:
+        """Reload once the calendar day turns over. True when it reloaded."""
+        if self.scrip_loaded_on == date.today():
+            return False
+        self.log.info("The date has changed; reloading the scrip master.")
+        self.load_scrip_master(force=True)
+        return True
 
     def connect(self, session_path: str) -> None:
         """Whole login in one call, for the command line where nobody can type

@@ -154,6 +154,19 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
         else f"near {near_info.lot_size}, far {far_info.lot_size}, "
              f"config expects {cfg.expected_lot_size}")
 
+    # ---- is the contract data current? -------------------------------------
+    file_date = getattr(session, "scrip_file_date", None)
+    if not cfg.require_fresh_scrip:
+        add("scrip master fresh", True, "freshness check disabled in config")
+    elif file_date is None:
+        add("scrip master fresh", False,
+            "cannot tell which day's scrip master is loaded")
+    else:
+        add("scrip master fresh", file_date == today,
+            f"today's file, {file_date}" if file_date == today
+            else f"loaded file is from {file_date}, not {today}; expiries and "
+                 "circuit limits may be a day behind")
+
     # ---- trading window ----------------------------------------------------
     in_window = cfg.window_open_t <= now.time() <= cfg.window_close_t
     add("trading window", in_window,

@@ -58,6 +58,7 @@ class Quote:
     divisor: Decimal
     bid_qty: Optional[int] = None   # size resting at the top of book
     ask_qty: Optional[int] = None
+    moved_at: Optional[float] = None  # when the book last actually changed
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def age(self, now: Optional[float] = None) -> float:
@@ -66,6 +67,12 @@ class Quote:
     @property
     def spread(self) -> Decimal:
         return self.ask - self.bid
+
+    def since_move(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the book last changed, as opposed to since we read it."""
+        if self.moved_at is None:
+            return None
+        return (time.monotonic() if now is None else now) - self.moved_at
 
 
 def _walk_records(node: Any, out: List[dict]) -> None:
@@ -78,6 +85,13 @@ def _walk_records(node: Any, out: List[dict]) -> None:
     elif isinstance(node, list):
         for item in node:
             _walk_records(item, out)
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        return int(D(value))
+    except Exception:
+        return None
 
 
 def _record_token(record: dict) -> Optional[str]:
@@ -189,7 +203,12 @@ class QuoteReader:
     def __init__(self, client, cfg):
         self.client = client
         self.cfg = cfg
-        self.divisor: Optional[Decimal] = None
+        self.divisor: Optional[Decimal] = None      # the last one used, for display
+        # The two sources legitimately use different scales: the websocket
+        # sends raw exchange units while REST sends rupees. The guard against a
+        # scale changing under us therefore has to be kept per source, or
+        # falling back from one to the other would look like corruption.
+        self._divisors: Dict[str, Decimal] = {}
         self.bid_key: Optional[str] = None
         self.ask_key: Optional[str] = None
         self.last_raw: Any = None
@@ -311,16 +330,69 @@ class QuoteReader:
             raw_values[token] = (bid, ask)
             sizes[token] = (bid_qty, ask_qty)
 
+        return self._finish(raw_values, sizes, at, by_token, source="touchline")
+
+    def from_feed(self, ticks: Dict[str, Any], tokens: List[str],
+                  at: Optional[float] = None) -> Dict[str, Quote]:
+        """Build quotes from websocket ticks, through the same checks as REST.
+
+        The feed states the price scale per message in tag 399. It is used as a
+        candidate and still verified against the contract's price band, exactly
+        as the scrip master's divisor is.
+        """
+        at = time.monotonic() if at is None else at
+        raw_values: Dict[str, Tuple[Decimal, Decimal]] = {}
+        sizes: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+        moved: Dict[str, float] = {}
+        declared: List[Decimal] = []
+
+        for token in (str(t) for t in tokens):
+            tick = ticks.get(token)
+            if tick is None:
+                raise QuoteError(f"no live tick for token {token}")
+            try:
+                bid, ask = D(tick.bid), D(tick.ask)
+            except PriceError as exc:
+                raise QuoteError(f"token {token}: unreadable live price ({exc})") from exc
+            if bid <= 0 or ask <= 0:
+                raise QuoteError(
+                    f"token {token}: no two-sided market on the live feed "
+                    f"(bid={bid}, ask={ask})")
+            raw_values[token] = (bid, ask)
+            sizes[token] = (_as_int(tick.bid_qty), _as_int(tick.ask_qty))
+            moved[token] = tick.at
+            if tick.divisor:
+                try:
+                    value = D(tick.divisor)
+                    if value > 0 and value not in declared:
+                        declared.append(value)
+                except PriceError:
+                    pass
+
+        return self._finish(raw_values, sizes, at,
+                            {t: ticks[t].raw for t in raw_values},
+                            extra_divisors=tuple(declared), source="live feed",
+                            moved=moved)
+
+    def _finish(self, raw_values, sizes, at, by_token,
+                extra_divisors: Tuple[Decimal, ...] = (),
+                source: str = "touchline",
+                moved: Optional[Dict[str, float]] = None) -> Dict[str, Quote]:
         flat = [v for pair in raw_values.values() for v in pair]
         forced = D(self.cfg.price_divisor) if self.cfg.price_divisor else None
         low, high = self._band()
-        divisor = detect_divisor(flat, low, high, forced, self._divisor_candidates())
+        candidates = tuple(extra_divisors) + tuple(
+            d for d in self._divisor_candidates() if d not in extra_divisors)
+        divisor = detect_divisor(flat, low, high, forced, candidates)
 
-        if self.divisor is not None and divisor != self.divisor:
+        known = self._divisors.get(source)
+        if known is not None and divisor != known:
             raise QuoteError(
-                f"price scale changed mid-session ({self.divisor} -> {divisor}). "
-                "Refusing to trade until this is understood."
+                f"the {source} price scale changed mid-session "
+                f"({known} -> {divisor}). Refusing to trade until this is "
+                "understood."
             )
+        self._divisors[source] = divisor
         self.divisor = divisor
 
         quotes: Dict[str, Quote] = {}
@@ -337,5 +409,6 @@ class QuoteReader:
             quotes[token] = Quote(
                 token=token, bid=bid_r, ask=ask_r, at=at, divisor=divisor,
                 bid_qty=bid_qty, ask_qty=ask_qty, raw=by_token[token],
+                moved_at=(moved or {}).get(token),
             )
         return quotes

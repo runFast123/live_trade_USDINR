@@ -62,6 +62,8 @@ class FakeSession:
         self.clips_done_today = kw.get("clips_done_today", 0)
         self.in_flight = kw.get("in_flight", False)
         self.halted_reason = kw.get("halted_reason")
+        self.scrip_file_date = kw.get("scrip_file_date", date(2026, 9, 17))
+        self.quote_source = kw.get("quote_source", "live feed")
 
 
 class TestScripMasterColumns(unittest.TestCase):

@@ -31,6 +31,8 @@ class FakeSession:
         self.clips_done_today = kw.get("clips_done_today", 0)
         self.in_flight = kw.get("in_flight", False)
         self.halted_reason = kw.get("halted_reason")
+        self.scrip_file_date = kw.get("scrip_file_date", date(2026, 9, 17))
+        self.quote_source = kw.get("quote_source", "live feed")
 
 
 def make_instrument(token, expiry, lot_size=1000, desc="USDINR",
@@ -187,6 +189,16 @@ class TestTouchlineParsing(unittest.TestCase):
             self.reader.parse({"Status": "Failure", "Response": None},
                               ["1001"], time.monotonic())
 
+    def test_each_source_keeps_its_own_scale(self):
+        """The websocket sends exchange units and REST sends rupees; falling
+        back from one to the other is not a corrupted scale."""
+        self.reader.parse(self.payload(), ["1001", "1002"], time.monotonic())
+        self.assertEqual(self.reader._divisors["touchline"], D("100"))
+        self.reader._divisors["live feed"] = D("10000000")
+        # Polling again must still be fine.
+        self.reader.parse(self.payload(), ["1001", "1002"], time.monotonic())
+        self.assertEqual(self.reader._divisors["touchline"], D("100"))
+
     def test_scale_cannot_change_mid_session(self):
         self.reader.parse(self.payload(), ["1001", "1002"], time.monotonic())
         rupees = {"Response": [
@@ -208,6 +220,9 @@ class TestGates(unittest.TestCase):
         self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
 
     def report(self, **session_kw):
+        # The scrip master is today's unless a test says otherwise, where
+        # "today" is whatever clock the test is running against.
+        session_kw.setdefault("scrip_file_date", self.now.date())
         session = FakeSession(near=self.near, far=self.far, **session_kw)
         return gates.evaluate(self.cfg, session, self.quotes, self.decision, self.now)
 
@@ -492,6 +507,40 @@ class TestLoginThreading(unittest.TestCase):
         from rollover.login import LoginWindow
         params = list(inspect.signature(LoginWindow._work_start).parameters)
         self.assertEqual(params, ["self", "force_fresh"])
+
+
+class TestScripFreshnessGate(unittest.TestCase):
+    """A scrip master from a previous day has stale expiries and stale bands."""
+
+    def setUp(self):
+        self.cfg = RollConfig(near_token="1001", far_token="1002",
+                              near_expiry="2026-09-28", far_expiry="2026-11-26")
+        self.near = make_instrument("1001", date(2026, 9, 28), desc="USDINR SEP26")
+        self.far = make_instrument("1002", date(2026, 11, 26), desc="USDINR NOV26")
+        self.now = datetime(2026, 9, 17, 11, 0, 0)
+        self.quotes = {"1001": quote("1001", "95.9400", "95.9450"),
+                       "1002": quote("1002", "96.2370", "96.2375")}
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+
+    def report(self, **session_kw):
+        session_kw.setdefault("scrip_file_date", self.now.date())
+        session = FakeSession(near=self.near, far=self.far, **session_kw)
+        return gates.evaluate(self.cfg, session, self.quotes, self.decision, self.now)
+
+    def test_todays_file_passes(self):
+        self.assertTrue(self.report(scrip_file_date=date(2026, 9, 17)).ok)
+
+    def test_yesterdays_file_blocks(self):
+        report = self.report(scrip_file_date=date(2026, 9, 16))
+        self.assertFalse(report.ok)
+        self.assertIn("may be a day behind", str(report))
+
+    def test_an_unknown_file_date_blocks(self):
+        self.assertFalse(self.report(scrip_file_date=None).ok)
+
+    def test_the_check_can_be_waived(self):
+        self.cfg.require_fresh_scrip = False
+        self.assertTrue(self.report(scrip_file_date=date(2026, 9, 16)).ok)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,8 @@ class RollConfig:
 
     # --- timing ------------------------------------------------------------
     poll_interval_sec: float = 1.0
+    use_live_feed: bool = True           # websocket first, polling as fallback
+    feed_max_silence: float = 120.0      # silence past this and the feed is doubted
     window_open: str = "09:05"
     window_close: str = "16:55"
     expiry_day_cutoff: str = "12:25"     # near leg stops trading 12:30 on its expiry day
@@ -85,6 +87,7 @@ class RollConfig:
     fill_timeout_sec: float = 2.0        # unfilled remainder is cancelled after this
     max_clips_per_day: int = 1
     require_market_status: bool = True   # False = trust window_open/window_close instead
+    require_fresh_scrip: bool = True     # refuse if the scrip master is not today's
     require_position: bool = True        # refuse to sell a near leg you do not hold
     require_touch_size: bool = True      # refuse unless both touches can fill the clip
     auto_unwind_on_leg2_failure: bool = False

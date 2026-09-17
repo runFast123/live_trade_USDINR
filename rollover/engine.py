@@ -17,6 +17,7 @@ from . import gates as gatelib
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
 from .config import RollConfig
+from .feed import LiveFeed
 from .logbook import Logbook
 from .money import ceil_tick, money
 from .quotes import Quote, QuoteError, QuoteReader
@@ -41,6 +42,8 @@ class SessionState:
     clips_done_today: int = 0
     in_flight: bool = False
     halted_reason: Optional[str] = None
+    scrip_file_date = None          # which day's scrip master is loaded
+    quote_source: str = "starting"  # "live feed" or "polled"
 
 
 @dataclass
@@ -59,6 +62,7 @@ class Snapshot:
     note: str = ""
     clips_done: int = 0
     halted_reason: Optional[str] = None
+    quote_source: str = ""
 
 
 class RollEngine:
@@ -70,6 +74,8 @@ class RollEngine:
         # The login window hands over a broker that is already signed in.
         self.broker = broker or Broker(cfg, log)
         self.reader: Optional[QuoteReader] = None
+        self.feed = LiveFeed(cfg, log)
+        self.quote_source = "starting"
         self.session = SessionState()
 
         self._thread: Optional[threading.Thread] = None
@@ -92,6 +98,7 @@ class RollEngine:
 
     def stop(self) -> None:
         self._stop.set()
+        self.feed.stop()
         if self._thread:
             self._thread.join(timeout=5)
 
@@ -190,6 +197,12 @@ class RollEngine:
             self.session.far.token: self.session.far,
         })
 
+        self.session.scrip_file_date = self.broker.scrip_file_date
+
+        if self.cfg.use_live_feed:
+            self.feed.start(self.broker.client,
+                            [self.session.near.token, self.session.far.token])
+
         for role, info in (("Near leg (SELL)", self.session.near),
                            ("Far leg  (BUY) ", self.session.far)):
             self.log.info(
@@ -198,7 +211,22 @@ class RollEngine:
                 f"limits {info.low_range}..{info.high_range}")
 
     def _slow_refresh(self) -> None:
-        """Position and market status, which do not need to be read every tick."""
+        """Position, market status, and the day's scrip master."""
+        try:
+            if self.broker.refresh_scrip_master_if_stale():
+                # New day, new file: the contracts must be read again, since
+                # their expiries and circuit limits have all moved.
+                self.session.near = self.broker.instrument(self.cfg.near_token)
+                self.session.far = self.broker.instrument(self.cfg.far_token)
+                self.reader.set_instruments({
+                    self.session.near.token: self.session.near,
+                    self.session.far.token: self.session.far,
+                })
+                self.session.scrip_file_date = self.broker.scrip_file_date
+                self.log.info("Contracts re-read from the new scrip master.")
+        except Exception as exc:
+            self.log.error(f"Could not refresh the scrip master: {exc}")
+
         self.session.market_open = self.broker.market_open()
         if self.cfg.require_position and self.session.near:
             self.session.near_position_qty = self.broker.long_qty(self.session.near.token)
@@ -233,6 +261,29 @@ class RollEngine:
             elapsed = time.monotonic() - cycle_started
             self._stop.wait(max(0.1, self.cfg.poll_interval_sec - elapsed))
 
+    def _read_quotes(self, tokens: List[str]):
+        """Take the websocket when it is live, and poll only when it is not.
+
+        The REST touchline is a cached snapshot and has been seen many minutes
+        behind, so it is the fallback rather than the source.
+        """
+        if self.cfg.use_live_feed and self.feed.healthy(
+                tokens, self.cfg.feed_max_silence):
+            quotes = self.reader.from_feed(self.feed.ticks(), tokens)
+            self._set_source("live feed")
+            return quotes
+
+        quotes = self.reader.fetch(tokens)
+        self._set_source("polled" if not self.feed.connected
+                         else "polled, feed stale")
+        return quotes
+
+    def _set_source(self, source: str) -> None:
+        if source != self.quote_source:
+            self.log.info(f"Quotes now coming from the {source}.")
+        self.quote_source = source
+        self.session.quote_source = source
+
     def _complain(self, level: str, message: str, every: float = 60.0) -> None:
         """Log a recurring problem once, then at most once a minute.
 
@@ -253,7 +304,7 @@ class RollEngine:
             self._slow_refresh()
             self._last_slow_refresh = now
 
-        quotes = self.reader.fetch(tokens)
+        quotes = self._read_quotes(tokens)
         self._last_complaint = ("", 0.0)
         near_q = quotes[self.session.near.token]
         far_q = quotes[self.session.far.token]
@@ -385,6 +436,7 @@ class RollEngine:
             note=note,
             clips_done=self.session.clips_done_today,
             halted_reason=self.session.halted_reason,
+            quote_source=self.quote_source,
         )
         with self._lock:
             self._snapshot = snap

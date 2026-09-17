@@ -95,6 +95,7 @@ duplicated order, a wrong price scale or a half-completed roll is not.
 
 | # | Gate | Blocks when |
 |---|---|---|
+| 0 | Scrip master is today's | the contract file is from a previous day, so expiries and circuit limits are behind |
 | 1 | Not halted | a previous problem has not been cleared by a human |
 | 2 | No order in flight | an order from this app is already working |
 | 3 | Session | not logged in |
@@ -113,7 +114,7 @@ duplicated order, a wrong price scale or a half-completed roll is not.
 | 16 | Clips remaining | the day's clip budget is already used |
 | 17 | Position | you are not long enough of the near contract, or it cannot be read |
 | 18 | Quotes | either leg has no quote |
-| 19 | Quote freshness | either quote is older than 3 seconds |
+| 19 | Quote freshness | either quote is older than 3 seconds, or the live feed has gone silent |
 | 20 | Leg spread | either leg's own bid/ask spread is wider than 0.0500 |
 | 21 | Two-sided market | either leg has an empty bid or ask, or a crossed book |
 | 22 | Touch size | the size resting at the near bid or the far ask cannot fill the clip |
@@ -123,6 +124,27 @@ duplicated order, a wrong price scale or a half-completed roll is not.
 | 26 | Roll cost plausible | the roll cost is outside -2.00 to +5.00 (treated as bad data) |
 | 27 | Roll cost below limit | `roll_cost >= ROLL_LIMIT`, or `worst_case >= ROLL_LIMIT` |
 | 28 | Armed | the operator has not armed the app, or the arming has expired |
+
+### Where the prices come from
+
+The websocket feed is the source. The REST touchline is a **cached snapshot**:
+polled three seconds apart it returns an identical payload, its own server
+timestamp included, and a quiet far month has been seen thirteen minutes behind.
+A roll cost computed from that is not the current cost.
+
+The websocket pushes a message whenever the book moves, and states the price
+scale in the message. Polling remains as the fallback for when the socket is
+down, and the app says on screen which of the two it is using.
+
+A push feed is silent while nothing changes, so silence is not staleness: the
+last message still describes the book. What is dangerous is a socket that has
+quietly died, so the feed counts as usable only while the connection is up, both
+legs have been seen, and something has arrived within the last two minutes.
+Otherwise the app falls back to polling.
+
+The two sources use different scales, and neither is converted into the other:
+the feed sends exchange units, REST sends rupees. Each is verified separately
+against the contract's price band.
 
 ### Gate 22, the size at the touch
 
@@ -159,6 +181,11 @@ scrip master row and then checked:
 
 Segment 13 holds around 14,000 rows and all but about 170 are options. Only
 futures are ever offered as a leg.
+
+The file changes every trading day: contracts expire out of it, new ones appear,
+and every circuit limit moves. The app reloads it when the calendar day turns
+over, re-reads both contracts from the new file, and refuses to trade on a file
+that is not today's.
 
 ### Gates 24 and 25, the price scale
 

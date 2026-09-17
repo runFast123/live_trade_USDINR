@@ -23,7 +23,7 @@ not below the 0.30 limit, so nothing is sent.
 python -m unittest discover -s tests -t .
 ```
 
-118 tests. [tests/test_realdata.py](tests/test_realdata.py) is built from real
+141 tests. [tests/test_realdata.py](tests/test_realdata.py) is built from real
 captured responses: the scrip master row, the `MultipleTouchline` payload,
 `MarketStatus` and `NetPosition`.
 
@@ -55,7 +55,9 @@ expects, cannot be saved.
 ### 3. Watch
 
 Both legs with the size resting at each touch, the roll cost against the limit,
-and every safety gate with the blocking ones listed first.
+and every safety gate with the blocking ones listed first. Prices flash green or
+red as they move, with the size of the move beside them, and a pill in the header
+says whether they are coming from the **live feed** or from **polling**.
 
 - **ARM** allows the next qualifying quote to trade. It expires after 120
   seconds and the app never arms itself.
@@ -133,6 +135,13 @@ roll_app.exe --selftest      run the rule on worked examples, no network
 
 ## Things worth knowing
 
+- **The REST touchline is cached.** Polled three seconds apart it returns an
+  identical payload, server timestamp included, and a quiet far month has been
+  seen thirteen minutes behind. The websocket feed is the real source; polling
+  is only the fallback, and the header says which is in use.
+- **The scrip master is reloaded when the day turns over**, because contracts
+  expire out of it and every circuit limit moves. The app will not trade on a
+  file that is not today's.
 - **Two different price scales.** The quote feed returns rupees. Order prices go
   in the contract's own exchange units, which is the rupee price times the
   `PriceDivisor` the scrip master declares: 100 for equity, **10000000** for
