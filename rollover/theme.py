@@ -133,8 +133,9 @@ class Button(tk.Canvas):
         }[kind]
 
         parent_bg = parent.cget("bg") if "bg" in parent.keys() else BG
+        # takefocus so the button is reachable by Tab, which a bare Canvas is not.
         super().__init__(parent, width=width, height=height, bg=parent_bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2", takefocus=1)
 
         self._command = command
         self._enabled = True
@@ -146,6 +147,9 @@ class Button(tk.Canvas):
 
         self._shape = round_rect(self, 1, 1, width - 1, height - 1, RADIUS,
                                  fill=self.palette[0], outline="")
+        # Drawn only while focused, so keyboard users can see where they are.
+        self._focus_ring = round_rect(self, 2, 2, width - 2, height - 2, RADIUS,
+                                      fill="", outline="", width=2)
         self._text = self.create_text(width / 2, height / 2, text=self._label,
                                       fill=self.palette[2], font=fonts.ui_medium)
 
@@ -153,6 +157,11 @@ class Button(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Return>", self._activate)
+        self.bind("<KP_Enter>", self._activate)
+        self.bind("<space>", self._activate)
 
     def _on_enter(self, _e=None):
         if self._enabled:
@@ -172,9 +181,24 @@ class Button(tk.Canvas):
         self.move(self._text, 0, -1)
         self._command()
 
+    def _on_focus_in(self, _e=None):
+        if self._enabled:
+            self.itemconfigure(self._focus_ring, outline=TEXT)
+
+    def _on_focus_out(self, _e=None):
+        self.itemconfigure(self._focus_ring, outline="")
+
+    def _activate(self, _e=None):
+        """Keyboard activation, so the button is not mouse only."""
+        if self._enabled:
+            self._command()
+        return "break"
+
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
-        self.configure(cursor="hand2" if enabled else "arrow")
+        self.configure(cursor="hand2" if enabled else "arrow", takefocus=enabled)
+        if not enabled:
+            self.itemconfigure(self._focus_ring, outline="")
         self.itemconfigure(self._shape,
                            fill=self.palette[0] if enabled else SURFACE_2)
         self.itemconfigure(self._text,
