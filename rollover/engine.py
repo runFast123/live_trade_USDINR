@@ -11,10 +11,11 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import gates as gatelib
 from . import ladder as ladderlib
+from . import reconcile
 from . import limits as limitlib
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
@@ -416,6 +417,34 @@ class RollEngine:
         except Exception:
             return None
 
+    def _confirm_trades(self, leg1, leg2, before_trades) -> None:
+        """Compare the order book's fills against the exchange's trade record.
+
+        Two independent accounts of the same event. The order book is what the
+        app has always read; the trade book is what actually executed. This
+        does not halt on its own -- a trade book whose row shape is not yet
+        known would then halt every roll -- but a disagreement is written down
+        loudly, because it means one of the two is wrong and the roll is about
+        to be declared complete on the strength of it.
+        """
+        if before_trades is None:
+            self.log.warn("The trade book could not be read before the roll, so "
+                          "the fills rest on the order book alone.")
+            return
+
+        for leg, side, outcome in (("near", SELL, leg1), ("far", BUY, leg2)):
+            token = (self.cfg.near_token if leg == "near" else self.cfg.far_token)
+            traded, detail = self.broker.traded_since(before_trades, token, side)
+            if traded is None:
+                self.log.warn(f"Trade book, {leg} leg: {detail}")
+            elif traded != outcome.filled_qty:
+                self.log.alert(
+                    f"TRADE BOOK DISAGREES on the {leg} leg: the order book says "
+                    f"{outcome.filled_qty} filled, the trade book shows {traded} "
+                    f"({detail}). One of them is wrong; check the terminal.")
+            else:
+                self.log.info(f"Trade book confirms the {leg} leg: {traded}.")
+
     def _credit_rung(self, decision, qty: int) -> None:
         """Record a fill against the rung that was being worked."""
         rung = getattr(decision, "active_rung", None)
@@ -428,6 +457,63 @@ class RollEngine:
             f"Ladder: {qty:,} credited to the {money(rung.rung.bps, 0)} bps rung; "
             f"{done:,} of {self.ladder.total_qty:,} rolled, "
             f"{self.ladder.remaining_total(self.ladder_progress):,} left.")
+
+    def cancel_all(self) -> Tuple[int, int, Optional[str]]:
+        """Cancel every order still live on either leg.
+
+        Returns (cancelled, failed, problem). `problem` is set when the book
+        could not be read at all, which is the case a caller must not read as
+        "nothing was working".
+        """
+        if self.cfg.dry_run:
+            return 0, 0, None
+
+        tokens = [t for t in (self.cfg.near_token, self.cfg.far_token) if t]
+        live = self.broker.working_orders(tokens)
+        if live is None:
+            return 0, 0, ("the order book could not be read, so it is not known "
+                          "whether anything is still working at the exchange")
+        if not live:
+            return 0, 0, None
+
+        self.log.warn(f"Cancelling {len(live)} working order(s).")
+        cancelled = failed = 0
+        for record in live:
+            if self.broker.cancel_record(record):
+                cancelled += 1
+            else:
+                failed += 1
+        return cancelled, failed, None
+
+    def shutdown(self) -> Optional[str]:
+        """Close down without leaving orders behind.
+
+        A Day order outlives this process at the exchange, and the synthetic
+        IOC that would have cancelled it dies with the process. Closing the
+        window therefore has to cancel, not merely stop watching.
+
+        Returns a message when something was left in doubt, so the window can
+        show it rather than closing over the top of it.
+        """
+        self.disarm("window closing")
+
+        problem = None
+        try:
+            cancelled, failed, unreadable = self.cancel_all()
+            if unreadable:
+                problem = unreadable + ". Check the terminal."
+            elif failed:
+                problem = (f"{failed} order(s) could not be cancelled and may "
+                           "still be live at the exchange. Check the terminal.")
+            elif cancelled:
+                self.log.info(f"Cancelled {cancelled} working order(s) on the way out.")
+        except Exception as exc:
+            problem = f"cancelling on the way out failed: {exc}. Check the terminal."
+
+        if problem:
+            self.log.alert(problem)
+        self.stop()
+        return problem
 
     def reset_ladder(self) -> None:
         """Start the campaign again. The operator's decision, never the app's."""
@@ -519,6 +605,18 @@ class RollEngine:
         self.log.info("--- ROLL ---")
         self.log.info(decision.describe().replace("\n", " | "))
 
+        # Read before anything is sent. Both are the baseline for afterwards:
+        # the position book says what the account held, the trade book says
+        # what had already executed today, and without the "before" neither
+        # can tell our fills apart from everyone else's.
+        before_positions = None
+        before_trades = None
+        if not self.cfg.dry_run:
+            before_positions = reconcile.capture(
+                self.broker, self.cfg.near_token, self.cfg.far_token)
+            before_trades = self.broker._trade_snapshot()
+            self.log.info(f"Before the roll: {before_positions.describe()}")
+
         try:
             leg1 = self.broker.place_leg(
                 self.session.near, SELL, decision.qty, decision.sell_limit,
@@ -552,6 +650,26 @@ class RollEngine:
             self.log.info(f"leg 2 result: {leg2.detail}")
 
             if leg2.fully_filled:
+                self._confirm_trades(leg1, leg2, before_trades)
+
+                # The order book is the broker's summary of what it believes.
+                # The position book is what the account actually holds. Saying
+                # ROLL COMPLETE without comparing them takes one on trust.
+                verdict = reconcile.check(
+                    self.broker, self.cfg.near_token, self.cfg.far_token,
+                    before_positions or reconcile.Positions(None, None),
+                    leg2.filled_qty, wait=self.cfg.reconcile_wait_sec)
+                if verdict.contradicted:
+                    # Count the clip before halting: whatever else is wrong,
+                    # this much was sent, and the daily budget must reflect it.
+                    self._count_clip(leg2.filled_qty)
+                    self.halt("BOTH LEGS REPORTED FILLED, BUT " + verdict.detail)
+                    return
+                if verdict.checked:
+                    self.log.info(verdict.detail)
+                else:
+                    self.log.warn(verdict.detail)
+
                 self._count_clip(leg2.filled_qty)
                 self._credit_rung(decision, leg2.filled_qty)
                 self.log.info(

@@ -62,6 +62,15 @@ _FILLED_KEYS = ("FilledQty", "TradedQty", "FilledQuantity", "ExecutedQty",
 _STATUS_KEYS = ("OrderStatus", "Status", "OrdStatus", "OrderStatusDesc", "Stat")
 _NET_QTY_KEYS = ("NetQty", "NetQuantity", "NetQTY", "Netqty", "NQty")
 
+# The trade book came back empty from the live probe, so its row shape is the
+# one thing about it still unconfirmed. These follow the order book's naming,
+# which the probe did confirm, with the usual aliases behind them. Anything not
+# covered here reads as unknown rather than as zero.
+_TRADE_NO_KEYS = ("TradeNo", "TradeNumber", "ExchangeTradeNo", "FillId",
+                  "TradeId", "ExchangeOrderNo", "ClientOrderNo")
+_TRADE_QTY_KEYS = ("TradedQty", "TradeQty", "FilledQty", "Qty", "Quantity",
+                   "TradeQuantity")
+
 # Why an order was refused. The probe's rejection carried
 # "exchg not enabled for this acct" here and nowhere else; without it the
 # operator sees "filled 0 of 1 (rejected)" and has nothing to act on.
@@ -260,6 +269,16 @@ def is_terminal(record: Dict[str, Any]) -> bool:
     if any(w in word for w in _PARTIAL_WORDS):
         return False
     return any(w in word for w in _DEAD_WORDS + _FILLED_WORDS)
+
+
+def _side_matches(record: Dict[str, Any], side: int) -> bool:
+    """True when this row is the side we asked about, or does not say."""
+    raw = _first(record, ("BS", "BuySell", "TransactionType", "Side"))
+    if raw is None:
+        return True
+    text = str(raw).strip().lower()
+    is_sell = text in ("2", "s", "sell", "sl")
+    return is_sell == (side == SELL)
 
 
 def _iter_records(node: Any):
@@ -634,6 +653,190 @@ class Broker:
                 return max(buy - sell, 0)
             return None
         return 0  # the position book was readable and this contract is not in it
+
+    def net_qty(self, token: str) -> Optional[int]:
+        """Net position in one contract, signed. None when it cannot be read.
+
+        `long_qty` clamps at zero because the gates only ever ask "do I hold
+        enough to sell?". Reconciliation needs the real number, including a
+        short, or it cannot tell a half-rolled account from a flat one.
+        """
+        try:
+            resp = self.client.portfolio.get_net_position()
+        except Exception as exc:
+            self.log.warn(f"Net position call failed: {exc}")
+            return None
+        if call_failed(resp):
+            self.log.warn(f"Net position refused: {call_failed(resp)}")
+            return None
+
+        token = str(token).strip()
+        for record in _iter_records(resp):
+            rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
+            if rec_token is None or str(rec_token).strip() != token:
+                continue
+
+            net = _first(record, _NET_QTY_KEYS)
+            if net is not None:
+                return _as_int(net)
+
+            buy = _as_int(_first(record, ("BuyQty", "BuyQuantity", "TotalBuyQty")) or 0)
+            sell = _as_int(_first(record, ("SellQty", "SellQuantity", "TotalSellQty")) or 0)
+            if buy is not None and sell is not None:
+                return buy - sell
+            return None
+        return 0  # readable, and this contract is simply not held
+
+    # ------------------------------------------------------------ trade book
+    def _trade_snapshot(self) -> Optional[set]:
+        """Identities of every trade currently in the book, or None if unread.
+
+        None and an empty set mean very different things: "I could not look"
+        against "nothing has traded". Returning a set for both would make a
+        failed call look like a clean slate, and every trade already done
+        today would then count as ours.
+        """
+        try:
+            resp = self.client.orders.get_trade_book()
+        except Exception as exc:
+            self.log.warn(f"Trade book call failed: {exc}")
+            return None
+        problem = call_failed(resp)
+        if problem:
+            self.log.warn(f"Trade book refused: {problem}")
+            return None
+
+        found = set()
+        for record in _iter_records(resp):
+            ref = _first(record, _TRADE_NO_KEYS)
+            if ref is not None:
+                found.add(str(ref))
+        return found
+
+    def traded_since(self, before: Optional[set], token: str,
+                     side: int) -> Tuple[Optional[int], str]:
+        """Quantity traded on this token and side since the snapshot.
+
+        The trade book is the exchange's record of what actually executed; the
+        order book is a summary of what the broker believes. They should agree,
+        and this exists so that a disagreement can be seen rather than assumed
+        away.
+        """
+        if before is None:
+            return None, "the trade book could not be read before the order"
+
+        try:
+            resp = self.client.orders.get_trade_book()
+        except Exception as exc:
+            return None, f"the trade book could not be read back: {exc}"
+        problem = call_failed(resp)
+        if problem:
+            return None, f"the trade book refused: {problem}"
+
+        token = str(token).strip()
+        total = 0
+        counted = 0
+        for record in _iter_records(resp):
+            ref = _first(record, _TRADE_NO_KEYS)
+            if ref is None or str(ref) in before:
+                continue
+            rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
+            if rec_token is None or str(rec_token).strip() != token:
+                continue
+            if not _side_matches(record, side):
+                continue
+            qty = _as_int(_first(record, _TRADE_QTY_KEYS))
+            if qty is None:
+                return None, ("a new trade on this contract has no readable "
+                              f"quantity; fields were {sorted(str(k) for k in record)}")
+            total += qty
+            counted += 1
+
+        return total, (f"{counted} new trade(s) totalling {total}" if counted
+                       else "no new trades")
+
+    # ------------------------------------------------------------ cancel all
+    def working_orders(self, tokens: Optional[List[str]] = None
+                       ) -> Optional[List[Dict[str, Any]]]:
+        """Every order still live at the exchange, or None if unreadable.
+
+        None means "I could not look", which is not the same as "there are
+        none". A caller closing the window has to tell those apart.
+        """
+        try:
+            resp = self.client.orders.get_order_book()
+        except Exception as exc:
+            self.log.warn(f"Order book call failed: {exc}")
+            return None
+        if call_failed(resp):
+            self.log.warn(f"Order book refused: {call_failed(resp)}")
+            return None
+
+        wanted = {str(t).strip() for t in (tokens or []) if t}
+        live = []
+        for record in _iter_records(resp):
+            # The response envelope carries "Status": "Success", which looks
+            # exactly like an order status. A token is what tells an order row
+            # apart from the wrapper around it.
+            token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
+            if token is None or _first(record, _STATUS_KEYS) is None:
+                continue
+            if is_terminal(record):
+                continue
+            if wanted and str(token).strip() not in wanted:
+                continue
+            live.append(record)
+        return live
+
+    def cancel_record(self, record: Dict[str, Any], label: str = "cancel all") -> bool:
+        """Cancel one order described by its own order-book row.
+
+        The row carries the price in rupees -- the probe sent 930600000 and the
+        book echoed 93.06 -- so it has to be scaled back up before it is sent
+        anywhere.
+        """
+        token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
+        if token is None:
+            self.log.warn(f"{label}: an order row has no token; skipping it")
+            return False
+
+        try:
+            info = self.instrument(str(token).strip())
+            price = _first(record, ("Price", "OrderPrice", "LimitPrice")) or 0
+            units = int(D(price) * (info.price_divisor or D(1)))
+        except Exception as exc:
+            self.log.warn(f"{label}: could not price the cancel for {token}: {exc}")
+            return False
+
+        qty = _as_int(_first(record, ("TotalQtyRemaining", "Qty", "Quantity"))) or 0
+        side_raw = str(_first(record, ("BS", "BuySell", "Side")) or "").strip().lower()
+        side = SELL if side_raw in ("2", "s", "sell") else BUY
+
+        try:
+            resp = self.client.orders.cancel_order(
+                client_order_no=_as_int(_first(record, ("ClientOrderNo",))) or 0,
+                exchange_order_no=str(_first(record, ("ExchangeOrderNo",)) or ""),
+                gateway_order_no=str(_first(record, ("GatewayOrderNo",)) or ""),
+                segment_id=self.cfg.segment_id,
+                token=int(D(str(token).strip())),
+                order_type=self.cfg.order_type,
+                bs=side,
+                qty=qty,
+                price=units,
+                trigger_price=0,
+                validity=self.cfg.validity,
+                product_type=self.cfg.product_type,
+            )
+        except Exception as exc:
+            self.log.error(f"{label}: cancel failed for {token}: {exc}")
+            return False
+
+        problem = call_failed(resp)
+        if problem:
+            self.log.error(f"{label}: cancel refused for {token}: {problem}")
+            return False
+        self.log.info(f"{label}: cancelled {qty} on {token}")
+        return True
 
     # ----------------------------------------------------------------- orders
     def _order_snapshot(self) -> set:

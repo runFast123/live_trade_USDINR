@@ -518,6 +518,9 @@ class RollWindow(tk.Toplevel):
                                     self.fonts, kind="warn", width=150, height=42)
         self.mode_button.pack(side="left", padx=T.PAD_S)
 
+        T.Button(bar, "Cancel all", self._cancel_all, self.fonts,
+                 kind="danger", width=140, height=42).pack(side="left", padx=T.PAD_S)
+
         if getattr(self.engine, "ladder", None):
             T.Button(bar, "Reset ladder", self._reset_ladder, self.fonts,
                      width=150, height=42).pack(side="left")
@@ -1106,7 +1109,54 @@ class RollWindow(tk.Toplevel):
             self._refresh_id = None
 
     def _on_close(self) -> None:
-        self.engine.disarm("window closing")
-        self.engine.stop()
+        """Do not walk away from live orders.
+
+        A Day order outlives this process at the exchange, and the app-side
+        synthetic IOC that would have cancelled it dies with the process. So
+        closing cancels first, and says so if anything was left in doubt.
+        """
+        from tkinter import messagebox
+
+        problem = None
+        try:
+            problem = self.engine.shutdown()
+        except Exception as exc:                 # never trap the operator
+            problem = f"closing down cleanly failed: {exc}. Check the terminal."
+
+        if problem:
+            messagebox.showwarning("Orders may still be live", problem, parent=self)
+
         self._cancel_refresh()
         self.destroy()
+
+    def _cancel_all(self) -> None:
+        from tkinter import messagebox
+
+        if self.cfg.dry_run:
+            messagebox.showinfo(
+                "Cancel all",
+                "Nothing has been sent, so there is nothing to cancel.",
+                parent=self)
+            return
+
+        if not messagebox.askyesno(
+                "Cancel all",
+                "Cancel every order still working on either leg?" + os.linesep * 2
+                + "This does not close any position you already hold.",
+                parent=self, default="no"):
+            return
+
+        self.engine.disarm("cancel all")
+        cancelled, failed, unreadable = self.engine.cancel_all()
+        if unreadable:
+            messagebox.showwarning("Cancel all", unreadable, parent=self)
+        elif failed:
+            messagebox.showwarning(
+                "Cancel all",
+                f"Cancelled {cancelled}, but {failed} could not be cancelled and "
+                "may still be live. Check the terminal.", parent=self)
+        else:
+            messagebox.showinfo(
+                "Cancel all",
+                f"Cancelled {cancelled} working order(s)." if cancelled
+                else "Nothing was working.", parent=self)

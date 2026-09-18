@@ -122,6 +122,10 @@ class RollConfig:
     # exchange yet. Switch once a live order can be placed at all.
     validity: int = DAY
     fill_timeout_sec: float = 2.0        # unfilled remainder is cancelled after this
+
+    # The broker's position book lags the trade, so reconciliation waits for it
+    # rather than reading once and reporting a mismatch that was only a race.
+    reconcile_wait_sec: float = 6.0
     max_clips_per_day: int = 1
     require_market_status: bool = True   # False = trust window_open/window_close instead
     require_fresh_scrip: bool = True     # refuse if the scrip master is not today's

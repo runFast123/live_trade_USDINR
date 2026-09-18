@@ -84,6 +84,23 @@ def cmd_check(cfg: RollConfig) -> int:
         print("  limit mode   fixed")
         print(f"  roll limit   {money(cfg.roll_limit_d)}")
     print(f"  size         {cfg.lots} lot(s) = {cfg.clip_qty} units")
+    if cfg.limit_ladder:
+        from rollover.ladder import LadderError, parse as parse_ladder
+        try:
+            built = parse_ladder(cfg.limit_ladder, lot_size=cfg.expected_lot_size)
+            print(f"  ladder       {len(built.rungs)} rung(s), "
+                  f"{built.total_qty:,} in total")
+            for rung in built.rungs:
+                orders = -(-rung.qty // cfg.clip_qty)   # round up
+                print(f"               {rung.describe(cfg.expected_lot_size)}"
+                      f"  = {orders} order(s) of {cfg.clip_qty:,}")
+            slowest = -(-built.total_qty // cfg.clip_qty)
+            if cfg.max_clips_per_day and slowest > cfg.max_clips_per_day:
+                days = -(-slowest // cfg.max_clips_per_day)
+                print(f"               at {cfg.max_clips_per_day} clip(s) a day that is "
+                      f"{days} trading days; raise lots or max_clips_per_day")
+        except LadderError as exc:
+            print(f"  ladder       UNUSABLE: {exc}")
     print(f"  allowance    {cfg.allowance_ticks} tick(s) = {money(cfg.allowance)}")
     print(f"  mode         {'DRY RUN' if cfg.dry_run else 'LIVE ORDERS'}")
     print(f"  validity     {cfg.validity} "

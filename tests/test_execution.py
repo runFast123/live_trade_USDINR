@@ -48,13 +48,26 @@ class StubBroker:
     it or the dry-run tests would be checking the wrong thing.
     """
 
-    def __init__(self, outcomes, cfg=None):
+    def __init__(self, outcomes, cfg=None, positions=None, traded=None):
         self.outcomes = list(outcomes)
         self.cfg = cfg
         self.calls = []          # every request the engine made
         self.sent = []           # the subset that would reach the exchange
         self.logged_in = True
         self.scrip_file_date = date.today()
+
+        # Reconciliation reads these. By default the account moves exactly as
+        # the fills say it did, so a correct roll reconciles and the tests that
+        # are about something else are not disturbed by it.
+        #
+        # `positions` is a list of books, one per reading: the first is what
+        # the account held before the roll, the last is what it holds after.
+        # A single dict means it never moves, which is a mismatch.
+        self.positions = ([positions] if isinstance(positions, dict)
+                          else list(positions or []))
+        self.traded = traded                 # None = the trade book is unreadable
+        self._auto_positions = not self.positions
+        self._reads = 0
 
     def place_leg(self, info, side, qty, limit_price, label):
         self.calls.append({"token": info.token, "side": side, "qty": qty,
@@ -65,10 +78,40 @@ class StubBroker:
         self.sent.append(self.calls[-1])
         if not self.outcomes:
             raise AssertionError(f"unexpected extra order: {label}")
-        return self.outcomes.pop(0)
+        result = self.outcomes.pop(0)
+        # The position moves by what filled, never by what was asked for. A
+        # stub that moved by the request would make every partial fill look
+        # like a reconciliation failure.
+        self.calls[-1]["filled"] = result.filled_qty
+        return result
 
     def market_open(self): return True
     def long_qty(self, token): return 1000
+
+    def net_qty(self, token):
+        if self._auto_positions:
+            # Follow whatever actually got sent, so the position book agrees
+            # with the orders by construction.
+            moved = 0
+            for call in self.sent:
+                if call["token"] != token:
+                    continue
+                filled = call.get("filled", 0)
+                moved += -filled if call["side"] == SELL else filled
+            return 1000 + moved
+
+        # capture() reads both legs, so two calls make one reading.
+        index = min(self._reads // 2, len(self.positions) - 1)
+        self._reads += 1
+        return self.positions[index].get(token)
+
+    def _trade_snapshot(self):
+        return set() if self.traded is not None else None
+
+    def traded_since(self, before, token, side):
+        if self.traded is None:
+            return None, "the trade book could not be read"
+        return self.traded.get((token, side), 0), "stubbed"
     def refresh_scrip_master_if_stale(self): return False
     def load_scrip_master(self, force=False): return None
     def instrument(self, token):
@@ -98,13 +141,17 @@ class ExecutionCase(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.state_dir, ignore_errors=True)
 
-    def build(self, outcomes, **cfg_kw):
+    def build(self, outcomes, positions=None, traded=None, **cfg_kw):
         cfg_kw.setdefault("dry_run", False)
         cfg_kw.setdefault("use_live_feed", False)
         cfg_kw.setdefault("limit_mode", "absolute")
+        # Reconciliation waits for the broker's book to catch up. In a test
+        # there is nothing to wait for, and waiting would only slow the suite.
+        cfg_kw.setdefault("reconcile_wait_sec", 0.0)
         self.cfg = RollConfig(near_token="1769", far_token="1584", **cfg_kw)
         self.log = StubLog()
-        self.broker = StubBroker(outcomes, self.cfg)
+        self.broker = StubBroker(outcomes, self.cfg, positions=positions,
+                                 traded=traded)
 
         engine = RollEngine(self.cfg, self.log, self.state_dir,
                             broker=self.broker)
