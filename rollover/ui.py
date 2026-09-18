@@ -64,7 +64,8 @@ class LiveModeDialog(tk.Toplevel):
         self.transient(parent)
 
         self.checks = livemode.preflight(cfg, engine)
-        self.exposure = livemode.exposure(cfg, self._price(), self._lot_size())
+        self.exposure = livemode.exposure(cfg, self._price(), self._lot_size(),
+                                          engine=engine)
 
         body = tk.Frame(self, bg=T.BG)
         body.pack(fill="both", expand=True, padx=T.PAD_L, pady=T.PAD_L)
@@ -551,6 +552,16 @@ class RollWindow(tk.Toplevel):
         if wanted is None:
             return
 
+        if getattr(self.engine.session, "in_flight", False):
+            # A clip in flight was sized and priced against the rung the
+            # decision is holding. Changing the ladder under it means the fill
+            # is credited to a rung that no longer exists, and the quantity is
+            # silently lost -- the position moves and the campaign does not
+            # know, so it would roll that much again.
+            self._ladder_note("an order is working; wait for it to finish",
+                              T.WARN)
+            return
+
         ceiling = self.engine._tenor_ceiling_bps()
         if wanted and ceiling is None and self.cfg.limit_mode == "bps":
             # Without a tenor there is no ceiling, and without a ceiling a rung
@@ -707,6 +718,12 @@ class RollWindow(tk.Toplevel):
 
         ladder = getattr(self.engine, "ladder", None)
         if not ladder:
+            return
+        if getattr(self.engine.session, "in_flight", False):
+            messagebox.showwarning(
+                "Reset ladder",
+                "An order is working. Wait for it to finish, so its fill is "
+                "counted before the record is cleared.", parent=self)
             return
         done = ladder.done_total(self.engine.ladder_progress)
         if not messagebox.askyesno(

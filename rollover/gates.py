@@ -58,6 +58,16 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
     def add(name: str, ok: bool, detail: str) -> None:
         gates.append(Gate(name, bool(ok), detail))
 
+    # What is actually about to be sent, which is not always a whole clip. A
+    # ladder rung with 300 units left sends 300, and checking the position and
+    # the depth against the full clip blocked that order although there was
+    # ample of both -- so the tail of every rung was untradeable.
+    #
+    # Zero means nothing qualifies and no order is coming, so the nominal clip
+    # is shown instead: a size gate that passes because it is checking against
+    # nothing would be worse than useless.
+    clip = getattr(decision, "qty", 0) or cfg.clip_qty
+
     # ---- nothing is broken -------------------------------------------------
     add("not halted",
         session.halted_reason is None,
@@ -185,7 +195,7 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
             add("position", False,
                 "net position unknown; cannot confirm you hold the near contract")
         else:
-            need = cfg.clip_qty
+            need = clip
             if qty >= need:
                 # How many days of clips the whole position would take matters
                 # when expiry is close: one clip a day cannot roll ten lots in
@@ -218,7 +228,7 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
     # the far offer is how a roll ends up half done, which is the one outcome
     # this app must not produce.
     if cfg.require_touch_size:
-        need = cfg.clip_qty
+        need = clip
         for label, quote, side, size in (("near", near_q, "bid", near_q.bid_qty),
                                          ("far", far_q, "ask", far_q.ask_qty)):
             if size is None:

@@ -310,6 +310,100 @@ class TestItSurvivesARestart(unittest.TestCase):
         self.assertEqual(self.engine().ladder_progress, {})
 
 
+class TestARestartCannotCauseAnOverRoll(unittest.TestCase):
+    """The credit has to be on disk before the process can end.
+
+    _count_clip persists and then _credit_rung ran afterwards without saving,
+    so a credit only reached disk on the NEXT clip. Restart after a completed
+    clip and the ladder had forgotten it -- which means rolling that quantity
+    a second time, on top of a position that had already moved.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="overroll_")
+        self.cfg = RollConfig(
+            near_token="1769", far_token="1584",
+            near_expiry="2026-09-28", far_expiry="2026-11-26",
+            lots=2, dry_run=True, use_live_feed=False, record_market=False,
+            update_check=False, journal=False, require_margin=False,
+            max_clips_per_day=99,
+            limit_ladder=[{"bps": "30", "qty": 5000},
+                          {"bps": "50", "qty": 4000}])
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def engine(self):
+        from rollover.broker import InstrumentInfo, OrderOutcome
+        from rollover.engine import RollEngine
+
+        class Log:
+            def info(self, m): pass
+            def warn(self, m): pass
+            def error(self, m): pass
+            def alert(self, m): pass
+
+        class Broker:
+            logged_in = True
+            scrip_file_date = date.today()
+
+            def place_leg(self, info, side, qty, price, label):
+                return OrderOutcome(sent=True, filled_qty=qty, requested_qty=qty,
+                                    order_ref="X", certain=True, detail="filled")
+
+        def contract(token, expiry):
+            return InstrumentInfo(token=token, symbol="USDINR",
+                                  sec_desc="USDINR" + token, segment="13",
+                                  lot_size=1000, expiry=expiry,
+                                  instrument="FUTCUR",
+                                  price_divisor=D("10000000"), tick=D("0.0025"),
+                                  tick_units=D("25000"), low_range=D("93"),
+                                  high_range=D("99"))
+
+        engine = RollEngine(self.cfg, Log(), self.dir, broker=Broker())
+        engine.session.near = contract("1769", date(2026, 9, 28))
+        engine.session.far = contract("1584", date(2026, 11, 26))
+        return engine
+
+    def clip(self, engine):
+        """One tick at a price that clears every rung."""
+        decision = rule.compute(
+            quote("1769", "95.7800", "95.7825"),
+            quote("1584", "96.0475", "96.0500"),
+            self.cfg, days=59, ladder=engine.ladder,
+            progress=engine.ladder_progress)
+        if decision.qualifies:
+            engine._execute(decision, None, None)
+        return decision
+
+    def test_a_credit_is_on_disk_before_the_next_clip(self):
+        engine = self.engine()
+        self.clip(engine)
+
+        from rollover.state import StateStore
+        self.assertEqual(StateStore(self.dir).load().ladder_done, {"30": 2000})
+
+    def test_restarting_after_every_clip_rolls_the_ladder_exactly_once(self):
+        sent = 0
+        engine = self.engine()
+        for _ in range(12):
+            decision = self.clip(engine)
+            if not decision.qualifies:
+                break
+            sent += decision.qty
+            engine = self.engine()          # the worst case for persistence
+
+        self.assertEqual(sent, 9000, "the ladder was over- or under-rolled")
+
+    def test_the_last_clip_is_not_forgotten(self):
+        engine = self.engine()
+        for _ in range(3):
+            self.clip(engine)
+        before = dict(engine.ladder_progress)
+
+        self.assertEqual(self.engine().ladder_progress, before)
+
+
 class TestTheEngineRefusesABadLadder(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="badladder_")

@@ -222,6 +222,69 @@ class TestWhatItCommits(unittest.TestCase):
         self.assertTrue(rupees(D("-95780")).startswith("-"))
 
 
+class TestTheCampaignIsShownNotJustTheClip(unittest.TestCase):
+    """Engaging live authorises the ladder, not one clip.
+
+    A dialog showing only "about Rs 95,780" understates what is being agreed to
+    by the number of clips in the ladder -- twenty six of them, in the case
+    below.
+    """
+
+    def ladder_engine(self, progress=None):
+        from rollover.ladder import parse
+
+        class Engine:
+            def __init__(self, ladder, progress):
+                self.ladder = ladder
+                self.ladder_progress = progress
+                self.broker = self.session = self.feed = None
+
+        return Engine(parse([{"bps": "30", "qty": 10000},
+                             {"bps": "50", "qty": 20000}], lot_size=1000),
+                      progress or {})
+
+    def lines(self, progress=None, price=D("95.78")):
+        cfg = good_config(lots=1)
+        got = exposure(cfg, price, engine=self.ladder_engine(progress))
+        return got, got.lines(unit_confirmed=True)
+
+    def test_the_outstanding_quantity_is_shown(self):
+        _, lines = self.lines({"30": 4000})
+        self.assertTrue(any("26,000 to roll" in line for line in lines), lines)
+
+    def test_so_is_what_it_is_worth(self):
+        _, lines = self.lines({"30": 4000})
+        self.assertTrue(any("24.90 lakh" in line for line in lines), lines)
+
+    def test_and_how_many_clips_that_is(self):
+        _, lines = self.lines({"30": 4000})
+        self.assertTrue(any("26 clip(s)" in line for line in lines), lines)
+
+    def test_a_finished_ladder_adds_nothing(self):
+        _, lines = self.lines({"30": 10000, "50": 20000})
+        self.assertFalse(any("to roll" in line for line in lines))
+
+    def test_no_ladder_adds_nothing(self):
+        got = exposure(good_config(), D("95.78"))
+        self.assertEqual(got.campaign_left, 0)
+        self.assertFalse(any("to roll" in line
+                             for line in got.lines(unit_confirmed=True)))
+
+    def test_without_a_price_the_quantity_still_shows(self):
+        _, lines = self.lines({"30": 4000}, price=None)
+        self.assertTrue(any("26,000 to roll" in line for line in lines))
+        self.assertFalse(any("Rs" in line for line in lines[2:]))
+
+    def test_a_broken_engine_does_not_stop_the_dialog(self):
+        class Awkward:
+            @property
+            def ladder(self):
+                raise RuntimeError("no")
+
+        got = exposure(good_config(), D("95.78"), engine=Awkward())
+        self.assertEqual(got.campaign_left, 0)
+
+
 class TestWhatTheOperatorReads(unittest.TestCase):
     def test_it_says_orders_are_real_and_the_session_stays_live(self):
         cfg, engine, checks = passing()

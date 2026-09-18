@@ -135,6 +135,11 @@ class Exposure:
     lot_size: int
     price: Optional[Decimal]
     qty_sent: int
+    # What the whole ladder would roll, if one is configured. Engaging live
+    # authorises the campaign, not a single clip, and a dialog that showed only
+    # the clip would understate it by the number of clips in the ladder.
+    campaign_qty: int = 0
+    campaign_left: int = 0
 
     @property
     def as_units(self) -> Optional[Decimal]:
@@ -154,16 +159,30 @@ class Exposure:
     def ambiguous(self) -> bool:
         return self.qty_sent != self.lots
 
+    @property
+    def campaign_value(self) -> Optional[Decimal]:
+        if self.price is None or not self.campaign_left:
+            return None
+        return D(self.campaign_left) * self.price
+
     def lines(self, unit_confirmed: bool) -> List[str]:
         out = [f"{self.lots} lot(s), sent to the exchange as qty {self.qty_sent}"]
         if self.price is None:
             out.append("no price available, so the notional cannot be shown")
-            return out
-        out.append(f"about {rupees(self.as_units)} at {money(self.price)}")
-        if self.ambiguous and not unit_confirmed:
-            out.append(
-                f"if the exchange reads qty {self.qty_sent} as CONTRACTS this "
-                f"is {rupees(self.as_contracts)}")
+        else:
+            out.append(f"about {rupees(self.as_units)} at {money(self.price)}")
+            if self.ambiguous and not unit_confirmed:
+                out.append(
+                    f"if the exchange reads qty {self.qty_sent} as CONTRACTS "
+                    f"this is {rupees(self.as_contracts)}")
+
+        if self.campaign_left:
+            clips = -(-self.campaign_left // max(1, self.qty_sent))
+            out.append("")
+            out.append(f"the ladder still has {self.campaign_left:,} to roll, "
+                       f"about {clips} clip(s)")
+            if self.campaign_value is not None:
+                out.append(f"which is {rupees(self.campaign_value)} in total")
         return out
 
 
@@ -191,10 +210,25 @@ def _round(value: Decimal, places: int) -> Decimal:
     return value.quantize(D(1).scaleb(-places), rounding=ROUND_HALF_UP)
 
 
-def exposure(cfg, price: Optional[Decimal], lot_size: Optional[int] = None) -> Exposure:
+def exposure(cfg, price: Optional[Decimal], lot_size: Optional[int] = None,
+             engine=None) -> Exposure:
     lots = int(getattr(cfg, "lots", 1) or 1)
     size = int(lot_size or getattr(cfg, "lot_size", 1000) or 1000)
-    return Exposure(lots=lots, lot_size=size, price=price, qty_sent=lots * size)
+
+    total = left = 0
+    try:
+        # getattr's default only swallows AttributeError, so the lookup itself
+        # belongs inside the guard. Nothing about the ladder may stop the
+        # dialog that asks whether to send real orders from opening.
+        ladder = getattr(engine, "ladder", None)
+        if ladder:
+            total = ladder.total_qty
+            left = ladder.remaining_total(getattr(engine, "ladder_progress", {}))
+    except Exception:
+        total = left = 0
+
+    return Exposure(lots=lots, lot_size=size, price=price, qty_sent=lots * size,
+                    campaign_qty=total, campaign_left=left)
 
 
 def summary(cfg, checks: List[Check], exposure_: Exposure) -> str:
@@ -202,7 +236,7 @@ def summary(cfg, checks: List[Check], exposure_: Exposure) -> str:
     lines = ["Switching to LIVE lets this program send real orders on your",
              "account, without asking again, for the rest of this session.", ""]
 
-    lines.append("What one clip commits:")
+    lines.append("What this commits:")
     for line in exposure_.lines(bool(getattr(cfg, "quantity_unit_confirmed", False))):
         lines.append(f"    {line}")
     lines.append("")

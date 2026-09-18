@@ -474,6 +474,11 @@ class RollEngine:
             return
         self.ladder_progress = self.ladder.credit(
             self.ladder_progress, rung.rung, qty)
+        # Write it now. _count_clip persists just before this runs, so without
+        # a save here a credit only reached disk on the *next* clip -- and a
+        # restart forgot the last one completed, which means rolling that
+        # quantity a second time.
+        self._persist()
         done = self.ladder.done_total(self.ladder_progress)
         self.log.info(
             f"Ladder: {qty:,} credited to the {money(rung.rung.bps, 0)} bps rung; "

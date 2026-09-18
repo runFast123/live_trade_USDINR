@@ -318,6 +318,62 @@ class TestGates(unittest.TestCase):
         self.assertFalse(self.report(in_flight=True).ok)
 
 
+class TestGatesSizeOnTheOrderNotTheClip(TestGates):
+    """A ladder rung with less than a clip left still has to be tradeable.
+
+    The position and depth gates measured against cfg.clip_qty, but a rung with
+    300 units remaining sends 300. Checking for a full clip blocked that order
+    although there was ample depth and ample position, so the tail of every
+    rung was untradeable.
+    """
+
+    def named(self, report, name):
+        return next(g for g in report.gates if g.name == name)
+
+    def small_order(self, qty):
+        from dataclasses import replace
+        self.decision = replace(self.decision, qty=qty)
+
+    def test_a_part_clip_passes_on_depth_a_full_clip_would_fail(self):
+        self.quotes = {"1001": quote("1001", "95.9400", "95.9450", bid_qty=500, ask_qty=500),
+                       "1002": quote("1002", "96.2370", "96.2375", bid_qty=500, ask_qty=500)}
+        self.small_order(300)
+        report = self.report(near_position_qty=600)
+
+        self.assertTrue(self.named(report, "near touch size").ok)
+        self.assertTrue(self.named(report, "far touch size").ok)
+        self.assertTrue(self.named(report, "position").ok)
+
+    def test_a_full_clip_is_still_checked_against_the_full_clip(self):
+        self.quotes = {"1001": quote("1001", "95.9400", "95.9450", bid_qty=500, ask_qty=500),
+                       "1002": quote("1002", "96.2370", "96.2375", bid_qty=500, ask_qty=500)}
+        self.small_order(1000)
+        report = self.report(near_position_qty=600)
+
+        self.assertFalse(self.named(report, "near touch size").ok)
+        self.assertFalse(self.named(report, "position").ok)
+
+    def test_the_detail_quotes_the_size_actually_needed(self):
+        self.small_order(300)
+        self.assertIn("300", self.named(self.report(), "near touch size").detail)
+
+    def test_nothing_qualifying_does_not_make_a_size_gate_pass(self):
+        """qty 0 means no order. A gate that passes on nothing is worse than
+        useless, so it falls back to the nominal clip."""
+        self.quotes = {"1001": quote("1001", "95.9400", "95.9450", bid_qty=10, ask_qty=10),
+                       "1002": quote("1002", "96.2370", "96.2375", bid_qty=10, ask_qty=10)}
+        self.small_order(0)
+        report = self.report(near_position_qty=10)
+
+        self.assertFalse(self.named(report, "near touch size").ok)
+        self.assertIn("1000", self.named(report, "near touch size").detail)
+
+    def test_without_a_ladder_nothing_changes(self):
+        """The plain path still measures the configured clip."""
+        report = self.report()
+        self.assertTrue(report.ok, msg=str(report))
+
+
 class TestExpiryParsing(unittest.TestCase):
     def test_formats(self):
         for text in ("2026-09-28", "28-Sep-2026", "28/09/2026", "28Sep2026",

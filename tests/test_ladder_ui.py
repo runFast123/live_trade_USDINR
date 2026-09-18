@@ -290,6 +290,46 @@ class TestApplyingIsDeliberate(LadderUICase):
         self.assertIn("Ladder set to 3 rung(s)", self.log.text())
 
 
+class TestNotWhileAnOrderIsWorking(LadderUICase):
+    """A clip in flight was sized and priced against a rung.
+
+    Change the ladder under it and the fill is credited to a rung that no
+    longer exists: the quantity is silently lost, the position moves, and the
+    campaign does not know, so it would roll that much again.
+    """
+
+    def test_applying_is_refused(self):
+        self.engine.session.in_flight = True
+        self.add("40", "5000")
+        self.window._apply_ladder()
+        self.assertIn("an order is working", self.window.ladder_note.cget("text"))
+        self.assertEqual(len(self.cfg.limit_ladder), 2)
+
+    def test_the_typed_row_is_kept_so_it_can_be_applied_after(self):
+        self.engine.session.in_flight = True
+        self.add("40", "5000")
+        self.window._apply_ladder()
+
+        self.engine.session.in_flight = False
+        self.window._apply_ladder()
+        self.assertIn(("40", "5000"), self.applied())
+
+    def test_resetting_is_refused_too(self):
+        import tkinter.messagebox as mb
+        self.engine.session.in_flight = True
+        self.engine.ladder_progress = {"30": 4000}
+
+        seen, real = [], mb.showwarning
+        mb.showwarning = lambda *a, **kw: seen.append(a)
+        try:
+            self.window._reset_ladder()
+        finally:
+            mb.showwarning = real
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(self.engine.ladder_progress, {"30": 4000})
+
+
 class TestProgressAcrossAnEdit(LadderUICase):
     def test_progress_survives_a_rung_that_is_unchanged(self):
         self.engine.ladder_progress = {"30": 4000}
