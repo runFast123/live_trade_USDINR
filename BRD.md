@@ -119,6 +119,8 @@ overnight, because a roll takes as long as it takes. It resets only when the
 contracts change, which is a different roll, or when the operator resets it by
 hand after reconciling against the position book.
 
+The rungs are set in the window, not only in a file. Applying a change always disarms.
+
 When no ladder is configured the single tenor limit applies exactly as above.
 
 ### The cost measured is what you pay, not what is quoted

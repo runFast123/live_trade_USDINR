@@ -394,22 +394,18 @@ class RollWindow(tk.Toplevel):
             value.pack(fill="x")
             self.stat_labels[key] = value
 
-    LADDER_COLUMNS = (
-        ("bps", "Limit", 90, "e"),
-        ("rupees", "In rupees", 100, "e"),
-        ("target", "Far ask at or below", 160, "e"),
-        ("gap", "Distance", 110, "e"),
-        ("progress", "Rolled", 150, "e"),
-        ("status", "", 130, "w"),
-    )
+    LADDER_HEADINGS = ("LIMIT", "QTY", "IN RUPEES", "FAR ASK AT OR BELOW",
+                       "DISTANCE", "ROLLED", "")
 
     def _build_ladder(self, parent) -> None:
-        """One row per rung, so every limit is visible at once.
+        """Several roll limits at once, each with its own quantity, editable.
 
-        This is the answer to "what would it cost me at thirty, and at fifty?".
-        With a single limit the screen can only say how far the market is from
-        that one number, which is not the question an operator has when they
-        are willing to do different sizes at different prices.
+        The single ROLL LIMIT box answers "may I roll?" and nothing else. An
+        operator willing to do ten thousand at thirty basis points and twenty
+        thousand at fifty needs to set both and watch both, so each rung gets
+        the same treatment that one limit had: a figure you can type, the rupee
+        amount it works out to, the far ask that would satisfy it, and how far
+        away the market is right now.
         """
         self.ladder_card = T.card(parent, padx=T.PAD_L, pady=self.gap)
         box = self.ladder_card.inner
@@ -422,54 +418,226 @@ class RollWindow(tk.Toplevel):
                                      font=self.fonts.ui_small, anchor="e")
         self.ladder_total.pack(side="right")
 
-        self.ladder_tree = ttk.Treeview(
-            box, columns=[c[0] for c in self.LADDER_COLUMNS],
-            show="headings", height=3, selectmode="none")
-        for key, title, width, anchor in self.LADDER_COLUMNS:
-            self.ladder_tree.heading(key, text=title)
-            self.ladder_tree.column(key, width=width, anchor=anchor,
-                                    stretch=(key == "status"))
-        self.ladder_tree.pack(fill="x", pady=(T.PAD_S, 0))
+        self.ladder_grid = tk.Frame(box, bg=T.SURFACE)
+        self.ladder_grid.pack(fill="x", pady=(T.PAD_S, 0))
+        for column, caption in enumerate(self.LADDER_HEADINGS):
+            tk.Label(self.ladder_grid, text=caption, bg=T.SURFACE, fg=T.FAINT,
+                     font=self.fonts.label,
+                     anchor="w" if column < 2 else "e").grid(
+                         row=0, column=column, sticky="ew",
+                         padx=(0, T.PAD_M), pady=(0, 2))
+        self.ladder_grid.columnconfigure(6, weight=1)
 
-        self.ladder_tree.tag_configure("ready", foreground=T.SUCCESS)
-        self.ladder_tree.tag_configure("working", foreground=T.WARN)
-        self.ladder_tree.tag_configure("done", foreground=T.FAINT)
-        self.ladder_tree.tag_configure("waiting", foreground=T.MUTED)
+        controls = tk.Frame(box, bg=T.SURFACE)
+        controls.pack(fill="x", pady=(T.PAD_S, 0))
+        T.Button(controls, "Add rung", self._add_rung, self.fonts,
+                 width=110, height=30).pack(side="left")
+        T.Button(controls, "Set ladder", self._apply_ladder, self.fonts,
+                 kind="primary", width=110, height=30).pack(side="left",
+                                                            padx=T.PAD_XS)
+        self.ladder_note = tk.Label(controls, text="", bg=T.SURFACE, fg=T.FAINT,
+                                    font=self.fonts.ui_small, anchor="w")
+        self.ladder_note.pack(side="left", padx=T.PAD_S)
 
-        # Packed only when a ladder is configured, so a single-limit setup
-        # looks exactly as it did before.
+        self.rung_rows = []
         self._ladder_shown = False
+        self._rebuild_rung_rows()
 
-    def _draw_ladder(self, decision) -> None:
-        rungs = getattr(decision, "rungs", None) if decision else None
-        if not rungs:
-            if self._ladder_shown:
-                self.ladder_card.pack_forget()
-                self._ladder_shown = False
-            return
+    # ---- the rows ---------------------------------------------------------
+    def _rebuild_rung_rows(self) -> None:
+        """Draw one row per rung of the ladder the engine is actually using."""
+        for row in list(self.rung_rows):
+            self._forget_row(row)
+        self.rung_rows = []
 
+        ladder = getattr(self.engine, "ladder", None)
+        for rung in (ladder.rungs if ladder else []):
+            self._add_row(f"{rung.bps.normalize():f}", str(rung.qty), rung.key)
+        self._reflow_rows()
+
+    def _forget_row(self, row) -> None:
+        for widget in (row["bps_box"], row["qty_box"], row["remove"],
+                       *row["cells"].values()):
+            widget.destroy()
+
+    def _add_row(self, bps: str = "", qty: str = "", key=None) -> None:
+        row = {"key": key, "bps": tk.StringVar(value=bps),
+               "qty": tk.StringVar(value=qty), "cells": {}}
+
+        row["bps_box"] = T.entry(self.ladder_grid, self.fonts,
+                                 textvariable=row["bps"], width=6)
+        row["qty_box"] = T.entry(self.ladder_grid, self.fonts,
+                                 textvariable=row["qty"], width=9)
+        for box in (row["bps_box"], row["qty_box"]):
+            box.bind("<Return>", lambda _e: self._apply_ladder())
+            box.bind("<Escape>", lambda _e: self._rebuild_rung_rows())
+
+        for name in ("rupees", "target", "gap", "rolled", "status"):
+            row["cells"][name] = tk.Label(
+                self.ladder_grid, text="--", bg=T.SURFACE, fg=T.MUTED,
+                font=self.fonts.mono, anchor="e")
+
+        row["remove"] = T.Button(self.ladder_grid, "Remove",
+                                 lambda r=row: self._remove_rung(r),
+                                 self.fonts, width=88, height=26)
+        self.rung_rows.append(row)
+
+    def _reflow_rows(self) -> None:
+        """Place every row's widgets. Called after any add or remove."""
+        for index, row in enumerate(self.rung_rows, start=1):
+            row["bps_box"].grid(row=index, column=0, sticky="w",
+                                padx=(0, T.PAD_M), pady=2, ipady=3)
+            row["qty_box"].grid(row=index, column=1, sticky="w",
+                                padx=(0, T.PAD_M), pady=2, ipady=3)
+            for column, name in enumerate(("rupees", "target", "gap", "rolled"),
+                                          start=2):
+                row["cells"][name].grid(row=index, column=column, sticky="e",
+                                        padx=(0, T.PAD_M))
+            row["cells"]["status"].configure(anchor="w")
+            row["cells"]["status"].grid(row=index, column=6, sticky="w",
+                                        padx=(0, T.PAD_M))
+            row["remove"].grid(row=index, column=7, sticky="e", pady=2)
+
+    def _add_rung(self) -> None:
+        self._add_row()
+        self._reflow_rows()
+        self._show_ladder()
+        self._ladder_note("type a limit and a quantity, then Set ladder", T.MUTED)
+        self.rung_rows[-1]["bps_box"].focus_set()
+
+    def _remove_rung(self, row) -> None:
+        self._forget_row(row)
+        if row in self.rung_rows:
+            self.rung_rows.remove(row)
+        self._reflow_rows()
+        self._ladder_note("removed; press Set ladder to apply", T.WARN)
+
+    def _ladder_note(self, text: str, colour: str) -> None:
+        self.ladder_note.configure(text=text, fg=colour)
+
+    def _show_ladder(self) -> None:
         if not self._ladder_shown:
             self.ladder_card.pack(fill="x", pady=self.gap,
                                   before=self.actions_bar)
             self._ladder_shown = True
 
+    # ---- applying ---------------------------------------------------------
+    def _typed_ladder(self):
+        """What the rows currently say, or None with a complaint shown."""
+        wanted = []
+        for row in self.rung_rows:
+            bps, qty = row["bps"].get().strip(), row["qty"].get().strip()
+            if not bps and not qty:
+                continue                      # a row left blank is not a rung
+            if not bps or not qty:
+                self._ladder_note("every rung needs both a limit and a quantity",
+                                  T.DANGER)
+                return None
+            wanted.append({"bps": bps, "qty": qty})
+        return wanted
+
+    def _apply_ladder(self) -> None:
+        """Validate what has been typed and put it into force.
+
+        The same validation config.json goes through, so a ladder that would
+        make the app unsafe is refused rather than accepted. Applying always
+        disarms: a typed digit must not fire a roll on the next tick.
+        """
+        from dataclasses import replace
+
+        from .ladder import parse as parse_ladder
+
+        wanted = self._typed_ladder()
+        if wanted is None:
+            return
+
+        ceiling = self.engine._tenor_ceiling_bps()
+        if wanted and ceiling is None and self.cfg.limit_mode == "bps":
+            # Without a tenor there is no ceiling, and without a ceiling a rung
+            # could quietly be looser than the limit for this roll. Refusing is
+            # the safe direction, and it clears as soon as the contracts load.
+            self._ladder_note(
+                "the tenor is not known yet, so a rung cannot be checked "
+                "against the limit", T.DANGER)
+            return
+
+        try:
+            built = parse_ladder(wanted, lot_size=self.cfg.expected_lot_size,
+                                 ceiling_bps=ceiling)
+            candidate = replace(self.cfg, limit_ladder=wanted)
+            candidate.validate()
+        except Exception as exc:
+            first = str(exc).splitlines()[-1].strip(" -")
+            self._ladder_note(first[:88], T.DANGER)
+            return
+
+        # Compare the rungs, not the text. config.json holds qty as a number
+        # and the box hands back a string, so comparing the raw entries made
+        # every press look like a change: disarming and re-saving each time.
+        current = getattr(self.engine, "ladder", None)
+        if current and [(r.bps, r.qty) for r in current.rungs] == \
+                [(r.bps, r.qty) for r in built.rungs]:
+            self._ladder_note("unchanged", T.MUTED)
+            return
+
+        was_armed = self.engine.armed
+        self.engine.disarm("ladder changed")
+        self.cfg.limit_ladder = wanted
+        self.engine.rebuild_ladder()
+        self._rebuild_rung_rows()
+
+        self.log.info(f"Ladder set to {len(wanted)} rung(s)"
+                      + (" (disarmed)" if was_armed else ""))
+
+        if self.config_path:
+            try:
+                self.cfg.save(self.config_path)
+                self._ladder_note("saved", T.SUCCESS)
+            except OSError as exc:
+                self.log.warn(f"Could not save config.json: {exc}")
+                self._ladder_note("applied, not saved", T.WARN)
+        else:
+            self._ladder_note("applied", T.SUCCESS)
+
+        self.after(4000, lambda: self._ladder_note("", T.FAINT))
+
+    # ---- the live numbers -------------------------------------------------
+    def _draw_ladder(self, decision) -> None:
+        """Fill in what the market is doing against each rung."""
+        if not self.rung_rows and not getattr(self.engine, "ladder", None):
+            if self._ladder_shown:
+                self.ladder_card.pack_forget()
+                self._ladder_shown = False
+            return
+        self._show_ladder()
+
+        views = {v.rung.key: v for v in (getattr(decision, "rungs", None) or [])}
         active = getattr(decision, "active_rung", None)
         active_key = active.rung.key if active else None
 
-        self.ladder_tree.delete(*self.ladder_tree.get_children())
-        total = done = 0
-        for view in rungs:
+        done = total = 0
+        for row in self.rung_rows:
+            view = views.get(row["key"]) if row["key"] else None
+            cells = row["cells"]
+
+            if view is None:
+                # Typed but not applied yet, or no quote to price it against.
+                for name in ("rupees", "target", "gap", "rolled"):
+                    cells[name].configure(text="--", fg=T.MUTED)
+                cells["status"].configure(text="not set", fg=T.FAINT)
+                continue
+
             total += view.rung.qty
             done += view.done
 
             if view.exhausted:
-                tag = "done"
+                colour, status = T.FAINT, "done"
             elif view.rung.key == active_key:
-                tag = "working"
+                colour, status = T.WARN, "WORKING"
             elif view.qualifies:
-                tag = "ready"
+                colour, status = T.SUCCESS, "READY"
             else:
-                tag = "waiting"
+                colour, status = T.MUTED, view.status
 
             gap = "--"
             if view.distance_bps is not None:
@@ -478,20 +646,24 @@ class RollWindow(tk.Toplevel):
                 inside = view.distance_bps < 0
                 gap = ("-" if inside else "+") + money(abs(view.distance_bps), 1)
 
-            self.ladder_tree.insert(
-                "", "end", tags=(tag,), values=(
-                    f"{money(view.rung.bps, 0)} bps",
-                    money(view.limit_rupees) if view.limit_rupees is not None else "--",
-                    money(view.required_far_ask) if view.required_far_ask is not None else "--",
-                    gap,
-                    f"{view.done:,} / {view.rung.qty:,}",
-                    "WORKING" if tag == "working" else view.status,
-                ))
+            cells["rupees"].configure(
+                text=money(view.limit_rupees) if view.limit_rupees is not None
+                else "--", fg=T.TEXT)
+            cells["target"].configure(
+                text=money(view.required_far_ask)
+                if view.required_far_ask is not None else "--", fg=T.TEXT)
+            cells["gap"].configure(text=gap, fg=colour)
+            cells["rolled"].configure(
+                text=f"{view.done:,} / {view.rung.qty:,}", fg=T.TEXT)
+            cells["status"].configure(text=status, fg=colour)
 
-        left = max(0, total - done)
-        self.ladder_total.configure(
-            text=f"{done:,} of {total:,} rolled, {left:,} left"
-                 f"   clip {self.cfg.clip_qty:,}")
+        if total:
+            left = max(0, total - done)
+            self.ladder_total.configure(
+                text=f"{done:,} of {total:,} rolled, {left:,} left"
+                     f"   clip {self.cfg.clip_qty:,}")
+        else:
+            self.ladder_total.configure(text="no rungs set")
 
     def _build_actions(self, parent) -> None:
         bar = tk.Frame(parent, bg=T.BG)

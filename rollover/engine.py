@@ -74,6 +74,14 @@ class Snapshot:
     quote_source: str = ""
 
 
+def _expiry(text):
+    """A YYYY-MM-DD string from config as a date, or None."""
+    try:
+        return datetime.strptime(str(text).strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 class RollEngine:
     def __init__(self, cfg: RollConfig, log: Logbook, base_dir: str,
                  broker: Optional[Broker] = None):
@@ -529,6 +537,26 @@ class RollEngine:
         self.stop()
         return problem
 
+    def rebuild_ladder(self) -> None:
+        """Re-read the ladder after the operator has edited it.
+
+        Progress is kept where a rung still exists at the same limit, and
+        dropped where it does not: a rung that has been deleted or repriced is
+        a different commitment, and carrying its history onto a new number
+        would report a fresh rung as already part done.
+        """
+        old = dict(self.ladder_progress)
+        self.ladder = self._build_ladder()
+        keys = {r.key for r in self.ladder.rungs}
+        self.ladder_progress = {k: v for k, v in old.items() if k in keys}
+
+        dropped = sorted(set(old) - keys)
+        if dropped:
+            self.log.warn(
+                "Ladder progress dropped for rung(s) no longer in the ladder: "
+                + ", ".join(f"{k} bps ({old[k]:,})" for k in dropped))
+        self._persist()
+
     def reset_ladder(self) -> None:
         """Start the campaign again. The operator's decision, never the app's."""
         self.ladder_progress = {}
@@ -543,9 +571,16 @@ class RollEngine:
         same trade and must not share a number.
         """
         near, far = self.session.near, self.session.far
-        if near is None or far is None:
-            return None
-        return limitlib.tenor_days(near.expiry, far.expiry)
+        if near is not None and far is not None:
+            return limitlib.tenor_days(near.expiry, far.expiry)
+
+        # Before the contracts have been read, fall back to the expiries in
+        # config.json. Those are cross-checked against the scrip master by a
+        # gate, so they are not authoritative -- but they are good enough to
+        # know whether a ladder rung is inside the limit for this tenor, and
+        # the alternative is no ceiling at all.
+        return limitlib.tenor_days(_expiry(self.cfg.near_expiry),
+                                   _expiry(self.cfg.far_expiry))
 
     def _set_source(self, source: str) -> None:
         if source != self.quote_source:

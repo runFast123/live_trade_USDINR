@@ -105,46 +105,55 @@ again"* is not.
 
 ## Several limits at once
 
-The single limit answers "may I roll?". It cannot answer "how much would I do
-at thirty basis points, and how much at fifty?" -- so `limit_ladder` takes a
-list of rungs, each with its own quantity:
-
-```json
-"limit_ladder": [
-  {"bps": "30", "qty": 10000},
-  {"bps": "50", "qty": 20000}
-]
-```
-
-That is a campaign of **30,000**: ten thousand at up to thirty basis points and
-twenty thousand more at up to fifty. Every rung is shown live, whether or not it
-qualifies, with the far ask that would make it trade:
+The single ROLL LIMIT box answers "may I roll?" and nothing else. It cannot
+answer "how much would I do at thirty basis points, and how much at fifty?" --
+so the ladder gives each limit the same treatment that one limit had, and you
+set them in the window rather than in a file:
 
 ```
-LADDER                                    10,000 of 30,000 rolled, 20,000 left   clip 1,000
-   Limit   In rupees   Far ask at or below   Distance             Rolled
-  30 bps      0.2873              96.0673       -1.8    10,000 / 10,000   done
-  50 bps      0.4789              96.2589      -21.8         0 / 20,000   WORKING
+LADDER                                    4,000 of 35,000 rolled, 31,000 left   clip 1,000
+LIMIT  QTY        IN RUPEES   FAR ASK AT OR BELOW   DISTANCE            ROLLED   STATUS
+[ 30]  [ 10000]      0.2875               96.1000      +36.0    4,000 / 10,000   36.0 bps away
+[ 45]  [  5000]      0.4312               96.2437      +21.0         0 / 5,000   21.0 bps away
+[ 50]  [ 20000]      0.4791               96.2916      +16.0        0 / 20,000   16.0 bps away
+
+[Add rung]  [Set ladder]
 ```
 
-**The cheapest rung with quantity left is worked first.** When both qualify, the
-price paid is the same either way, but crediting the tight rung keeps the loose
-one in reserve for a worse market later. Crediting the loose one first strands
-the rest of the campaign behind the tight limit.
+The limit and the quantity are typed. Everything to the right is the market
+against that rung: what the basis points come to in rupees, the far ask that
+would satisfy it, how far away we are, and how much of it is done. **Set
+ladder** validates and applies; it always disarms, so a typed digit cannot fire
+a roll on the next tick, and it writes the result back to `config.json`.
+
+That ladder is a campaign of **35,000**: each rung is its own allocation and
+they add up.
+
+**The cheapest rung with quantity left is worked first.** When more than one
+qualifies the price paid is the same either way, but crediting the tight rung
+keeps the loose one in reserve for a worse market later. Crediting the loose one
+first strands the rest of the campaign behind the tight limit.
 
 **No rung may be looser than the tenor limit** in `limit_bps_schedule`. A ladder
-decides how to spend within the limit, not whether to raise it; a rung above the
-ceiling is refused, and the app falls back to the single limit and says so.
+decides how to spend within the limit, not whether to raise it, so a rung above
+the ceiling is refused with the reason shown next to the buttons. If the tenor
+is not known yet, nothing is accepted at all -- without a ceiling a rung could
+quietly exceed the limit for this roll.
+
+Also refused, in place, with the bad row left on screen to be corrected: a
+quantity that is not a multiple of the lot size, the same limit twice, and
+anything that is not a number.
 
 A rung is a budget, not an order size. `lots` still decides what goes out in one
-order and `max_clips_per_day` how many orders a day -- so a 10,000 rung with a
+order and `max_clips_per_day` how many orders a day -- a 10,000 rung with a
 1,000 clip is ten orders, which is why the panel shows the clip size next to the
-total. Raise `lots` to send more at once, and the depth gate will still refuse
-a clip the book cannot fill.
+total. Raise `lots` to send more at once; the depth gate will still refuse a
+clip the book cannot fill.
 
-Progress survives restarts and does not reset overnight. It resets when the
-contracts change, or via **Reset ladder**, which only forgets what the app
-believes and changes nothing at the exchange.
+Progress survives restarts and does not reset overnight. Editing keeps it for
+any rung still at the same limit and drops it for one removed or repriced,
+because that is a different commitment. **Reset ladder** forgets all of it, and
+changes nothing at the exchange.
 
 ## What happens around an order
 
