@@ -237,5 +237,71 @@ class TestCancelFailure(unittest.TestCase):
         self.assertIn("check the terminal", log.text())
 
 
+class TestFillAfterCancel(unittest.TestCase):
+    """The quantity that matters is the one after the cancel has landed.
+
+    place_leg used to read the fill, fire the cancel, then return the
+    PRE-cancel number. Anything that traded in that gap was invisible, so the
+    far leg was sized too small and the account ended up half rolled. At one
+    lot this never bites; at twenty it does.
+    """
+
+    # The stub serves one book per get_order_book call and then repeats the
+    # last. The poll loop consumes two before the cancel, so the settled state
+    # has to be the final entry.
+    PARTIAL = {"Response": [order_row(filled=300, status="PartiallyFilled")]}
+
+    def test_a_fill_landing_during_the_cancel_is_picked_up(self):
+        # Poll sees 300. Then the rest trades before the cancel takes effect.
+        orders = StubOrders([
+            {"Response": []},                                   # snapshot before
+            self.PARTIAL,                                       # first poll
+            self.PARTIAL,                                       # second poll
+            {"Response": [order_row(filled=1000, status="Complete")]},
+        ])
+        b, log = broker_with(orders)
+        out = b.place_leg(instrument(), SELL, 1000, D("95.9400"), "leg 1")
+
+        self.assertEqual(out.filled_qty, 1000)
+        self.assertTrue(out.certain)
+        self.assertIn("more filled between the last poll", log.text())
+
+    def test_a_cancelled_order_settles_at_what_it_actually_got(self):
+        orders = StubOrders([
+            {"Response": []},
+            self.PARTIAL,
+            self.PARTIAL,
+            {"Response": [order_row(filled=400, status="Cancelled")]},
+        ])
+        b, _ = broker_with(orders)
+        out = b.place_leg(instrument(), SELL, 1000, D("95.9400"), "leg 1")
+
+        self.assertEqual(out.filled_qty, 400)
+        self.assertTrue(out.certain)
+
+    def test_an_unreadable_settlement_is_not_assumed(self):
+        """If the final quantity cannot be read, the outcome is unknown."""
+        orders = StubOrders([
+            {"Response": []},
+            self.PARTIAL,
+            self.PARTIAL,
+            {"Response": []},                                   # order vanished
+        ])
+        b, _ = broker_with(orders)
+        out = b.place_leg(instrument(), SELL, 1000, D("95.9400"), "leg 1")
+
+        self.assertFalse(out.certain)
+        self.assertIn("could not be read", out.detail)
+        self.assertIn("At least 300", out.detail)
+
+    def test_a_full_fill_never_reaches_the_settle_path(self):
+        orders = StubOrders([{"Response": []},
+                             {"Response": [order_row(filled=1000)]}])
+        b, _ = broker_with(orders)
+        out = b.place_leg(instrument(), SELL, 1000, D("95.9400"), "leg 1")
+        self.assertEqual(out.filled_qty, 1000)
+        self.assertEqual(orders.cancelled, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

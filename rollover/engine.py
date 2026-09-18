@@ -399,6 +399,17 @@ class RollEngine:
             short_by = leg1.filled_qty - leg2.filled_qty
             self._handle_leg2_failure(leg1, leg2, short_by, near_q)
 
+        except Exception as exc:
+            # Anything unexpected in here can have left a leg filled. Without
+            # this the exception escaped to the watch loop, which logged it and
+            # carried on: no halt, every gate passing again, and the operator
+            # able to arm on top of a position that is already half moved.
+            self.halt(
+                f"{type(exc).__name__} during execution: {exc}. A leg may have "
+                "filled. Check the terminal and the position book before doing "
+                "anything else.")
+            self.log.error(f"Execution failed after the roll had started: {exc!r}")
+
         finally:
             self.session.in_flight = False
 

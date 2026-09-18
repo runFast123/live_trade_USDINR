@@ -279,5 +279,73 @@ class TestHaltBehaviour(ExecutionCase):
         self.assertIsNone(engine.session.halted_reason)
 
 
+class TestNothingEscapesWithoutAHalt(ExecutionCase):
+    """An exception mid-roll must halt, never return to watching.
+
+    _execute used to be try/finally with no except. An exception after the near
+    leg filled escaped to the watch loop, which logged it and carried on: no
+    halt, every gate passing again, and the operator free to arm on top of a
+    position that was already half moved. That was the most dangerous line in
+    the program.
+    """
+
+    class Boom(RuntimeError):
+        pass
+
+    def test_a_failure_while_sending_the_far_leg_halts(self):
+        engine = self.build([outcome(1000, 1000)])
+
+        def explode(info, side, qty, price, label):
+            if "leg 2" in label:
+                raise self.Boom("gateway refused the far leg")
+            return outcome(1000, 1000)
+
+        engine.broker.place_leg = explode
+        engine._execute(self.decision, self.near_q, self.far_q)
+
+        self.assertIsNotNone(engine.session.halted_reason)
+        self.assertIn("Boom", engine.session.halted_reason)
+        self.assertEqual(engine._state, HALTED)
+
+    def test_the_halt_says_a_leg_may_have_filled(self):
+        engine = self.build([])
+
+        def explode(*a, **k):
+            raise self.Boom("network died")
+
+        engine.broker.place_leg = explode
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertIn("may have filled", engine.session.halted_reason)
+
+    def test_a_pricing_failure_on_the_far_leg_halts(self):
+        """exchange_price raises BrokerError for an off-grid price."""
+        from rollover.broker import BrokerError
+
+        engine = self.build([outcome(1000, 1000)])
+
+        def explode(info, side, qty, price, label):
+            if "leg 2" in label:
+                raise BrokerError("price is not a multiple of the tick")
+            return outcome(1000, 1000)
+
+        engine.broker.place_leg = explode
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertIsNotNone(engine.session.halted_reason)
+
+    def test_in_flight_is_still_cleared_after_an_exception(self):
+        engine = self.build([])
+        engine.broker.place_leg = lambda *a, **k: (_ for _ in ()).throw(
+            self.Boom("x"))
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertFalse(engine.session.in_flight)
+
+    def test_an_exception_does_not_count_a_clip(self):
+        engine = self.build([])
+        engine.broker.place_leg = lambda *a, **k: (_ for _ in ()).throw(
+            self.Boom("x"))
+        engine._execute(self.decision, self.near_q, self.far_q)
+        self.assertEqual(engine.session.clips_done_today, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

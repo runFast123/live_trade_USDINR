@@ -668,9 +668,56 @@ class Broker:
         if filled < qty:
             self._cancel(record, info, side, qty - filled, units, label)
 
+            # A cancel is not instantaneous. Whatever traded between the last
+            # poll and the cancel taking effect is absent from `filled`, and
+            # sizing the second leg from a stale number is precisely how a half
+            # roll gets manufactured. At one lot this never bites; at twenty it
+            # does. Re-read once the order has settled and use that.
+            settled, settled_status = self._settle_after_cancel(
+                token, side, before, qty)
+
+            if settled is None:
+                return OrderOutcome(
+                    sent=True, filled_qty=filled, requested_qty=qty, order_ref=ref,
+                    certain=False, raw=record,
+                    detail=("cancelled, but the final filled quantity could not be "
+                            f"read ({settled_status}). At least {filled} of {qty} "
+                            "filled; check the terminal."))
+
+            if settled != filled:
+                self.log.warn(
+                    f"{label}: {settled - filled} more filled between the last poll "
+                    f"and the cancel taking effect; using {settled}, not {filled}.")
+            filled, status = settled, settled_status
+
         return OrderOutcome(sent=True, filled_qty=filled, requested_qty=qty, order_ref=ref,
                             certain=True, raw=record,
                             detail=f"filled {filled} of {qty} ({status})")
+
+    def _settle_after_cancel(self, token: str, side: int, before: set, qty: int,
+                             wait: float = 2.0) -> Tuple[Optional[int], str]:
+        """Read the order's final filled quantity once the cancel has landed.
+
+        Returns (None, reason) when it cannot be established, which the caller
+        must treat as an unknown outcome rather than assuming the earlier
+        reading still holds.
+        """
+        deadline = time.monotonic() + wait
+        last: Optional[int] = None
+        last_status = "the order could not be found after cancelling"
+
+        while time.monotonic() < deadline:
+            record = self._find_order(token, side, before)
+            if record is not None:
+                value, status = self.read_fill(record, qty)
+                if value is not None:
+                    last, last_status = value, status
+                    settled = any(word in status for word in _DEAD_WORDS + _FILLED_WORDS)
+                    if settled or value >= qty:
+                        return value, status
+            time.sleep(0.25)
+
+        return last, last_status
 
     def _cancel(self, record: Dict[str, Any], info: InstrumentInfo, side: int,
                 remainder: int, units: Decimal, label: str) -> None:
