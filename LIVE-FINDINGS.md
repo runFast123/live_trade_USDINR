@@ -243,8 +243,12 @@ Also worth noting: `PENDING` means "order confirmed from exchange", i.e. working
 - **Phase 0 (quantity unit): still open.** Now blocked behind the entitlement.
 - **Phase 1.3 (honest order outcomes): largely done**, and no longer theorised —
   every part of it was observed.
-- **Phase 1.4 (trade book as the fill record):** the endpoint is confirmed
-  reachable and its shape is known. Not yet wired in.
+- **Phase 1.4 (trade book as the fill record): done.** It now confirms each
+  leg against the order book and reports a disagreement, without halting on a
+  row shape that is still unconfirmed.
+- **Phases 1.5 to 1.8: done.** Margin gate (both legs in one request),
+  post-trade reconciliation, cancel-all with a clean shutdown, and a JSONL
+  journal.
 - **Phases 3.2, 3.3 and 4: blocked** until the account is enabled.
 - **New for Phase 2:** clip sizing must respect NSE's freeze quantity,
   or oversized clips come back FROZEN.

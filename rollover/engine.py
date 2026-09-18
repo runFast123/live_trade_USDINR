@@ -15,6 +15,8 @@ from typing import List, Optional, Tuple
 
 from . import gates as gatelib
 from . import ladder as ladderlib
+from . import journal as journallib
+from . import margin as marginlib
 from . import reconcile
 from . import limits as limitlib
 from . import rule
@@ -44,6 +46,7 @@ class SessionState:
     far: Optional[InstrumentInfo] = None
     market_open: Optional[bool] = None
     near_position_qty: Optional[int] = None
+    margin: Optional[object] = None   # margin.Estimate, refreshed on the slow beat
     clips_done_today: int = 0
     lots_rolled: int = 0
     in_flight: bool = False
@@ -85,6 +88,8 @@ class RollEngine:
         self.recorder = (Recorder(os.path.join(base_dir, "data"),
                                   cfg.record_interval_sec)
                          if cfg.record_market else None)
+        self.journal = journallib.Journal(os.path.join(base_dir, "data"),
+                                          enabled=cfg.journal)
         # Whether the cost was clearing the limit on the previous tick,
         # so the crossing can be announced once rather than every tick.
         self._was_qualifying = False
@@ -190,6 +195,7 @@ class RollEngine:
             self._state = HALTED
             self._note = reason
         self.log.alert(f"HALTED: {reason}")
+        self.journal.halt(reason)
         self._persist()
 
     def clear_halt(self) -> None:
@@ -275,6 +281,14 @@ class RollEngine:
         self.session.market_open = self.broker.market_open()
         if self.cfg.require_position and self.session.near:
             self.session.near_position_qty = self.broker.long_qty(self.session.near.token)
+
+        # Margin moves with the market, so it is refreshed on the slow beat
+        # rather than every tick. This is the screen's copy; the one that
+        # actually stops an order is taken immediately before leg 1.
+        if self.cfg.require_margin and not self.cfg.dry_run:
+            self.session.margin = marginlib.estimate(
+                self.broker, self.cfg.near_token, self.cfg.far_token,
+                self.cfg.clip_qty)
 
     # ------------------------------------------------------------------- loop
     def _run(self) -> None:
@@ -604,6 +618,7 @@ class RollEngine:
         self._set_state(WORKING, "sending the near leg")
         self.log.info("--- ROLL ---")
         self.log.info(decision.describe().replace("\n", " | "))
+        self.journal.decision(decision, dry_run=self.cfg.dry_run, armed=True)
 
         # Read before anything is sent. Both are the baseline for afterwards:
         # the position book says what the account held, the trade book says
@@ -617,11 +632,32 @@ class RollEngine:
             before_trades = self.broker._trade_snapshot()
             self.log.info(f"Before the roll: {before_positions.describe()}")
 
+        # The gate's copy is up to a slow beat old and was sized on the
+        # configured clip. This one is taken now, for the quantity actually
+        # about to be sent, and is what stops the order.
+        if self.cfg.require_margin and not self.cfg.dry_run:
+            estimate = marginlib.estimate(
+                self.broker, self.cfg.near_token, self.cfg.far_token,
+                decision.qty)
+            self.session.margin = estimate
+            self.journal.margin(estimate, decision.qty)
+            if estimate.affordable is not True:
+                self.session.in_flight = False
+                self.disarm("margin")
+                self.log.alert(
+                    "NOT SENDING: " + (estimate.describe() if estimate.known
+                                       else estimate.detail)
+                    + ". Nothing was sent, and the app has disarmed.")
+                self._set_state(WATCHING, "margin")
+                return
+
         try:
             leg1 = self.broker.place_leg(
                 self.session.near, SELL, decision.qty, decision.sell_limit,
                 "leg 1 near SELL")
             self.log.info(f"leg 1 result: {leg1.detail}")
+            self.journal.order("near", SELL, self.cfg.near_token, decision.qty,
+                               decision.sell_limit, leg1)
 
             if self.cfg.dry_run:
                 leg2_price = decision.buy_limit
@@ -648,6 +684,8 @@ class RollEngine:
                 self.session.far, BUY, leg1.filled_qty, decision.buy_limit,
                 "leg 2 far BUY")
             self.log.info(f"leg 2 result: {leg2.detail}")
+            self.journal.order("far", BUY, self.cfg.far_token, leg1.filled_qty,
+                               decision.buy_limit, leg2)
 
             if leg2.fully_filled:
                 self._confirm_trades(leg1, leg2, before_trades)
@@ -659,6 +697,7 @@ class RollEngine:
                     self.broker, self.cfg.near_token, self.cfg.far_token,
                     before_positions or reconcile.Positions(None, None),
                     leg2.filled_qty, wait=self.cfg.reconcile_wait_sec)
+                self.journal.reconciliation(verdict)
                 if verdict.contradicted:
                     # Count the clip before halting: whatever else is wrong,
                     # this much was sent, and the daily budget must reflect it.
@@ -675,6 +714,13 @@ class RollEngine:
                 self.log.info(
                     f"ROLL COMPLETE: sold {leg1.filled_qty} near, bought {leg2.filled_qty} far, "
                     f"at a booked cost near {money(decision.roll_cost)} per unit.")
+                self.journal.note(
+                    "complete", "roll complete",
+                    near_filled=leg1.filled_qty, far_filled=leg2.filled_qty,
+                    roll_cost=decision.roll_cost, cost_bps=decision.cost_bps,
+                    limit_bps=decision.limit_bps,
+                    clips_done=self.session.clips_done_today,
+                    ladder_done=dict(self.ladder_progress))
                 self._slow_refresh()
                 return
 

@@ -39,6 +39,27 @@ class StubLog:
         return "\n".join(f"{lvl} {msg}" for lvl, msg in self.lines)
 
 
+class StubMarginAPI:
+    """Stands in for choice_api's orders/funds, so the real parsing runs."""
+
+    def __init__(self, margin=50000, funds=10000000):
+        self.margin, self.funds = margin, funds
+        self.asked = []
+
+    def get_margin(self, **kw):
+        self.asked.append(kw)
+        if self.margin is None:
+            return {"Status": "Fail", "Response": "no", "Reason": "Error"}
+        return {"Status": "Success", "Response": {"TotalMargin": self.margin},
+                "Reason": ""}
+
+    def get_funds_view(self):
+        if self.funds is None:
+            return {"Status": "Fail", "Response": "no", "Reason": "Error"}
+        return {"Status": "Success",
+                "Response": {"AvailableMargin": self.funds}, "Reason": ""}
+
+
 class StubBroker:
     """Returns scripted outcomes and records exactly what was asked of it.
 
@@ -48,13 +69,16 @@ class StubBroker:
     it or the dry-run tests would be checking the wrong thing.
     """
 
-    def __init__(self, outcomes, cfg=None, positions=None, traded=None):
+    def __init__(self, outcomes, cfg=None, positions=None, traded=None,
+                 margin=50000, funds=10000000):
         self.outcomes = list(outcomes)
         self.cfg = cfg
         self.calls = []          # every request the engine made
         self.sent = []           # the subset that would reach the exchange
         self.logged_in = True
         self.scrip_file_date = date.today()
+        # The real broker always has one, and the margin reader uses it.
+        self.log = StubLog()
 
         # Reconciliation reads these. By default the account moves exactly as
         # the fills say it did, so a correct roll reconciles and the tests that
@@ -68,6 +92,12 @@ class StubBroker:
         self.traded = traded                 # None = the trade book is unreadable
         self._auto_positions = not self.positions
         self._reads = 0
+
+        # An account with room by default, so tests about anything else are
+        # not stopped by the margin gate. None on either means unreadable.
+        self.margin_api = StubMarginAPI(margin, funds)
+        self.client = type("C", (), {"orders": self.margin_api,
+                                     "funds": self.margin_api})()
 
     def place_leg(self, info, side, qty, limit_price, label):
         self.calls.append({"token": info.token, "side": side, "qty": qty,
@@ -141,7 +171,8 @@ class ExecutionCase(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.state_dir, ignore_errors=True)
 
-    def build(self, outcomes, positions=None, traded=None, **cfg_kw):
+    def build(self, outcomes, positions=None, traded=None, margin=50000,
+              funds=10000000, **cfg_kw):
         cfg_kw.setdefault("dry_run", False)
         cfg_kw.setdefault("use_live_feed", False)
         cfg_kw.setdefault("limit_mode", "absolute")
@@ -151,7 +182,7 @@ class ExecutionCase(unittest.TestCase):
         self.cfg = RollConfig(near_token="1769", far_token="1584", **cfg_kw)
         self.log = StubLog()
         self.broker = StubBroker(outcomes, self.cfg, positions=positions,
-                                 traded=traded)
+                                 traded=traded, margin=margin, funds=funds)
 
         engine = RollEngine(self.cfg, self.log, self.state_dir,
                             broker=self.broker)

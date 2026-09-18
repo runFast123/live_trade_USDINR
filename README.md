@@ -146,6 +146,41 @@ Progress survives restarts and does not reset overnight. It resets when the
 contracts change, or via **Reset ladder**, which only forgets what the app
 believes and changes nothing at the exchange.
 
+## What happens around an order
+
+Four things sit between a qualifying quote and a completed roll, and none of
+them existed at first.
+
+**Margin, before anything is sent.** Both legs go to `get_margin` in one
+request, because a calendar spread nets and asking about the sell and the buy
+separately would add two outright numbers together and refuse rolls the account
+can comfortably afford. A shortfall otherwise surfaces as a filled near leg and
+a rejected far one, which is a naked short in the month about to expire.
+Unknown counts as unaffordable: guessing optimistically here is exactly how
+that happens. Needs kkunal 1.3.0.
+
+**Reconciliation, afterwards.** A roll of N moves the near leg down N and the
+far leg up N. Both legs are read before the first order and again after the
+second, and a position book that disagrees halts. A book that cannot be *read*
+is not a book that *disagrees* -- the first warns, the second halts.
+
+**The trade book, as a second witness.** `get_trade_book` is the exchange's
+record of what executed, against the order book's summary of what the broker
+believes. A disagreement is reported loudly but does not halt on its own: its
+row shape is the one thing the live probe could not confirm, and halting every
+roll on a guess about field names would be worse.
+
+**A journal**, at `data/journal-<date>.jsonl`, one JSON object per line: the
+decision with the limit that was in force, each order with the broker's
+reference and its raw answer, the reconciliation verdict, and every halt.
+Decimals are written as strings, so the number in the record is the number the
+decision was made on. A crash costs at most the line being written.
+
+**Cancel all**, and a close that uses it. A Day order outlives this process at
+the exchange and the app-side synthetic IOC that would have cancelled it does
+not. Closing the window cancels first and says so if anything was left in
+doubt.
+
 ## Dry run and live
 
 The app starts in whatever mode `config.json` says, and ships in **dry run**,
@@ -246,6 +281,9 @@ The workflow refuses to release if the tag does not match
 | `rollover/probe.py` | the one-order live probe |
 | `rollover/notify.py` | sound, because a screen alert is useless to someone not looking |
 | `rollover/ladder.py` | several limits at once, each with its own quantity |
+| `rollover/margin.py` | can the account carry this roll, both legs in one question |
+| `rollover/reconcile.py` | did the position actually move the way the fills said |
+| `rollover/journal.py` | one JSON line per decision, order, fill and halt |
 | `rollover/livemode.py` | the preconditions for sending real orders |
 | `rollover/state.py` | the clip count, any halt and ladder progress, kept across restarts |
 | `logs/` | a dated audit log of every decision and order |

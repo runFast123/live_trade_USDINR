@@ -130,6 +130,11 @@ class RollConfig:
     require_market_status: bool = True   # False = trust window_open/window_close instead
     require_fresh_scrip: bool = True     # refuse if the scrip master is not today's
     require_position: bool = True        # refuse to sell a near leg you do not hold
+
+    # Check the whole roll's margin before leg 1. A shortfall otherwise
+    # surfaces as a filled near leg and a rejected far one, which is a naked
+    # short in the month about to expire. Needs kkunal 1.3.0 for get_margin.
+    require_margin: bool = True
     require_touch_size: bool = True      # refuse unless both touches can fill the clip
     auto_unwind_on_leg2_failure: bool = False
     dry_run: bool = True                 # nothing is sent to the exchange while true
@@ -149,6 +154,7 @@ class RollConfig:
 
     # --- observing -----------------------------------------------------------
     record_market: bool = True           # write a market sample CSV
+    journal: bool = True                 # write data/journal-<date>.jsonl
     record_interval_sec: float = 5.0
     alert_on_qualify: bool = True        # say something when the cost first clears
 

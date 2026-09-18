@@ -269,6 +269,20 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
              f"{money(cfg.roll_cost_band_low_d)}..{money(cfg.roll_cost_band_high_d)}; "
              "treating this as bad data")
 
+    if getattr(cfg, "require_margin", False) and not cfg.dry_run:
+        estimate = getattr(session, "margin", None)
+        if estimate is None:
+            add("margin", False, "not yet checked")
+        elif estimate.affordable is None:
+            # Unknown is not affordable. Guessing optimistically here is how a
+            # rejected far leg leaves a naked short in the expiring month.
+            add("margin", False, estimate.detail)
+        else:
+            add("margin", estimate.affordable, estimate.describe())
+    else:
+        add("margin", True,
+            "not checked in dry run" if cfg.dry_run else "check disabled")
+
     add("roll cost below limit",
         decision.qualifies,
         f"{money(decision.roll_cost)} < {money(decision.limit)}" if decision.qualifies
