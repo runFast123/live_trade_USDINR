@@ -19,6 +19,11 @@ and buy the far contract, one clip at a time. Otherwise do nothing.
 
 Segment: `13` (NSE currency derivatives).
 
+Contract facts, all read from the daily scrip master and cross-checked against
+the exchange's own rules: lot size 1000 USD, tick 0.0025 (a quarter of a paisa),
+and monthly expiry two working days before the last business day of the month.
+All twelve listed monthly contracts match that expiry rule exactly.
+
 ---
 
 ## 2. The rule
@@ -69,7 +74,23 @@ two as the same is the mistake this guards against: a one month roll was found
 running a 0.50 limit, which is 52 bps, seventy four percent looser than intended.
 
 The basis points are taken of the **near contract's mid**, not of the bid being
-hit, so the limit does not move with our own side of the spread. The result is
+hit, so the limit does not move with our own side of the spread.
+
+### The cost measured is what you pay, not what is quoted
+
+A calendar spread is normally quoted mid to mid. What this app measures is bid
+to ask, which is the price actually achievable, and therefore includes half of
+each leg's spread:
+
+| Roll | Quoted, mid to mid | Traded, bid to ask | Difference |
+|---|---|---|---|
+| Sep → Oct | 0.3100 = 32.3 bps | 0.3125 = 32.6 bps | 0.3 bps |
+| Sep → Nov | 0.5750 = 59.9 bps | 0.5800 = 60.5 bps | 0.5 bps |
+
+The limit therefore caps what is actually paid rather than what is quoted, which
+is the stricter of the two readings and never lets the real cost exceed the
+limit. On a wide book the gap grows, so a roll can be inside the quoted spread
+and still refused here. The result is
 quantized to four decimal places, the same grid prices sit on, so a decision can
 be reproduced exactly from the log.
 
