@@ -329,6 +329,8 @@ class RollWindow(tk.Toplevel):
                                   f"(running {__version__}).")
                 elif kind == "progress":
                     self.update_button.set_text(f"Downloading {payload:.0%}")
+                elif kind == "ready":
+                    self._install_now(payload)
                 elif kind == "failed":
                     self._updating = False
                     self.update_button.set_enabled(True)
@@ -338,6 +340,29 @@ class RollWindow(tk.Toplevel):
                     self.log.error(f"Update failed: {payload}")
         except queue.Empty:
             pass
+
+    def _install_now(self, downloaded: str) -> None:
+        """Swap in the new build and end this process. Main thread only."""
+        self.update_button.set_text("Restarting...")
+        try:
+            self.log.info("Update verified. Handing over to the installer.")
+            self.engine.stop()
+            updater.stage_update(downloaded)
+        except Exception as exc:
+            self._updating = False
+            self.update_button.set_enabled(True)
+            self.log.error(f"Update could not be installed: {exc}")
+            return
+
+        self.log.info("Closing so the new version can replace this one.")
+        self._cancel_refresh()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        # The swap cannot start until this process releases the file, so go
+        # now rather than risk a thread holding the window open.
+        updater.quit_now(0)
 
     def _do_update(self) -> None:
         """Download and install, but never in the middle of something."""
@@ -385,11 +410,10 @@ class RollWindow(tk.Toplevel):
                 path = updater.download(
                     self._release,
                     progress=lambda f: self._updates.put(("progress", f)))
-                self.log.info("Update downloaded and verified. Restarting.")
-                self.engine.stop()
-                updater.install_and_restart(path)
-            except SystemExit:
-                raise
+                # Hand back to the main thread. Ending the process from here
+                # would only end this thread, leaving the executable locked
+                # and the swap waiting forever.
+                self._updates.put(("ready", path))
             except Exception as exc:
                 self._updates.put(("failed", str(exc)))
 
@@ -777,13 +801,22 @@ class RollWindow(tk.Toplevel):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
-    def _on_close(self) -> None:
-        self.engine.disarm("window closing")
-        self.engine.stop()
+    def _cancel_refresh(self) -> None:
+        """Stop the redraw timer before the widgets go away.
+
+        Without this the pending callback fires against a destroyed window. On
+        the update path os._exit usually wins that race, but relying on a race
+        is not a reason to leave the error there.
+        """
         if self._refresh_id is not None:
             try:
                 self.after_cancel(self._refresh_id)
             except tk.TclError:
                 pass
             self._refresh_id = None
+
+    def _on_close(self) -> None:
+        self.engine.disarm("window closing")
+        self.engine.stop()
+        self._cancel_refresh()
         self.destroy()

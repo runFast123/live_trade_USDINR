@@ -150,6 +150,12 @@ def cmd_run(cfg: RollConfig, log: Logbook, base: str, config_path: str) -> int:
         log.warn("LIVE MODE. Real orders will be sent when you arm the app "
                  "and every gate passes.")
 
+    # An update that never finished leaves a whole build behind in temp.
+    from rollover import updater
+    stale = updater.cleanup_stale_downloads()
+    if stale:
+        log.info(f"Removed {stale} unfinished update download(s).")
+
     root = tk.Tk()
     root.withdraw()
 

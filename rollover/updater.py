@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -240,8 +241,20 @@ def write_swap_script(target: str, new_exe: str, backup: str,
     return script_path
 
 
-def install_and_restart(new_exe: str) -> None:
-    """Swap the running executable for the new one and start it again."""
+def stage_update(new_exe: str) -> str:
+    """Start the swap running in the background and return its script path.
+
+    It does **not** end this process, and it must not: the swap cannot begin
+    until the executable is unlocked, which only happens once this process is
+    gone. Ending it is the caller's job, and has to be done from the main
+    thread, because sys.exit() on a worker thread raises SystemExit in that
+    thread alone and leaves the process very much alive.
+
+    That was exactly the bug: the update downloaded, verified, logged
+    "Restarting", exited a worker thread, and then nothing happened. The
+    executable stayed locked, the script sat waiting for a lock that would
+    never clear, and the download was orphaned in the temp directory.
+    """
     ok, why = can_install()
     if not ok:
         raise UpdateError(why)
@@ -252,4 +265,44 @@ def install_and_restart(new_exe: str) -> None:
     subprocess.Popen(["cmd", "/c", script],
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                      | getattr(subprocess, "DETACHED_PROCESS", 0))
-    sys.exit(0)
+    return script
+
+
+def quit_now(code: int = 0) -> None:
+    """End the process immediately so the executable is released.
+
+    os._exit rather than sys.exit: a lingering non-daemon thread, or Tk still
+    unwinding, would keep the file locked and strand the update. Everything
+    that matters is already on disk, because the log writes and closes on every
+    line.
+    """
+    sys.stdout.flush() if sys.stdout else None
+    sys.stderr.flush() if sys.stderr else None
+    os._exit(code)
+
+
+def cleanup_stale_downloads(older_than_seconds: int = 3600) -> int:
+    """Delete update downloads left behind by an attempt that never finished.
+
+    Each is the size of a whole build, so a few failed attempts quietly cost
+    well over a hundred megabytes.
+    """
+    removed = 0
+    folder = tempfile.gettempdir()
+    now = time.time()
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+
+    for name in names:
+        if not (name.startswith("roll_app_update_") and name.endswith(".exe")):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            if now - os.path.getmtime(path) > older_than_seconds:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
