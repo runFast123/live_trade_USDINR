@@ -81,6 +81,12 @@ class RollConfig:
     # tenor limit -- see rollover/ladder.py.
     limit_ladder: list = field(default_factory=list)
 
+    # Limits with no quantity: priced and shown alongside the rungs so several
+    # can be compared at once, and never traded. Because they cannot trade they
+    # are not bound by the tenor ceiling, which is what makes them safe to
+    # experiment with -- unlike the single roll limit, which IS the ceiling.
+    watch_limits: list = field(default_factory=list)
+
     lots: int = 1                        # one clip
     allowance_ticks: int = 0             # price give on each leg; 0 is strictest
     tick: str = "0.0025"
@@ -229,6 +235,13 @@ class RollConfig:
                 # two month roll could be matched to the one month limit.
                 errors.append("tenor_tolerance_days above 15 would let one tenor "
                               "be mistaken for another")
+
+        if self.watch_limits:
+            from .ladder import LadderError as _LadderError, parse_watch
+            try:
+                parse_watch(self.watch_limits)
+            except _LadderError as exc:
+                errors.append(str(exc))
 
         if self.limit_ladder:
             from .ladder import LadderError, parse as parse_ladder

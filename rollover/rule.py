@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import List, Optional
 
-from .ladder import Ladder, RungView
+from .ladder import Ladder, RungView, watch_views
 from .limits import Limit, LimitError, resolve, to_bps
 from .money import ceil_tick, floor_tick, money, q4
 from .quotes import Quote
@@ -35,6 +35,9 @@ class RollDecision:
     # worked. Empty when no ladder is configured.
     rungs: List["RungView"] = field(default_factory=list)
     active_rung: Optional["RungView"] = None
+
+    # Limits carrying no quantity, priced for comparison only.
+    watch_rungs: List["RungView"] = field(default_factory=list)
 
     @property
     def cost_per_lot(self) -> Decimal:
@@ -91,7 +94,8 @@ class RollDecision:
 def compute(near: Quote, far: Quote, cfg,
             days: Optional[int] = None,
             ladder: Optional[Ladder] = None,
-            progress: Optional[dict] = None) -> RollDecision:
+            progress: Optional[dict] = None,
+            watch: Optional[list] = None) -> RollDecision:
     """Evaluate the roll rule against one pair of quotes.
 
     roll_cost = far.ask - near.bid
@@ -146,6 +150,11 @@ def compute(near: Quote, far: Quote, cfg,
     qty = cfg.clip_qty
     ladder_blocker: Optional[str] = None
 
+    # Limits the operator is comparing but not trading. Priced whatever else
+    # happens, including when the ladder itself cannot be used.
+    watching: List[RungView] = watch_views(watch or [], roll_cost, reference,
+                                           near_bid)
+
     if ladder:
         rungs = ladder.evaluate(roll_cost, reference, near_bid, progress)
         active = ladder.active(rungs)
@@ -184,6 +193,7 @@ def compute(near: Quote, far: Quote, cfg,
             limit=limit if limit is not None else q4(Decimal(0)), qty=0,
             qualifies=False, blockers=[ladder_blocker], limit_detail=detail,
             reference=reference, rungs=rungs, active_rung=None,
+            watch_rungs=watching,
         )
 
     if limit is None:
@@ -193,7 +203,7 @@ def compute(near: Quote, far: Quote, cfg,
             sell_limit=sell_limit, buy_limit=buy_limit, worst_case=worst_case,
             limit=q4(Decimal(0)), qty=cfg.clip_qty, qualifies=False,
             blockers=[limit_error], limit_detail=None, reference=reference,
-            rungs=rungs, active_rung=None,
+            rungs=rungs, active_rung=None, watch_rungs=watching,
         )
 
     if roll_cost >= limit:
@@ -225,4 +235,5 @@ def compute(near: Quote, far: Quote, cfg,
         reference=reference,
         rungs=rungs,
         active_rung=active if not blockers else None,
+        watch_rungs=watching,
     )

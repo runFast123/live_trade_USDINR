@@ -431,14 +431,17 @@ class RollWindow(tk.Toplevel):
 
         controls = tk.Frame(box, bg=T.SURFACE)
         controls.pack(fill="x", pady=(T.PAD_S, 0))
-        T.Button(controls, "Add rung", self._add_rung, self.fonts,
+        T.Button(controls, "Add limit", self._add_rung, self.fonts,
                  width=110, height=30).pack(side="left")
         T.Button(controls, "Set ladder", self._apply_ladder, self.fonts,
                  kind="primary", width=110, height=30).pack(side="left",
                                                             padx=T.PAD_XS)
+        # Wrapped, not truncated: a refusal that stops mid-sentence tells the
+        # operator a rung is wrong without telling them what to do about it.
         self.ladder_note = tk.Label(controls, text="", bg=T.SURFACE, fg=T.FAINT,
-                                    font=self.fonts.ui_small, anchor="w")
-        self.ladder_note.pack(side="left", padx=T.PAD_S)
+                                    font=self.fonts.ui_small, anchor="w",
+                                    justify="left", wraplength=620)
+        self.ladder_note.pack(side="left", padx=T.PAD_S, fill="x", expand=True)
 
         self.rung_rows = []
         self._ladder_shown = False
@@ -454,6 +457,10 @@ class RollWindow(tk.Toplevel):
         ladder = getattr(self.engine, "ladder", None)
         for rung in (ladder.rungs if ladder else []):
             self._add_row(f"{rung.bps.normalize():f}", str(rung.qty), rung.key)
+
+        for bps in (getattr(self.engine, "watch_limits", None) or []):
+            key = f"{bps.normalize():f}"
+            self._add_row(key, "", key, watch=True)
         self._reflow_rows()
 
     def _forget_row(self, row) -> None:
@@ -461,8 +468,9 @@ class RollWindow(tk.Toplevel):
                        *row["cells"].values()):
             widget.destroy()
 
-    def _add_row(self, bps: str = "", qty: str = "", key=None) -> None:
-        row = {"key": key, "bps": tk.StringVar(value=bps),
+    def _add_row(self, bps: str = "", qty: str = "", key=None,
+                 watch: bool = False) -> None:
+        row = {"key": key, "watch": watch, "bps": tk.StringVar(value=bps),
                "qty": tk.StringVar(value=qty), "cells": {}}
 
         row["bps_box"] = T.entry(self.ladder_grid, self.fonts,
@@ -503,7 +511,9 @@ class RollWindow(tk.Toplevel):
         self._add_row()
         self._reflow_rows()
         self._show_ladder()
-        self._ladder_note("type a limit and a quantity, then Set ladder", T.MUTED)
+        self._ladder_note(
+            "a limit with a quantity is traded; leave the quantity blank to "
+            "watch and compare it only", T.MUTED)
         self.rung_rows[-1]["bps_box"].focus_set()
 
     def _remove_rung(self, row) -> None:
@@ -524,18 +534,29 @@ class RollWindow(tk.Toplevel):
 
     # ---- applying ---------------------------------------------------------
     def _typed_ladder(self):
-        """What the rows currently say, or None with a complaint shown."""
-        wanted = []
+        """The rows, split into rungs and watch lines. None on a complaint.
+
+        A limit with a quantity is a rung: it will be traded, and it is bound
+        by the tenor ceiling. A limit with the quantity left blank is a watch
+        line: priced and compared so several limits can be read at once, never
+        traded, and therefore not bound by the ceiling. That is the safe place
+        to ask "what would fifty look like?" -- the single roll limit is not,
+        because it IS the ceiling.
+        """
+        rungs, watch = [], []
         for row in self.rung_rows:
             bps, qty = row["bps"].get().strip(), row["qty"].get().strip()
-            if not bps and not qty:
-                continue                      # a row left blank is not a rung
-            if not bps or not qty:
-                self._ladder_note("every rung needs both a limit and a quantity",
-                                  T.DANGER)
-                return None
-            wanted.append({"bps": bps, "qty": qty})
-        return wanted
+            if not bps:
+                if qty:
+                    self._ladder_note("a quantity with no limit is not a rung",
+                                      T.DANGER)
+                    return None
+                continue                      # a row left blank is nothing
+            if qty:
+                rungs.append({"bps": bps, "qty": qty})
+            else:
+                watch.append(bps)
+        return rungs, watch
 
     def _apply_ladder(self) -> None:
         """Validate what has been typed and put it into force.
@@ -546,11 +567,12 @@ class RollWindow(tk.Toplevel):
         """
         from dataclasses import replace
 
-        from .ladder import parse as parse_ladder
+        from .ladder import parse as parse_ladder, parse_watch
 
-        wanted = self._typed_ladder()
-        if wanted is None:
+        typed = self._typed_ladder()
+        if typed is None:
             return
+        wanted, watch = typed
 
         if getattr(self.engine.session, "in_flight", False):
             # A clip in flight was sized and priced against the rung the
@@ -575,30 +597,40 @@ class RollWindow(tk.Toplevel):
         try:
             built = parse_ladder(wanted, lot_size=self.cfg.expected_lot_size,
                                  ceiling_bps=ceiling)
-            candidate = replace(self.cfg, limit_ladder=wanted)
+            # Watch lines are deliberately NOT ceiling-checked. They cannot
+            # trade, so they cannot loosen anything, and that is exactly what
+            # makes them the safe place to ask what a wider limit would look
+            # like -- the single roll limit is not, because it IS the ceiling.
+            parse_watch(watch)
+            candidate = replace(self.cfg, limit_ladder=wanted,
+                                watch_limits=watch)
             candidate.validate()
         except Exception as exc:
             first = str(exc).splitlines()[-1].strip(" -")
-            self._ladder_note(first[:88], T.DANGER)
+            self._ladder_note(first, T.DANGER)
             return
 
         # Compare the rungs, not the text. config.json holds qty as a number
         # and the box hands back a string, so comparing the raw entries made
         # every press look like a change: disarming and re-saving each time.
         current = getattr(self.engine, "ladder", None)
-        if current and [(r.bps, r.qty) for r in current.rungs] == \
-                [(r.bps, r.qty) for r in built.rungs]:
+        same_rungs = ([(r.bps, r.qty) for r in (current.rungs if current else [])]
+                      == [(r.bps, r.qty) for r in built.rungs])
+        if same_rungs and parse_watch(watch) == parse_watch(self.cfg.watch_limits):
             self._ladder_note("unchanged", T.MUTED)
             return
 
         was_armed = self.engine.armed
         self.engine.disarm("ladder changed")
         self.cfg.limit_ladder = wanted
+        self.cfg.watch_limits = watch
         self.engine.rebuild_ladder()
         self._rebuild_rung_rows()
 
-        self.log.info(f"Ladder set to {len(wanted)} rung(s)"
-                      + (" (disarmed)" if was_armed else ""))
+        self.log.info(
+            f"Ladder set to {len(wanted)} rung(s)"
+            + (f" and {len(watch)} watch limit(s)" if watch else "")
+            + (" (disarmed)" if was_armed else ""))
 
         if self.config_path:
             try:
@@ -615,7 +647,8 @@ class RollWindow(tk.Toplevel):
     # ---- the live numbers -------------------------------------------------
     def _draw_ladder(self, decision) -> None:
         """Fill in what the market is doing against each rung."""
-        if not self.rung_rows and not getattr(self.engine, "ladder", None):
+        if (not self.rung_rows and not getattr(self.engine, "ladder", None)
+                and not self.cfg.watch_limits):
             if self._ladder_shown:
                 self.ladder_card.pack_forget()
                 self._ladder_shown = False
@@ -623,12 +656,15 @@ class RollWindow(tk.Toplevel):
         self._show_ladder()
 
         views = {v.rung.key: v for v in (getattr(decision, "rungs", None) or [])}
+        watched = {v.rung.key: v
+                   for v in (getattr(decision, "watch_rungs", None) or [])}
         active = getattr(decision, "active_rung", None)
         active_key = active.rung.key if active else None
 
         done = total = 0
         for row in self.rung_rows:
-            view = views.get(row["key"]) if row["key"] else None
+            source = watched if row.get("watch") else views
+            view = source.get(row["key"]) if row["key"] else None
             cells = row["cells"]
 
             if view is None:
@@ -641,7 +677,12 @@ class RollWindow(tk.Toplevel):
             total += view.rung.qty
             done += view.done
 
-            if view.exhausted:
+            if view.watch:
+                # It is priced for comparison and will never be traded, so it
+                # is shown in the colour of information rather than of action.
+                colour = T.ACCENT_TEXT if view.qualifies else T.MUTED
+                status = view.status
+            elif view.exhausted:
                 colour, status = T.FAINT, "done"
             elif view.rung.key == active_key:
                 colour, status = T.WARN, "WORKING"
@@ -665,7 +706,9 @@ class RollWindow(tk.Toplevel):
                 if view.required_far_ask is not None else "--", fg=T.TEXT)
             cells["gap"].configure(text=gap, fg=colour)
             cells["rolled"].configure(
-                text=f"{view.done:,} / {view.rung.qty:,}", fg=T.TEXT)
+                text="watching" if view.watch
+                else f"{view.done:,} / {view.rung.qty:,}",
+                fg=T.FAINT if view.watch else T.TEXT)
             cells["status"].configure(text=status, fg=colour)
 
         if total:
@@ -898,6 +941,14 @@ class RollWindow(tk.Toplevel):
         detail = getattr(self._last_decision, "limit_detail", None)
         return detail.tenor_months if detail else None
 
+    def _rungs_above(self, ceiling):
+        """Rungs the ladder holds that a proposed ceiling would not allow."""
+        if ceiling is None:
+            return []
+        ladder = getattr(self.engine, "ladder", None)
+        return [f"{r.bps.normalize():f}" for r in (ladder.rungs if ladder else [])
+                if r.bps > ceiling]
+
     def _reset_limit(self) -> None:
         if self._bps_mode:
             months = self._current_tenor()
@@ -961,6 +1012,18 @@ class RollWindow(tk.Toplevel):
         except Exception as exc:
             first = str(exc).splitlines()[-1].strip(" -")
             self._limit_note(first[:70], T.DANGER)
+            return
+
+        # Lowering the limit under a looser rung would leave that rung in force
+        # for the rest of the session -- the ladder is built once at startup --
+        # so the app would go on trading at the old, wider number against the
+        # new instruction. Refuse, and say which rung is in the way, rather
+        # than silently discarding a rung the operator put there.
+        blocking = self._rungs_above(self.engine._tenor_ceiling_bps(candidate))
+        if blocking:
+            self._limit_note(
+                f"the {blocking[0]} bps rung is above that; change it first",
+                T.DANGER)
             return
 
         if unchanged:

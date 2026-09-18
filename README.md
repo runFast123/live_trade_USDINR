@@ -129,6 +129,30 @@ a roll on the next tick, and it writes the result back to `config.json`.
 That ladder is a campaign of **35,000**: each rung is its own allocation and
 they add up.
 
+### Watching a limit without trading it
+
+Leave the quantity blank and the limit becomes a **watch line**: priced and
+compared alongside the rungs, and never traded.
+
+```
+LIMIT  QTY        IN RUPEES   FAR ASK AT OR BELOW  DISTANCE      ROLLED   STATUS
+[ 30]  [ 10000]      0.2877               96.2027     +33.6  3,000/10,000  33.6 bps away
+[ 45]  [      ]      0.4316               96.3466     +18.6      watching  18.6 bps away
+[ 50]  [      ]      0.4796               96.3946     +13.6      watching  13.6 bps away
+[ 65]  [      ]      0.6234               96.5384      -1.4      watching  in range
+```
+
+This is the answer to "what would fifty look like?", and it matters *where* you
+ask it. The single ROLL LIMIT box is the tenor ceiling -- typing a smaller
+number into it makes every looser rung illegal. A watch line cannot trade, so
+it cannot loosen anything, and it is therefore not ceiling-bound: you can watch
+90 bps while trading at 30.
+
+For the same reason, lowering the ROLL LIMIT below a rung you already hold is
+refused, and it names the rung in the way. Otherwise the ladder -- built once at
+startup -- would go on trading at the old, wider number against the new
+instruction for the rest of the session.
+
 **The cheapest rung with quantity left is worked first.** When more than one
 qualifies the price paid is the same either way, but crediting the tight rung
 keeps the loose one in reserve for a worse market later. Crediting the loose one

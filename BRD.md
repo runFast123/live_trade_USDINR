@@ -119,6 +119,12 @@ overnight, because a roll takes as long as it takes. It resets only when the
 contracts change, which is a different roll, or when the operator resets it by
 hand after reconciling against the position book.
 
+A limit with no quantity is a **watch line**: priced and compared, never traded.
+Because it cannot trade it cannot loosen anything, so it is not bound by the
+tenor ceiling. The single roll limit *is* that ceiling, which is why lowering it
+below a rung already in force is refused rather than leaving that rung trading
+at the old, wider number.
+
 The rungs are set in the window, not only in a file. Applying a change always disarms.
 
 When no ladder is configured the single tenor limit applies exactly as above.

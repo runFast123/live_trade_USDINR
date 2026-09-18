@@ -82,26 +82,34 @@ class RungView:
     distance_bps: Optional[Decimal] = None   # negative means it qualifies
     qualifies: bool = False
 
+    # A limit carrying no quantity: priced and compared, never traded. It is
+    # how an operator asks "what would thirty basis points look like?" without
+    # committing size to the answer, and because it cannot trade it is not
+    # bound by the tenor ceiling either.
+    watch: bool = False
+
     @property
     def remaining(self) -> int:
+        if self.watch:
+            return 0
         return max(0, self.rung.qty - self.done)
 
     @property
     def exhausted(self) -> bool:
-        return self.remaining <= 0
+        return not self.watch and self.remaining <= 0
 
     @property
     def workable(self) -> bool:
-        return self.qualifies and not self.exhausted
+        return self.qualifies and not self.watch and not self.exhausted
 
     @property
     def status(self) -> str:
+        if self.distance_bps is None:
+            return "no price"
         if self.exhausted:
             return "done"
         if self.qualifies:
-            return "READY"
-        if self.distance_bps is None:
-            return "no price"
+            return "in range" if self.watch else "READY"
         return f"{money(self.distance_bps, 1)} bps away"
 
 
@@ -224,6 +232,48 @@ def parse(raw: Any, lot_size: Optional[int] = None,
 
     rungs.sort(key=lambda r: r.bps)
     return Ladder(rungs)
+
+
+def parse_watch(raw: Any) -> List[Decimal]:
+    """Limits to price and show but never trade. Cheapest first, no duplicates."""
+    if raw in (None, "", [], {}):
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise LadderError("watch_limits must be a list of basis point figures")
+
+    out: List[Decimal] = []
+    for index, entry in enumerate(raw, start=1):
+        value = entry.get("bps") if isinstance(entry, dict) else entry
+        try:
+            bps = D(value)
+        except Exception:
+            raise LadderError(f"watch_limits entry {index}: {value!r} is not a number")
+        if bps <= 0:
+            raise LadderError(f"watch_limits entry {index}: must be positive")
+        if bps not in out:
+            out.append(bps)
+    return sorted(out)
+
+
+def watch_views(limits: List[Decimal], roll_cost: Optional[Decimal],
+                reference: Optional[Decimal],
+                near_bid: Optional[Decimal]) -> List[RungView]:
+    """Price a set of limits for comparison. No quantity, never traded."""
+    cost_bps = (to_bps(roll_cost, reference)
+                if roll_cost is not None and reference else None)
+
+    views = []
+    for bps in limits:
+        view = RungView(rung=Rung(bps=D(bps), qty=0), done=0, watch=True)
+        if reference is not None and D(reference) > 0:
+            view.limit_rupees = from_bps(bps, reference)
+            if near_bid is not None:
+                view.required_far_ask = q4(D(near_bid) + view.limit_rupees)
+        if cost_bps is not None:
+            view.distance_bps = (cost_bps - D(bps)).quantize(Decimal("0.1"))
+            view.qualifies = cost_bps < D(bps)
+        views.append(view)
+    return views
 
 
 def campaign_key(near_token: Any, far_token: Any) -> str:

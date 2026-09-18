@@ -107,8 +107,10 @@ class LadderUICase(unittest.TestCase):
             quote("1769", "95.7800", "95.7825"),
             quote("1584", D(far_ask) - D("0.0025"), far_ask),
             self.cfg, days=59, ladder=self.engine.ladder,
-            progress=self.engine.ladder_progress)
+            progress=self.engine.ladder_progress,
+            watch=self.engine.watch_limits)
         self.window._draw_ladder(decision)
+        self.window._last_decision = decision     # _draw sets this
         _root.update_idletasks()
         return decision
 
@@ -209,10 +211,10 @@ class TestAddingAndRemoving(LadderUICase):
         self.window._apply_ladder()
         self.assertEqual(len(self.cfg.limit_ladder), 2)
 
-    def test_half_a_row_is_refused(self):
-        self.add("40", "")
+    def test_a_quantity_with_no_limit_is_refused(self):
+        self.add("", "5000")
         self.window._apply_ladder()
-        self.assertIn("both a limit and a quantity", self.note())
+        self.assertIn("no limit", self.note())
         self.assertEqual(len(self.cfg.limit_ladder), 2)
 
     def test_escape_puts_the_rows_back(self):
@@ -288,6 +290,144 @@ class TestApplyingIsDeliberate(LadderUICase):
         self.add("40", "5000")
         self.window._apply_ladder()
         self.assertIn("Ladder set to 3 rung(s)", self.log.text())
+
+
+class TestWatchOnlyLimits(LadderUICase):
+    """A limit with no quantity: compared, never traded.
+
+    It is how an operator asks "what would fifty look like?" without
+    committing size to the answer -- and without touching the single roll
+    limit, which is the tenor ceiling and therefore the one number that is
+    dangerous to experiment with.
+    """
+
+    def test_a_blank_quantity_makes_a_watch_line(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.assertEqual(self.cfg.watch_limits, ["45"])
+        self.assertEqual(len(self.cfg.limit_ladder), 2, "it became a rung")
+
+    def test_it_is_priced_like_a_rung(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        decision = self.draw(far_ask="96.0500")
+
+        watched = {v.rung.key: v for v in decision.watch_rungs}
+        self.assertIn("45", watched)
+        self.assertEqual(watched["45"].limit_rupees, D("0.4310"))
+        self.assertIsNotNone(watched["45"].required_far_ask)
+
+    def test_it_shows_on_screen_with_the_rungs(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.draw(far_ask="96.4000")
+        self.assertEqual(self.cell(2, "rolled"), "watching")
+        self.assertIn("bps away", self.cell(2, "status"))
+
+    def test_it_is_never_traded(self):
+        """A price that clears the watch line but no rung must not trade."""
+        self.window._remove_rung(self.rows()[1])    # drop the 50 rung
+        self.add("45", "")
+        self.window._apply_ladder()
+        decision = self.draw(far_ask="96.2000")     # 43.8 bps: clears 45 only
+
+        self.assertFalse(decision.qualifies)
+        self.assertIsNone(decision.active_rung)
+        self.assertTrue(decision.watch_rungs[0].qualifies)
+        self.assertFalse(decision.watch_rungs[0].workable)
+
+    def test_it_is_not_bound_by_the_tenor_ceiling(self):
+        """It cannot trade, so it cannot loosen anything."""
+        self.add("90", "")
+        self.window._apply_ladder()
+        self.assertEqual(self.note(), "saved")
+        self.assertEqual(self.cfg.watch_limits, ["90"])
+
+    def test_the_same_limit_as_a_rung_is_still_refused(self):
+        self.add("70", "5000")
+        self.window._apply_ladder()
+        self.assertIn("looser", self.note())
+
+    def test_it_survives_a_restart(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.assertEqual(
+            [str(b) for b in self.engine._build_watch()], ["45"])
+
+    def test_duplicates_are_collapsed(self):
+        self.add("45", "")
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.assertEqual(self.cfg.watch_limits, ["45", "45"])
+        self.assertEqual([str(b) for b in self.engine.watch_limits], ["45"])
+
+    def test_something_that_is_not_a_number_is_refused(self):
+        self.add("later", "")
+        self.window._apply_ladder()
+        self.assertIn("not a number", self.note())
+
+    def test_changing_only_a_watch_line_still_counts_as_a_change(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.assertEqual(self.note(), "saved")
+
+    def test_applying_the_same_pair_twice_says_unchanged(self):
+        self.add("45", "")
+        self.window._apply_ladder()
+        self.window._apply_ladder()
+        self.assertEqual(self.note(), "unchanged")
+
+
+class TestTheLimitBoxCannotUndercutARung(LadderUICase):
+    """Lowering the tenor limit under a looser rung left that rung in force.
+
+    The ladder is built once at startup, so the app would go on trading at the
+    old, wider number against the new instruction for the rest of the session.
+    """
+
+    def test_lowering_the_limit_below_a_rung_is_refused(self):
+        self.draw()
+        self.window.limit_var.set("40")           # below the 50 rung
+        self.window._apply_limit()
+        self.assertIn("50 bps rung is above that",
+                      self.window.limit_note.cget("text"))
+
+    def test_the_schedule_is_not_changed(self):
+        self.draw()
+        self.window.limit_var.set("40")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule.get("2"), "50")
+
+    def test_the_ladder_is_left_alone(self):
+        self.draw()
+        self.window.limit_var.set("40")
+        self.window._apply_limit()
+        self.assertEqual([str(r.bps) for r in self.engine.ladder.rungs],
+                         ["30", "50"])
+
+    def test_raising_the_limit_is_fine(self):
+        self.draw()
+        self.window.limit_var.set("60")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule.get("2"), "60")
+
+    def test_lowering_to_exactly_the_loosest_rung_is_fine(self):
+        self.draw()
+        self.window.limit_var.set("50")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule.get("2"), "50")
+
+    def test_a_watch_line_does_not_block_it(self):
+        """Watch lines never trade, so they cannot be undercut."""
+        for row in list(self.rows()):
+            self.window._remove_rung(row)
+        self.add("90", "")
+        self.window._apply_ladder()
+        self.draw()
+
+        self.window.limit_var.set("40")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule.get("2"), "40")
 
 
 class TestNotWhileAnOrderIsWorking(LadderUICase):

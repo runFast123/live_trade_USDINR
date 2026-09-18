@@ -121,6 +121,7 @@ class RollEngine:
         saved = self.store.load()
         saved = self.store.for_campaign(saved, self.campaign_key())
         self.ladder = self._build_ladder()
+        self.watch_limits = self._build_watch()
         self.ladder_progress = dict(saved.ladder_done or {})
         self.session.clips_done_today = saved.clips_done
         self.session.lots_rolled = saved.lots_rolled
@@ -424,17 +425,32 @@ class RollEngine:
                 f"  (total {built.total_qty:,})")
         return built
 
-    def _tenor_ceiling_bps(self):
-        """The bps limit for this pair of contracts, if it can be determined."""
-        if self.cfg.limit_mode != "bps":
+    def _build_watch(self):
+        """Limits priced for comparison only. Never traded, never a ceiling."""
+        try:
+            return ladderlib.parse_watch(getattr(self.cfg, "watch_limits", None))
+        except Exception as exc:
+            self.log.warn(f"watch_limits in config.json is unusable ({exc}); "
+                          "ignoring it.")
+            return []
+
+    def _tenor_ceiling_bps(self, cfg=None):
+        """The bps limit for this pair of contracts, if it can be determined.
+
+        `cfg` lets a caller ask what the ceiling *would* be under a proposed
+        configuration, which is how a change to the limit can be checked
+        against the ladder before it is accepted.
+        """
+        cfg = cfg or self.cfg
+        if cfg.limit_mode != "bps":
             return None
         try:
             from .limits import match_tenor, parse_schedule
             days = self.tenor_days()
             if days is None:
                 return None
-            _, bps = match_tenor(days, parse_schedule(self.cfg.limit_bps_schedule),
-                                 self.cfg.tenor_tolerance_days)
+            _, bps = match_tenor(days, parse_schedule(cfg.limit_bps_schedule),
+                                 cfg.tenor_tolerance_days)
             return bps
         except Exception:
             return None
@@ -552,6 +568,7 @@ class RollEngine:
         """
         old = dict(self.ladder_progress)
         self.ladder = self._build_ladder()
+        self.watch_limits = self._build_watch()
         keys = {r.key for r in self.ladder.rungs}
         self.ladder_progress = {k: v for k, v in old.items() if k in keys}
 
@@ -619,7 +636,8 @@ class RollEngine:
         far_q = quotes[self.session.far.token]
         decision = rule.compute(near_q, far_q, self.cfg, days=self.tenor_days(),
                                 ladder=self.ladder,
-                                progress=self.ladder_progress)
+                                progress=self.ladder_progress,
+                                watch=self.watch_limits)
         report = gatelib.evaluate(self.cfg, self.session, quotes, decision)
 
         if self.session.halted_reason:

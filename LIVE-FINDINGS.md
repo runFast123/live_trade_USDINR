@@ -144,9 +144,27 @@ Partial statuses are now excluded explicitly.
 
 ---
 
-## Still unknown: what a quantity means
+## Settled: a quantity is in units
 
-**The probe did not settle this, and must not be read as having settled it.**
+**Confirmed by the account holder on 18 September 2026: the exchange reads an
+order quantity as units of the underlying, not as contracts.**
+
+So `qty = lots x MarketLot` is right, and one lot of USDINR is `qty = 1000`.
+`quantity_unit_confirmed` is now true in config.json, which clears the first
+precondition on live mode.
+
+This is a statement from the account holder rather than something this program
+observed, and the distinction is worth keeping: the probe could not settle it,
+and still has not. Once the segment is enabled, one accepted order at `qty=1000`
+would turn the confirmation into an observation. Until then the record should
+say plainly where the answer came from.
+
+The reasoning that pointed the other way is left below, because if it is ever
+revisited this is the evidence that will need explaining.
+
+### Why it looked like contracts
+
+**The probe could not settle this, and must not be read as having settled it.**
 
 The order book shows `Qty: 1` — but that only proves the broker echoed what we
 sent. The order was refused on account entitlement *before* the exchange
@@ -172,7 +190,10 @@ Two ways to settle it, neither of which needs a fill:
    "quantity not a multiple of market lot" would prove units; acceptance of
    `qty=1` at the circuit floor would prove contracts.
 
-Until then the clip size stays unverified and no live order should be sent.
+The open interest figures are the one thing that still does not sit comfortably
+with "units", and they are worth putting to Choice at the same time as the
+segment enablement. Nothing in the app depends on resolving that, since the unit
+is now set from the account holder's answer.
 
 ---
 
