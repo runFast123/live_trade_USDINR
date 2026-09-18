@@ -103,6 +103,11 @@ class RollConfig:
     auto_unwind_on_leg2_failure: bool = False
     dry_run: bool = True                 # nothing is sent to the exchange while true
 
+    # --- observing -----------------------------------------------------------
+    record_market: bool = True           # write a market sample CSV
+    record_interval_sec: float = 5.0
+    alert_on_qualify: bool = True        # say something when the cost first clears
+
     # --- updates -----------------------------------------------------------
     update_check: bool = True            # ask GitHub once at startup
     update_repo: str = "runFast123/live_trade_USDINR"

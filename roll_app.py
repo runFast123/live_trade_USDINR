@@ -4,6 +4,8 @@
     roll_app.exe --find USDINR   list the contracts and their tokens
     roll_app.exe --check         validate config.json and exit
     roll_app.exe --selftest      run the rule on worked examples, no network
+    roll_app.exe --probe         place one resting order that cannot fill,
+                                 read it back and cancel it (asks first)
 """
 from __future__ import annotations
 
@@ -208,6 +210,13 @@ def main(argv=None) -> int:
                         help="validate the configuration and exit")
     parser.add_argument("--selftest", action="store_true",
                         help="run the rule on worked examples with no network")
+    parser.add_argument("--probe", action="store_true",
+                        help="place ONE resting order that cannot fill, read it "
+                             "back, and cancel it. Asks before sending.")
+    parser.add_argument("--probe-token", metavar="TOKEN",
+                        help="contract for --probe (default: near_token)")
+    parser.add_argument("--probe-qty", type=int, default=1, metavar="N",
+                        help="quantity for --probe (default 1)")
     args = parser.parse_args(argv)
 
     base, config_path, log_dir = _paths()
@@ -241,6 +250,10 @@ def main(argv=None) -> int:
 
     log = Logbook(log_dir)
     try:
+        if args.probe:
+            from rollover import probe
+            return probe.run(cfg, log, base, token=args.probe_token,
+                             qty=args.probe_qty)
         if args.find:
             return cmd_find(cfg, args.find, log, base)
         return cmd_run(cfg, log, base, config_path)

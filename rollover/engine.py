@@ -22,6 +22,7 @@ from .feed import LiveFeed
 from .logbook import Logbook
 from .money import ceil_tick, money
 from .quotes import Quote, QuoteError, QuoteReader
+from .recorder import Recorder
 
 # States the operator sees on screen.
 STARTING = "STARTING"
@@ -77,6 +78,12 @@ class RollEngine:
         self.reader: Optional[QuoteReader] = None
         self.feed = LiveFeed(cfg, log)
         self.quote_source = "starting"
+        self.recorder = (Recorder(os.path.join(base_dir, "data"),
+                                  cfg.record_interval_sec)
+                         if cfg.record_market else None)
+        # Whether the cost was clearing the limit on the previous tick,
+        # so the crossing can be announced once rather than every tick.
+        self._was_qualifying = False
         self.session = SessionState()
 
         self._thread: Optional[threading.Thread] = None
@@ -99,6 +106,13 @@ class RollEngine:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.recorder is not None:
+            limit_bps = None
+            snap = self._snapshot
+            if snap is not None and snap.decision is not None:
+                limit_bps = snap.decision.limit_bps
+            for line in self.recorder.summary(limit_bps).splitlines():
+                self.log.info(line)
         self.feed.stop()
         if self._thread:
             self._thread.join(timeout=5)
@@ -262,6 +276,28 @@ class RollEngine:
             elapsed = time.monotonic() - cycle_started
             self._stop.wait(max(0.1, self.cfg.poll_interval_sec - elapsed))
 
+    def _announce_crossing(self, decision) -> None:
+        """Say something the first time the cost clears the limit.
+
+        With a tight limit the qualifying windows are rare and brief, and the
+        operator is not necessarily watching. Announced on the transition only,
+        so it is a signal rather than a stream.
+        """
+        if not self.cfg.alert_on_qualify or decision is None:
+            return
+
+        now_qualifying = bool(decision.qualifies)
+        if now_qualifying and not self._was_qualifying:
+            bps = decision.cost_bps
+            self.log.alert(
+                "The roll cost has come below the limit: "
+                + (f"{money(bps, 1)} bps against {money(decision.limit_bps, 1)}"
+                   if bps is not None and decision.limit_bps is not None
+                   else f"{money(decision.roll_cost)} against {money(decision.limit)}"))
+        elif self._was_qualifying and not now_qualifying:
+            self.log.info("The roll cost has gone back above the limit.")
+        self._was_qualifying = now_qualifying
+
     def _read_quotes(self, tokens: List[str]):
         """Take the websocket when it is live, and poll only when it is not.
 
@@ -334,6 +370,10 @@ class RollEngine:
             self._set_state(WATCHING, "watching both legs")
 
         self._publish(near_q, far_q, decision, self._note, report)
+
+        if self.recorder is not None:
+            self.recorder.sample(near_q, far_q, decision, report, self.quote_source)
+        self._announce_crossing(decision)
 
         if not self.armed:
             return

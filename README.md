@@ -23,8 +23,8 @@ not below the 0.30 limit, so nothing is sent.
 python -m unittest discover -s tests -t .
 ```
 
-226 tests, covering the rule, the tenor based limit, the gates, the order
-sequence, the price feed and the updater.
+276 tests, covering the rule, the tenor based limit, the gates, the order
+sequence, the price feed, the recorder, the probe and the updater.
 
 - [tests/test_limits.py](tests/test_limits.py) pins the basis point maths and
   the tenor schedule, including that 30 bps is not 30 paise.
@@ -81,6 +81,27 @@ says whether they are coming from the **live feed** or from **polling**.
 
 Every window scrolls, so nothing is out of reach on a small screen.
 
+**It makes a noise** when the cost first comes below the limit, and a different,
+more insistent one on anything that halts. With a tight limit the qualifying
+windows are rare and brief, and nobody watches a screen all day.
+
+### What it records
+
+While it runs it writes `data/market-<date>.csv`: a row every few seconds with
+both legs' bid, ask and resting size, the roll cost in basis points, the limit,
+and which gates were blocking. On shutdown it summarises the day:
+
+```
+closest approach 28.9 bps at 10:19:37
+at or below the 30 bps limit: 10.0 minutes
+within 2 bps of it: 30.0 minutes
+a limit of 29 bps would have been available for at least a minute
+```
+
+That last line is the point. *"Your 30 bps was touched for ten minutes; 31 would
+have given you fifteen"* is something a client can act on. *"Nothing happened
+again"* is not.
+
 ## Updating
 
 The app asks GitHub once at startup whether there is a newer release. If there
@@ -134,7 +155,11 @@ The workflow refuses to release if the tag does not match
 | `rollover/ui.py` | the watch window |
 | `rollover/updater.py` | the update check and install |
 | `tools/make_icon.py` | regenerates `assets/icon.ico` |
+| `rollover/recorder.py` | the market sampler that answers "what limit would have worked" |
+| `rollover/probe.py` | the one-order live probe |
+| `rollover/notify.py` | sound, because a screen alert is useless to someone not looking |
 | `logs/` | a dated audit log of every decision and order |
+| `data/` | market samples and probe captures |
 
 ## Command line
 
@@ -143,7 +168,24 @@ roll_app.exe                 the windows
 roll_app.exe --find USDINR   list contracts and tokens
 roll_app.exe --check         validate config.json and exit
 roll_app.exe --selftest      run the rule on worked examples, no network
+roll_app.exe --probe         place ONE resting order, read it back, cancel it
 ```
+
+### `--probe` places a real order
+
+It is the only way to learn three things that no amount of reading can settle:
+what a quantity actually means to the exchange, what the order book's field
+names really are, and that the price scale and the cancel path work.
+
+The order is a BUY at the contract's lower circuit, about three rupees under the
+market, so it cannot trade. And if the price scale were wrong the price would
+land far outside the day's circuit band in every direction, which the exchange
+rejects rather than fills — that band is what makes this safe to run *before*
+the scale is confirmed.
+
+It needs a session, so log in through the app first. It prints what it is about
+to do and sends nothing unless you type `PLACE REAL ORDER` exactly. Everything
+it sees is written verbatim to `data/probe-<timestamp>.json`.
 
 ## Things worth knowing
 

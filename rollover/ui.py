@@ -15,7 +15,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from . import theme as T
-from . import __version__, updater
+from . import __version__, notify, updater
 from .engine import ARMED, DONE, HALTED, RollEngine, WATCHING, WORKING
 from .money import D, money
 
@@ -76,6 +76,7 @@ class RollWindow(tk.Toplevel):
 
         self._refresh_id = None
         self._last_log_count = -1
+        self._alerts_seen = 0          # so a new ALERT can be heard, not just seen
         self._updates: "queue.Queue[tuple]" = queue.Queue()
         # Last seen price per cell, so a change can be shown rather than just
         # rendered: {cell key: (price, direction, moved_at, delta)}
@@ -793,6 +794,17 @@ class RollWindow(tk.Toplevel):
         if len(entries) == self._last_log_count:
             return
         self._last_log_count = len(entries)
+
+        # Anything that halts, or the cost finally clearing, is worth hearing.
+        # The operator is not necessarily looking at the screen.
+        alerts = sum(1 for _, level, _ in entries if level == "ALERT")
+        if alerts > self._alerts_seen:
+            newest = next((m for _, lvl, m in reversed(entries) if lvl == "ALERT"), "")
+            if "come below the limit" in newest:
+                notify.chime()
+            else:
+                notify.alarm()
+        self._alerts_seen = alerts
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         for stamp, level, message in entries:
