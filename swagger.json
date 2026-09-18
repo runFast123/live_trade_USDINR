@@ -1,0 +1,270 @@
+{
+  "openapi": "3.0.4",
+  "info": {
+    "title": "ChoiceOpenTransactionPusher",
+    "description": "# Introduction \n The Choice Open Transaction Pusher is a set of HTTP Web APIs that provide Vendor wise Order Book and real time order status on callback API. The APIs deals with JSON request and response structures. This document will provide step by step guide to use the API right from Authentication to the request response of structure of the API, error codes and messages.\n # Getting Started \n\n First of all the client needs to request for callback url registration, once url registered they will recive real time order status on callback API.\n # Important Points \n 1. VendorId and VendorKey mandatory to pass in request header in keys **VendorId: TEST**, **VendorKey: XXXXXXX** in every request. VendorId and VendorKey will be given in person.\n 2. All Passwords related fields need to be encrypted with **AES CBC 256 PKCS7 Encoding** Algorithm in request. Encoding Key and IV will be given in person.",
+    "version": "V1"
+  },
+  "paths": {
+    "/api/vendor/OrderBook": {
+      "post": {
+        "tags": [
+          "OpenVendor"
+        ],
+        "summary": "API to Get Order Book Listing",
+        "description": "Description\n\n    This API returns Order Book Listing based on vendor id\n    \n    Once API return Data not found then stop calling this API \n\nParameters\n\n    VendorId : TEST\n    StartPos : Starting position for fetching records (Numeric)\n    NoOfRecords : Number of records to be fetched (Numeric)\n     \nParameter Types\n\n    1.\"string\" stands for String Type\n    2.0 (Zero) stands for Numeric.\n            \nOrderType \n            \n    RL_LIMIT : Regular limit order\n    RL_MKT : Regular market order\n    SL_LIMIT : Stop loss limit order\n    SL_MKT : Stop loss market order\n\nBS \n\n    1 for Buy 2 for Sell\n\nValidity \n\n    1 for Day, 4 for IOC\n            \nProductType \n\n    M for Margin/Intraday \n    D for Delivery \n    AM for AMO Margin for Equity segments and AMO Intraday for Derivative Segments\n    AD for AMO Delivery for Equity Segments and AMO CARRYFORWARD for Derivative Segments\n\nOrder Status\n    \n    CLIENT XMITTED : Order sent from client, confirmation awaited\n    GATEWAY XMITTED : Order sent from Gateway, confirmation awaited\n    OMS XMITTED : Order sent from OMS, confirmation awaited\n    EXCHANGE XMITTED : Order sent from Exchange, confirmation awaited\n    PENDING : Order confirmed from exchange\n    CANCELLED : Order cancelled\n    EXECUTED : Order Traded\n    GATEWAY REJECT : Order rejected by gateway\n    OMS REJECT : Order rejected by oms\n    ORDER ERROR : Order rejected from exchange\n    FROZEN : Order rejected from exchange (The order will go for a freeze if the quantity is greater than the freeze quantity determined by NSE)\n    A.ACCEPT [ADMINACCEPT]\n    A.REJECT [ADMINREJECT]\n    A.MODIFY [ADMINMODIFY]\n    A.CANCEL [ADMINCANCEL]\n    AMO SUBMITTED : AMO order submitted successfully\n    AMO CANCELLED : AMO order cancelled successfully\n\nSegment Master ID's\n\n    NSE-CASH: 1\n    \n    NSE-DERIVATIVES: 2\n    \n    BSE-CASH: 3\n    \n    BSE-DERIVATIVES: 4\n    \n    MCX-DERIVATIVES (COMMODITIES): 5\n    \n    MCX-SPOT (COMMODITIES): 6\n    \n    NCDEX-DERIVATIVES (COMMODITIES): 7\n    \n    NCDEX-SPOT (COMMODITIES): 8\n    \n    NSECDS-DERIVATIVES (CURRENCIES): 13\n    \n    NSECDS-SPOT (CURRENCIES): 14",
+        "requestBody": {
+          "content": {
+            "application/json-patch+json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookRequest"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Returns Success Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized. VendorId or VendorKey is invalid or doesn't exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/vendor/OrderStatus": {
+      "post": {
+        "tags": [
+          "OpenVendor"
+        ],
+        "summary": "API to Get Order Status",
+        "description": "Description\n\n    This API returns Order Status on vendor registered url\n            \nDummy Url : http://uat.jiffy.in/vendor/OrderStatus\n     \nParameter Types\n            \n    1.\"string\" stands for String Type\n    2.0 (Zero) stands for Numeric.\n    \nOrderType \n            \n    RL_LIMIT : Regular limit order\n    RL_MKT : Regular market order\n    SL_LIMIT : Stop loss market order\n    SL_MKT : Stop loss market order\n\nBS \n\n    1 for Buy 2 for Sell\n\nValidity \n\n    1 for Day, 4 for IOC\n            \nProductType \n\n    M for Margin/Intraday \n    D for Delivery \n    AM for AMO Margin for Equity segments and AMO Intraday for Derivative Segments\n    AD for AMO Delivery for Equity Segments and AMO CARRYFORWARD for Derivative Segments\n\n            \nOrder Status\n    \n    CLIENT XMITTED : Order sent from client, confirmation awaited\n    GATEWAY XMITTED : Order sent from Gateway, confirmation awaited\n    OMS XMITTED : Order sent from OMS, confirmation awaited\n    EXCHANGE XMITTED : Order sent from Exchange, confirmation awaited\n    PENDING : Order confirmed from exchange\n    CANCELLED : Order cancelled\n    EXECUTED : Order Traded\n    GATEWAY REJECT : Order rejected by gateway\n    OMS REJECT : Order rejected by oms\n    ORDER ERROR : Order rejected from exchange\n    FROZEN : Order rejected from exchange (The order will go for a freeze if the quantity is greater than the freeze quantity determined by NSE)\n    A.ACCEPT [ADMINACCEPT]\n    A.REJECT [ADMINREJECT]\n    A.MODIFY [ADMINMODIFY]\n    A.CANCEL [ADMINCANCEL]\n    AMO SUBMITTED : AMO order submitted successfully\n    AMO CANCELLED : AMO order cancelled successfully\n\nSegment Master ID's\n\n    NSE-CASH: 1\n    \n    NSE-DERIVATIVES: 2\n    \n    BSE-CASH: 3\n    \n    BSE-DERIVATIVES: 4\n    \n    MCX-DERIVATIVES (COMMODITIES): 5\n    \n    MCX-SPOT (COMMODITIES): 6\n    \n    NCDEX-DERIVATIVES (COMMODITIES): 7\n    \n    NCDEX-SPOT (COMMODITIES): 8\n    \n    NSECDS-DERIVATIVES (CURRENCIES): 13\n    \n    NSECDS-SPOT (CURRENCIES): 14",
+        "requestBody": {
+          "content": {
+            "application/json-patch+json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookResponse"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookResponse"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookResponse"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderBookResponse"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Returns Success Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OrderBookRequest": {
+        "type": "object",
+        "properties": {
+          "vendorId": {
+            "type": "string",
+            "nullable": true
+          },
+          "startPos": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "noOfRecords": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OrderBookResponse": {
+        "type": "object",
+        "properties": {
+          "segmentId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "token": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "orderType": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientOrderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "bs": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "disclosedQty": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "price": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "triggerPrice": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "validity": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productType": {
+            "type": "string",
+            "nullable": true
+          },
+          "exchangeOrderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "remarks": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatewayOrderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "time": {
+            "type": "string",
+            "nullable": true
+          },
+          "errorString": {
+            "type": "string",
+            "nullable": true
+          },
+          "orderStatus": {
+            "type": "string",
+            "nullable": true
+          },
+          "exchangeOrderTime": {
+            "type": "string",
+            "nullable": true
+          },
+          "tradedQty": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tradedQtyRemaining": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ltp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "initiatedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "modifiedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "gtdDays": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "gtdStatus": {
+            "type": "string",
+            "nullable": true
+          },
+          "bracketOrderId": {
+            "type": "boolean"
+          },
+          "averageTradedPrice": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true
+          },
+          "orderTag": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResponseMessage": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "nullable": true
+          },
+          "response": {
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

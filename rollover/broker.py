@@ -18,6 +18,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
+from .config import IOC
 from .money import D, PriceError, money, to_exchange_units
 
 BUY, SELL = 1, 2
@@ -67,8 +68,36 @@ _NET_QTY_KEYS = ("NetQty", "NetQuantity", "NetQTY", "Netqty", "NQty")
 _REASON_KEYS = ("ErrorString", "RejectionReason", "ErrorMessage", "Remarks",
                 "Reason")
 
+# The vendor's own status vocabulary, from swagger.json (ChoiceOpenTransactionPusher).
+# Kept here as documentation for the word lists below, and asserted against them
+# in tests/test_live_findings.py so a change to either is caught.
+#
+#   CLIENT XMITTED    sent from the client, confirmation awaited
+#   GATEWAY XMITTED   sent from the gateway, confirmation awaited
+#   OMS XMITTED       sent from the OMS, confirmation awaited
+#   EXCHANGE XMITTED  sent to the exchange, confirmation awaited
+#   PENDING           confirmed by the exchange, i.e. working
+#   CANCELLED         cancelled
+#   EXECUTED          traded
+#   GATEWAY REJECT    rejected by the gateway
+#   OMS REJECT        rejected by the OMS
+#   ORDER ERROR       rejected by the exchange
+#   FROZEN            rejected by the exchange for breaching NSE's freeze quantity
+#   A.ACCEPT / A.REJECT / A.MODIFY / A.CANCEL     admin actions
+#   AMO SUBMITTED / AMO CANCELLED                 after-market orders
+#
+# The OpenAPI order book the app actually reads uses a shorter vocabulary of its
+# own ("REJECTED" came back from the live probe), so matching stays on words
+# rather than on an exact list.
 _FILLED_WORDS = ("complete", "filled", "executed", "traded", "fullyexecuted")
-_DEAD_WORDS = ("reject", "cancel", "expired", "lapsed")
+
+# "error" catches ORDER ERROR and "frozen" catches FROZEN. Neither contains
+# "reject", so both were previously read as live orders: the app would try to
+# cancel an order the exchange had already thrown out, the cancel would be
+# refused, and the roll would halt for no reason. FROZEN matters most, because
+# it is the routine answer to a clip larger than NSE's freeze quantity and the
+# sane response is to size down, not to stop.
+_DEAD_WORDS = ("reject", "cancel", "expired", "lapsed", "error", "frozen")
 
 # "PartiallyFilled" contains "filled" and "partiallyexecuted" contains
 # "executed", so a substring test reads a live, partly-filled order as a
@@ -851,6 +880,16 @@ class Broker:
                 f"{label}: the order is already {status_word(record)}, "
                 "so there is nothing to cancel")
             return True
+
+        if self.cfg.validity == IOC:
+            # An IOC order cannot rest, so anything unfilled is already gone
+            # and there is nothing for a cancel to act on. Seeing one still
+            # open here means the exchange did not treat it as IOC, which is
+            # worth stopping for rather than papering over with a cancel.
+            self.log.error(
+                f"{label}: an immediate-or-cancel order is still {status_word(record)}. "
+                "It should not be able to rest. Check the terminal now.")
+            return False
 
         self.log.warn(f"{label}: cancelling the unfilled {remainder} units")
         try:

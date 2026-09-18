@@ -176,6 +176,68 @@ Until then the clip size stays unverified and no live order should be sent.
 
 ---
 
+## What swagger.json added
+
+The vendor's OpenAPI spec (`swagger.json`, ChoiceOpenTransactionPusher) does not
+document the order placement endpoint, but its shared descriptions settle three
+things the app had been guessing at.
+
+### Validity 4 is immediate-or-cancel
+
+    Validity    1 for Day, 4 for IOC
+
+The app was written believing only Day validity existed, and builds IOC by hand:
+place, poll for a fill window, cancel the remainder. That hand-built version is
+the source of the cancel race, and of the window in which a partial fill is
+still working while the second leg is being priced.
+
+Real IOC removes both. `validity` now accepts 4 and `place_leg` knows an IOC
+order cannot rest, so it treats one that does as an alarm rather than something
+to cancel. The default is still 1, because IOC has not been exercised against
+the exchange and defaulting to an untested path would be trading one unknown
+for another.
+
+### Two order statuses were being read as live orders
+
+The documented vocabulary is `CLIENT XMITTED`, `GATEWAY XMITTED`, `OMS XMITTED`,
+`EXCHANGE XMITTED`, `PENDING`, `CANCELLED`, `EXECUTED`, `GATEWAY REJECT`,
+`OMS REJECT`, `ORDER ERROR`, `FROZEN`, `A.ACCEPT`, `A.REJECT`, `A.MODIFY`,
+`A.CANCEL`, `AMO SUBMITTED`, `AMO CANCELLED`.
+
+The app matches on words, and two of those contain none of the words it looked
+for:
+
+- **`ORDER ERROR`** -- "Order rejected from exchange". The ordinary
+  exchange-side rejection, read as a working order.
+- **`FROZEN`** -- "rejected from exchange (the order will go for a freeze if the
+  quantity is greater than the freeze quantity determined by NSE)".
+
+Both would have had the app try to cancel an order the exchange had already
+thrown out; the cancel would be refused, and under the hardening a refused
+cancel halts the roll. So every exchange rejection would have become a halt.
+
+`FROZEN` is the worse of the two, because it is not an error at all -- it is the
+routine answer to a clip larger than NSE's freeze quantity, and the sane
+response is to size down. **That is a live constraint for Phase 2**, which plans
+clips out of a 100+ lot position: the freeze quantity is a per-contract ceiling
+that clip sizing has to respect, and it is not in the scrip master.
+
+Also worth noting: `PENDING` means "order confirmed from exchange", i.e. working
+-- not awaiting submission.
+
+### Smaller confirmations
+
+- `price` is `integer/int64` in the schema, consistent with exchange units
+- `segmentId` 13 is `NSECDS-DERIVATIVES (CURRENCIES)`, as configured
+- `productType` `D` is delivery/carry-forward, which is what a roll wants
+- `averageTradedPrice` exists, which is what Phase 2.7 needs for a realised
+  cost rather than an assumed one
+- `RL_MKT` and `SL_MKT` do exist, so the old comment that the API has no market
+  orders was wrong. It makes no difference here: a market order would ignore
+  the price limit that is the entire instruction.
+
+---
+
 ## What this changes in the plan
 
 - **Phase 0 (quantity unit): still open.** Now blocked behind the entitlement.
@@ -184,6 +246,11 @@ Until then the clip size stays unverified and no live order should be sent.
 - **Phase 1.4 (trade book as the fill record):** the endpoint is confirmed
   reachable and its shape is known. Not yet wired in.
 - **Phases 3.2, 3.3 and 4: blocked** until the account is enabled.
+- **New for Phase 2:** clip sizing must respect NSE's freeze quantity,
+  or oversized clips come back FROZEN.
+- **Live mode** is now a guarded switch in the window rather than a
+  config edit, and it refuses to engage while the quantity unit is
+  unconfirmed. See the README.
 
 The evidence recorder can keep running throughout. It needs no order permissions
 and the question it answers — whether the cost ever reaches the client's limit —

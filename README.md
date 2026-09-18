@@ -103,6 +103,46 @@ That last line is the point. *"Your 30 bps was touched for ten minutes; 31 would
 have given you fifteen"* is something a client can act on. *"Nothing happened
 again"* is not.
 
+## Dry run and live
+
+The app starts in whatever mode `config.json` says, and ships in **dry run**,
+where it decides everything and sends nothing.
+
+Switching to live is a button in the window, but it is not a toggle. It opens a
+dialog that states what one clip commits in rupees, lists every precondition
+with a verdict beside it, and stays disabled until they all read OK and the
+phrase `GO LIVE` has been typed exactly. The preconditions are rechecked when
+the button is pressed, not when the dialog was drawn, so a halt or a dropped
+feed arriving in between still stops it.
+
+    quantity unit confirmed     see below
+    configuration valid         config.json passes every check
+    signed in                   a live session with Choice
+    not halted                  no outstanding halt
+    scrip master is today's     current circuit limits and ticks
+    live price feed             the websocket, not the REST fallback
+
+Going back to dry run needs none of that. One press, no dialog, takes effect
+immediately. A safety control that is awkward to release is one that gets
+switched off and left off.
+
+Live mode lasts for the session. Arming does not survive the switch in either
+direction: whoever armed the app in dry run was authorising a simulation.
+
+### `quantity_unit_confirmed`
+
+This one is not about the program. Whether the exchange reads an order quantity
+as **contracts** or as **units of the underlying** has never been established,
+and the app sends `lots x MarketLot`. If the exchange counts contracts, that is
+a thousandfold over-order.
+
+The live probe could not settle it, because the order was refused on account
+entitlement before the exchange validated anything. Until Choice confirm it, or
+an accepted order proves it, live mode refuses to engage. Set
+`quantity_unit_confirmed` to `true` in `config.json` once you know.
+
+[LIVE-FINDINGS.md](LIVE-FINDINGS.md) has the detail.
+
 ## Updating
 
 The app asks GitHub once at startup whether there is a newer release. If there

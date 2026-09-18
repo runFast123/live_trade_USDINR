@@ -86,6 +86,12 @@ def cmd_check(cfg: RollConfig) -> int:
     print(f"  size         {cfg.lots} lot(s) = {cfg.clip_qty} units")
     print(f"  allowance    {cfg.allowance_ticks} tick(s) = {money(cfg.allowance)}")
     print(f"  mode         {'DRY RUN' if cfg.dry_run else 'LIVE ORDERS'}")
+    print(f"  validity     {cfg.validity} "
+          f"({'day' if cfg.validity == 1 else 'immediate or cancel'})")
+    print(f"  qty unit     {'confirmed' if cfg.quantity_unit_confirmed else 'NOT CONFIRMED'}")
+    if not cfg.quantity_unit_confirmed:
+        print("               live mode will refuse until this is settled; see")
+        print("               LIVE-FINDINGS.md")
     if not cfg.near_token or not cfg.far_token:
         print("\nSet near_token and far_token before running. Use --find to list them.")
         return 1
@@ -196,6 +202,9 @@ def cmd_run(cfg: RollConfig, log: Logbook, base: str, config_path: str) -> int:
     if not cfg.dry_run:
         log.warn("LIVE MODE. Real orders will be sent when you arm the app "
                  "and every gate passes.")
+    if not cfg.quantity_unit_confirmed:
+        log.warn("The order quantity unit has not been confirmed with Choice, so "
+                 "live mode will refuse to engage. See LIVE-FINDINGS.md.")
 
     # An update that never finished leaves a whole build behind in temp.
     from rollover import updater

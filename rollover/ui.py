@@ -15,7 +15,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from . import theme as T
-from . import __version__, notify, updater
+from . import __version__, livemode, notify, updater
 from .engine import ARMED, DONE, HALTED, RollEngine, WATCHING, WORKING
 from .money import D, money
 
@@ -41,6 +41,124 @@ GATE_COLUMNS = (
     ("name", "Gate", 210, "w"),
     ("detail", "Detail", 560, "w"),
 )
+
+
+class LiveModeDialog(tk.Toplevel):
+    """The one window in this program that lets real orders out.
+
+    It is deliberately not a toggle. It states what a clip commits in rupees,
+    lists every precondition with its verdict, and will not enable its own
+    button until they all pass and the phrase has been typed exactly.
+
+    Going the other way needs none of this, and has no dialog at all.
+    """
+
+    def __init__(self, parent, cfg, engine, fonts, log, on_done=None):
+        super().__init__(parent)
+        self.cfg, self.engine, self.fonts = cfg, engine, fonts
+        self.log, self.on_done = log, on_done
+
+        self.title("Switch to live orders")
+        self.configure(bg=T.BG)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        self.checks = livemode.preflight(cfg, engine)
+        self.exposure = livemode.exposure(cfg, self._price(), self._lot_size())
+
+        body = tk.Frame(self, bg=T.BG)
+        body.pack(fill="both", expand=True, padx=T.PAD_L, pady=T.PAD_L)
+
+        tk.Label(body, text="This sends real orders",
+                 bg=T.BG, fg=T.DANGER, font=fonts.title,
+                 anchor="w").pack(fill="x")
+
+        tk.Label(body, text=livemode.summary(cfg, self.checks, self.exposure),
+                 bg=T.SURFACE_2, fg=T.TEXT, font=fonts.mono, justify="left",
+                 anchor="w", padx=T.PAD_M, pady=T.PAD_M).pack(
+                     fill="x", pady=T.PAD_M)
+
+        self.blocked = bool(livemode.blockers(self.checks))
+        if self.blocked:
+            tk.Label(body,
+                     text=("Live mode is not available until every line above "
+                           "reads OK."),
+                     bg=T.BG, fg=T.WARN, font=fonts.ui, anchor="w",
+                     wraplength=520, justify="left").pack(fill="x")
+        else:
+            tk.Label(body, text=f'Type  {livemode.CONFIRM}  to confirm:',
+                     bg=T.BG, fg=T.TEXT, font=fonts.ui, anchor="w").pack(fill="x")
+            self.entry = tk.Entry(body, bg=T.SURFACE_2, fg=T.TEXT, font=fonts.mono,
+                                  insertbackground=T.TEXT, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=T.BORDER,
+                                  highlightcolor=T.ACCENT)
+            self.entry.pack(fill="x", ipady=6, pady=(T.PAD_S, T.PAD_M))
+            self.entry.bind("<KeyRelease>", lambda _e: self._retest())
+            self.entry.bind("<Return>", lambda _e: self._confirm())
+
+        row = tk.Frame(body, bg=T.BG)
+        row.pack(fill="x")
+
+        T.Button(row, "Cancel", self.destroy, fonts, width=130,
+                 height=40).pack(side="right")
+
+        if not self.blocked:
+            self.go = T.Button(row, "Send real orders", self._confirm, fonts,
+                               kind="danger", width=210, height=40)
+            self.go.pack(side="right", padx=(0, T.PAD_S))
+            self.go.set_enabled(False)
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        T.centre(self)
+        self.grab_set()
+        if not self.blocked:
+            self.entry.focus_set()
+
+    def _price(self):
+        """A price to value the clip at, if one is to be had."""
+        try:
+            snap = self.engine.snapshot()
+            for quote in (snap.near_quote, snap.far_quote):
+                if quote is not None and quote.ask:
+                    return quote.ask
+        except Exception:
+            pass
+        return None
+
+    def _lot_size(self):
+        try:
+            return self.engine.session.near.lot_size
+        except Exception:
+            return None
+
+    def _retest(self) -> None:
+        typed = self.entry.get().strip()
+        self.go.set_enabled(typed == livemode.CONFIRM)
+
+    def _confirm(self) -> None:
+        if self.blocked:
+            return
+        # Re-run the preconditions rather than trusting the ones drawn a minute
+        # ago. A halt, a dropped feed or a signed-out session between opening
+        # this window and pressing the button all have to count.
+        refusal = livemode.go_live(self.cfg, self.engine, self.entry.get())
+        if refusal:
+            from tkinter import messagebox
+            messagebox.showwarning("Not switched", refusal, parent=self)
+            self.log.warn(f"Live mode refused: {refusal}")
+            return
+
+        self.log.alert(
+            "LIVE ORDERS ARE ENABLED. Real orders will be sent when armed and "
+            "the roll cost clears the limit.")
+        for line in self.exposure.lines(
+                bool(getattr(self.cfg, "quantity_unit_confirmed", False))):
+            self.log.info(f"  {line}")
+        notify.alarm()
+        self.destroy()
+        if self.on_done:
+            self.on_done()
 
 
 class RollWindow(tk.Toplevel):
@@ -121,10 +239,8 @@ class RollWindow(tk.Toplevel):
 
         self.mode_pill = T.Pill(right, self.fonts, width=186, height=30)
         self.mode_pill.pack(side="right")
-        if self.cfg.dry_run:
-            self.mode_pill.set("DRY RUN, nothing sent", T.WARN, "#2a2008")
-        else:
-            self.mode_pill.set("LIVE ORDERS", T.DANGER, "#2a0d0b")
+        self._mode_shown = None
+        self._refresh_mode()
 
         self.clock = tk.Label(right, text="", bg=T.BG, fg=T.FAINT,
                               font=self.fonts.mono)
@@ -297,9 +413,45 @@ class RollWindow(tk.Toplevel):
             T.Button(bar, "Change contracts", self._change_contracts, self.fonts,
                      width=180, height=42).pack(side="left", padx=T.PAD_S)
 
+        self.mode_button = T.Button(bar, "Go live...", self._switch_mode,
+                                    self.fonts, kind="warn", width=150, height=42)
+        self.mode_button.pack(side="left", padx=T.PAD_S)
+        self._refresh_mode()
+
         self.arm_timer = tk.Label(bar, text="", bg=T.BG, fg=T.WARN,
                                   font=self.fonts.mono_medium)
         self.arm_timer.pack(side="right", padx=T.PAD_S)
+
+    # ---- dry run and live -------------------------------------------------
+    def _refresh_mode(self, dry_run=None) -> None:
+        """Keep the pill and the button agreeing with what will actually happen.
+
+        Driven from the engine's own snapshot on every redraw, not only from
+        the button that changed it, so the screen cannot sit claiming DRY RUN
+        while the engine would send an order.
+        """
+        dry = self.cfg.dry_run if dry_run is None else dry_run
+        if dry == self._mode_shown:
+            return
+        self._mode_shown = dry
+
+        if dry:
+            self.mode_pill.set("DRY RUN, nothing sent", T.WARN, "#2a2008")
+        else:
+            self.mode_pill.set("LIVE ORDERS", T.DANGER, "#2a0d0b")
+
+        button = getattr(self, "mode_button", None)   # built after the pill
+        if button is not None:
+            button.set_text("Go live..." if dry else "Back to dry run")
+
+    def _switch_mode(self) -> None:
+        if not self.cfg.dry_run:
+            livemode.go_dry(self.cfg, self.engine)
+            self.log.alert("Switched to DRY RUN. Nothing further will be sent.")
+            self._refresh_mode()
+            return
+        LiveModeDialog(self, self.cfg, self.engine, self.fonts, self.log,
+                       on_done=self._refresh_mode)
 
     # ---- updates ----------------------------------------------------------
     def _start_update_check(self) -> None:
@@ -599,6 +751,7 @@ class RollWindow(tk.Toplevel):
 
         self.state_pill.set(snap.state.lower(),
                             STATE_COLOUR.get(snap.state, T.MUTED))
+        self._refresh_mode(snap.dry_run)
 
         source = snap.quote_source or "connecting"
         self.source_pill.set(source,

@@ -166,6 +166,105 @@ class TestTerminalOrders(unittest.TestCase):
         self.assertFalse(is_terminal(row))
 
 
+class TestTheDocumentedStatusVocabulary(unittest.TestCase):
+    """Every status in swagger.json, classified.
+
+    The app matches on words rather than an exact list, because the OpenAPI
+    order book it reads uses a shorter vocabulary of its own -- the live probe
+    returned "REJECTED", which appears nowhere in the vendor's list. That makes
+    it worth checking the whole documented set explicitly.
+    """
+
+    # status -> is it finished?
+    LIVE = ("CLIENT XMITTED", "GATEWAY XMITTED", "OMS XMITTED",
+            "EXCHANGE XMITTED", "PENDING", "A.ACCEPT", "A.MODIFY",
+            "AMO SUBMITTED")
+    FINISHED = ("CANCELLED", "EXECUTED", "GATEWAY REJECT", "OMS REJECT",
+                "ORDER ERROR", "FROZEN", "A.REJECT", "A.CANCEL",
+                "AMO CANCELLED", "REJECTED")
+
+    def test_working_orders_are_not_treated_as_finished(self):
+        for status in self.LIVE:
+            self.assertFalse(is_terminal({"OrderStatus": status}), msg=status)
+
+    def test_finished_orders_are_recognised(self):
+        for status in self.FINISHED:
+            self.assertTrue(is_terminal({"OrderStatus": status}), msg=status)
+
+    def test_an_exchange_rejection_is_not_mistaken_for_a_live_order(self):
+        """ORDER ERROR contains neither "reject" nor any fill word.
+
+        It was read as a working order, so the app would try to cancel
+        something the exchange had already thrown out, the cancel would be
+        refused, and the roll would halt for no reason at all.
+        """
+        self.assertTrue(is_terminal({"OrderStatus": "ORDER ERROR"}))
+
+    def test_a_frozen_order_is_recognised(self):
+        """FROZEN is the answer to a clip above NSE's freeze quantity.
+
+        It is a sizing problem with an obvious remedy, and reading it as a live
+        order would have turned it into a halt instead.
+        """
+        self.assertTrue(is_terminal({"OrderStatus": "FROZEN"}))
+
+    def test_pending_means_working_not_unsent(self):
+        """"PENDING" is the exchange confirming the order, not awaiting it."""
+        self.assertFalse(is_terminal({"OrderStatus": "PENDING"}))
+
+    def test_executed_is_a_fill(self):
+        broker = Broker(RollConfig(), StubLog())
+        filled, _ = broker.read_fill({"OrderStatus": "EXECUTED"}, 25)
+        self.assertEqual(filled, 25)
+
+    def test_no_status_is_both_live_and_finished(self):
+        self.assertEqual(set(self.LIVE) & set(self.FINISHED), set())
+
+
+class TestImmediateOrCancel(unittest.TestCase):
+    """swagger.json documents Validity 4 = IOC.
+
+    The app was written believing only Day validity existed and builds IOC by
+    hand: place, poll, cancel the remainder. That is what creates the cancel
+    race, and the window in which a partial fill is still working while the
+    second leg is being priced.
+    """
+
+    def test_both_validities_are_accepted_by_the_config(self):
+        from rollover.config import DAY, IOC as IOC_VALIDITY
+        self.assertEqual((DAY, IOC_VALIDITY), (1, 4))
+        for validity in (DAY, IOC_VALIDITY):
+            RollConfig(validity=validity, near_token="1769",
+                       far_token="1584").validate()      # must not raise
+
+    def test_any_other_validity_is_refused(self):
+        from rollover.config import ConfigError
+        for validity in (0, 2, 3, 5, -1):
+            with self.assertRaises(ConfigError, msg=validity) as ctx:
+                RollConfig(validity=validity, near_token="1769",
+                           far_token="1584").validate()
+            self.assertIn("validity", str(ctx.exception))
+
+    def test_the_default_is_still_day(self):
+        """IOC has not been exercised against the exchange. Do not assume it."""
+        from rollover.config import DAY
+        self.assertEqual(RollConfig().validity, DAY)
+
+    def test_an_ioc_order_that_rests_is_an_alarm_not_a_cancel(self):
+        """IOC cannot rest. One that did means the exchange ignored the flag."""
+        from rollover.config import IOC as IOC_VALIDITY
+        working = dict(REJECTED_ROW, OrderStatus="PENDING", TradedQty=0,
+                       ErrorString="")
+        orders = StubOrders([{"Response": {"Orders": []}},
+                             {"Status": "Success", "Response": {"Orders": [working]}}])
+        broker, log = broker_with(orders, validity=IOC_VALIDITY)
+        out = broker.place_leg(instrument(), BUY, 1, D("93.0600"), "leg 1")
+
+        self.assertEqual(orders.cancelled, [], "sent a cancel an IOC cannot need")
+        self.assertFalse(out.certain)
+        self.assertIn("should not be able to rest", log.text())
+
+
 class TestPriceScaleConfirmed(unittest.TestCase):
     """The strongest positive result of the probe.
 

@@ -16,6 +16,10 @@ from typing import Optional
 
 from .money import D, PriceError
 
+# Order validity, as swagger.json documents it.
+DAY = 1
+IOC = 4
+
 
 def app_dir() -> str:
     """Directory holding config.json: next to the .exe when frozen, else the project."""
@@ -91,9 +95,20 @@ class RollConfig:
     arm_timeout_sec: int = 120
 
     # --- execution ---------------------------------------------------------
-    order_type: str = "RL_LIMIT"         # the API does not support market orders
+    # RL_MKT and SL_MKT exist, but a market order is the one thing this
+    # strategy must never send: the whole instruction is a price limit.
+    order_type: str = "RL_LIMIT"
     product_type: str = "D"              # carry forward
-    validity: int = 1                    # 1 = Day; see fill_timeout_sec for IOC behaviour
+
+    # 1 = Day, 4 = immediate-or-cancel. swagger.json documents both; the app
+    # was written believing only Day existed and builds IOC by hand -- place,
+    # poll, cancel the remainder -- which is what creates the cancel race and
+    # the window where a partial fill sits working while the second leg is
+    # priced. Real IOC removes all of it.
+    #
+    # Still defaulted to Day because it has not been exercised against the
+    # exchange yet. Switch once a live order can be placed at all.
+    validity: int = DAY
     fill_timeout_sec: float = 2.0        # unfilled remainder is cancelled after this
     max_clips_per_day: int = 1
     require_market_status: bool = True   # False = trust window_open/window_close instead
@@ -102,6 +117,19 @@ class RollConfig:
     require_touch_size: bool = True      # refuse unless both touches can fill the clip
     auto_unwind_on_leg2_failure: bool = False
     dry_run: bool = True                 # nothing is sent to the exchange while true
+
+    # Whether an order quantity reaches the exchange as contracts or as units
+    # of the underlying has never been established, and the app sends
+    # lots x MarketLot. If the exchange counts contracts, that is a
+    # thousandfold over-order. The live probe of 18 Sep 2026 could not settle
+    # it: the order was refused on account entitlement before the exchange
+    # validated anything. See LIVE-FINDINGS.md.
+    #
+    # Set to true only once Choice have confirmed it, or once an accepted order
+    # has proved it. Live mode refuses to engage while it is false, which is
+    # the app being honest about what it does not know rather than a limit on
+    # what the operator may decide.
+    quantity_unit_confirmed: bool = False
 
     # --- observing -----------------------------------------------------------
     record_market: bool = True           # write a market sample CSV
@@ -211,8 +239,11 @@ class RollConfig:
         if self.fill_timeout_sec <= 0:
             errors.append("fill_timeout_sec must be positive")
         if self.order_type not in ("RL_LIMIT", "SL_LIMIT"):
-            errors.append("order_type must be RL_LIMIT or SL_LIMIT; market orders are "
-                          "not supported by the API")
+            errors.append("order_type must be RL_LIMIT or SL_LIMIT; a market order "
+                          "would ignore the price limit that is the whole rule")
+        if self.validity not in (DAY, IOC):
+            errors.append(f"validity must be {DAY} (day) or {IOC} "
+                          "(immediate or cancel)")
         if self.product_type not in ("D", "M"):
             errors.append("product_type must be D (carry forward) or M (intraday)")
 
