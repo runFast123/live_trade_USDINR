@@ -111,13 +111,19 @@ so the ladder gives each limit the same treatment that one limit had, and you
 set them in the window rather than in a file:
 
 ```
-LADDER                                    4,000 of 35,000 rolled, 31,000 left   clip 1,000
-LIMIT  QTY        IN RUPEES   FAR ASK AT OR BELOW   DISTANCE            ROLLED   STATUS
-[ 30]  [ 10000]      0.2875               96.1000      +36.0    4,000 / 10,000   36.0 bps away
-[ 45]  [  5000]      0.4312               96.2437      +21.0         0 / 5,000   21.0 bps away
-[ 50]  [ 20000]      0.4791               96.2916      +16.0        0 / 20,000   16.0 bps away
+ROLL COST AT EACH LIMIT                   3,000 of 10,000 rolled, 7,000 left   clip 1,000
 
-[Add rung]  [Set ladder]
+| LIMIT              x |  | LIMIT              x |  | LIMIT              x |
+| [30] bps      0.2877 |  | [45] bps      0.4316 |  | [65] bps      0.6234 |
+|                      |  |                      |  |                      |
+| too dear             |  | too dear             |  | in range             |
+| 33.6 bps away        |  | 18.6 bps away        |  | 1.4 bps inside       |
+| far ask <= 96.2027   |  | far ask <= 96.3466   |  | far ask <= 96.5384   |
+| -------------------- |  | -------------------- |  | -------------------- |
+| QTY          [10000] |  | QTY          [     ] |  | QTY          [     ] |
+| 3,000 of 10,000      |  | watching only        |  | watching only        |
+
+[Add limit]  [Set limits]
 ```
 
 The limit and the quantity are typed. Everything to the right is the market

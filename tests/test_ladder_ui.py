@@ -136,32 +136,34 @@ class TestTheLiveNumbers(LadderUICase):
     def test_each_rung_shows_the_far_ask_that_would_satisfy_it(self):
         """The number to watch the market against, per rung."""
         self.draw()
-        self.assertEqual(self.cell(0, "target"), "96.0673")
-        self.assertEqual(self.cell(1, "target"), "96.2589")
+        self.assertIn("96.0673", self.cell(0, "target"))
+        self.assertIn("96.2589", self.cell(1, "target"))
+        self.assertIn("far ask", self.cell(0, "target"))
 
-    def test_a_rung_the_market_has_passed_reads_negative(self):
+    def test_a_rung_the_market_has_passed_says_inside(self):
         self.draw(far_ask="96.0500")          # 28 bps, inside both
-        self.assertTrue(self.cell(0, "gap").startswith("-"), self.cell(0, "gap"))
+        self.assertIn("inside the limit", self.cell(0, "gap"))
 
-    def test_a_rung_out_of_reach_reads_positive(self):
+    def test_a_rung_out_of_reach_says_how_far(self):
         self.draw(far_ask="96.4000")          # 65 bps, outside both
-        self.assertTrue(self.cell(0, "gap").startswith("+"), self.cell(0, "gap"))
-        self.assertIn("bps away", self.cell(0, "status"))
+        self.assertIn("34.7 bps away", self.cell(0, "gap"))
+        self.assertEqual(self.cell(0, "status"), "too dear")
 
     def test_the_rung_being_worked_says_so(self):
         self.draw(far_ask="96.0500")
-        self.assertEqual(self.cell(0, "status"), "WORKING")
+        self.assertEqual(self.cell(0, "status"), "READY")
 
     def test_a_cheaper_rung_that_is_spent_shows_done(self):
         self.engine.ladder_progress = {"30": 10000}
         self.draw(far_ask="96.0500")
         self.assertEqual(self.cell(0, "status"), "done")
-        self.assertEqual(self.cell(1, "status"), "WORKING")
+        self.assertEqual(self.cell(1, "status"), "READY")
 
     def test_progress_is_shown_per_rung(self):
         self.engine.ladder_progress = {"30": 4000}
         self.draw()
-        self.assertEqual(self.cell(0, "rolled"), "4,000 / 10,000")
+        self.assertIn("4,000 of 10,000 rolled", self.cell(0, "rolled"))
+        self.assertIn("10 lots", self.cell(0, "rolled"))
 
     def test_the_total_shows_the_clip_size_too(self):
         """A 10,000 rung at a 1,000 clip is ten orders, and that should show."""
@@ -321,8 +323,9 @@ class TestWatchOnlyLimits(LadderUICase):
         self.add("45", "")
         self.window._apply_ladder()
         self.draw(far_ask="96.4000")
-        self.assertEqual(self.cell(2, "rolled"), "watching")
-        self.assertIn("bps away", self.cell(2, "status"))
+        self.assertIn("watching", self.cell(2, "rolled"))
+        self.assertEqual(self.cell(2, "status"), "too dear")
+        self.assertIn("bps away", self.cell(2, "gap"))
 
     def test_it_is_never_traded(self):
         """A price that clears the watch line but no rung must not trade."""

@@ -395,25 +395,29 @@ class RollWindow(tk.Toplevel):
             value.pack(fill="x")
             self.stat_labels[key] = value
 
-    LADDER_HEADINGS = ("LIMIT", "QTY", "IN RUPEES", "FAR ASK AT OR BELOW",
-                       "DISTANCE", "ROLLED", "")
+    # How many cards sit side by side before wrapping to the next line.
+    LADDER_COLUMNS = 4
 
     def _build_ladder(self, parent) -> None:
-        """Several roll limits at once, each with its own quantity, editable.
+        """A roll cost card per limit, so several can be read at once.
 
-        The single ROLL LIMIT box answers "may I roll?" and nothing else. An
-        operator willing to do ten thousand at thirty basis points and twenty
-        thousand at fifty needs to set both and watch both, so each rung gets
-        the same treatment that one limit had: a figure you can type, the rupee
-        amount it works out to, the far ask that would satisfy it, and how far
-        away the market is right now.
+        The single ROLL COST card answers "where is the market against ONE
+        limit". An operator willing to do ten thousand at thirty basis points
+        and twenty at fifty needs that question answered for each of them at
+        the same time, side by side, rather than by retyping one box and
+        losing the previous answer.
+
+        Each card carries the same figures the main one does -- what the limit
+        is worth in rupees, the far ask that would satisfy it, how far away the
+        market is -- plus what it would trade and how much of it is done. A
+        card with no quantity is a watch line: compared, never traded.
         """
         self.ladder_card = T.card(parent, padx=T.PAD_L, pady=self.gap)
         box = self.ladder_card.inner
 
         head = tk.Frame(box, bg=T.SURFACE)
         head.pack(fill="x")
-        tk.Label(head, text="LADDER", bg=T.SURFACE, fg=T.FAINT,
+        tk.Label(head, text="ROLL COST AT EACH LIMIT", bg=T.SURFACE, fg=T.FAINT,
                  font=self.fonts.label, anchor="w").pack(side="left")
         self.ladder_total = tk.Label(head, text="", bg=T.SURFACE, fg=T.MUTED,
                                      font=self.fonts.ui_small, anchor="e")
@@ -421,23 +425,18 @@ class RollWindow(tk.Toplevel):
 
         self.ladder_grid = tk.Frame(box, bg=T.SURFACE)
         self.ladder_grid.pack(fill="x", pady=(T.PAD_S, 0))
-        for column, caption in enumerate(self.LADDER_HEADINGS):
-            tk.Label(self.ladder_grid, text=caption, bg=T.SURFACE, fg=T.FAINT,
-                     font=self.fonts.label,
-                     anchor="w" if column < 2 else "e").grid(
-                         row=0, column=column, sticky="ew",
-                         padx=(0, T.PAD_M), pady=(0, 2))
-        self.ladder_grid.columnconfigure(6, weight=1)
+        for column in range(self.LADDER_COLUMNS):
+            self.ladder_grid.columnconfigure(column, weight=1, uniform="rung")
 
         controls = tk.Frame(box, bg=T.SURFACE)
-        controls.pack(fill="x", pady=(T.PAD_S, 0))
+        controls.pack(fill="x", pady=(T.PAD_M, 0))
         T.Button(controls, "Add limit", self._add_rung, self.fonts,
                  width=110, height=30).pack(side="left")
-        T.Button(controls, "Set ladder", self._apply_ladder, self.fonts,
+        T.Button(controls, "Set limits", self._apply_ladder, self.fonts,
                  kind="primary", width=110, height=30).pack(side="left",
                                                             padx=T.PAD_XS)
         # Wrapped, not truncated: a refusal that stops mid-sentence tells the
-        # operator a rung is wrong without telling them what to do about it.
+        # operator a limit is wrong without telling them what to do about it.
         self.ladder_note = tk.Label(controls, text="", bg=T.SURFACE, fg=T.FAINT,
                                     font=self.fonts.ui_small, anchor="w",
                                     justify="left", wraplength=620)
@@ -447,9 +446,9 @@ class RollWindow(tk.Toplevel):
         self._ladder_shown = False
         self._rebuild_rung_rows()
 
-    # ---- the rows ---------------------------------------------------------
+    # ---- one card per limit -----------------------------------------------
     def _rebuild_rung_rows(self) -> None:
-        """Draw one row per rung of the ladder the engine is actually using."""
+        """One card per limit the engine is actually using."""
         for row in list(self.rung_rows):
             self._forget_row(row)
         self.rung_rows = []
@@ -464,48 +463,81 @@ class RollWindow(tk.Toplevel):
         self._reflow_rows()
 
     def _forget_row(self, row) -> None:
-        for widget in (row["bps_box"], row["qty_box"], row["remove"],
-                       *row["cells"].values()):
-            widget.destroy()
+        row["card"].destroy()
 
     def _add_row(self, bps: str = "", qty: str = "", key=None,
                  watch: bool = False) -> None:
-        row = {"key": key, "watch": watch, "bps": tk.StringVar(value=bps),
-               "qty": tk.StringVar(value=qty), "cells": {}}
+        card = T.card(self.ladder_grid, padx=T.PAD_M, pady=T.PAD_S)
+        inner = card.inner
+        row = {"card": card, "key": key, "watch": watch,
+               "bps": tk.StringVar(value=bps), "qty": tk.StringVar(value=qty),
+               "cells": {}}
 
-        row["bps_box"] = T.entry(self.ladder_grid, self.fonts,
-                                 textvariable=row["bps"], width=6)
-        row["qty_box"] = T.entry(self.ladder_grid, self.fonts,
-                                 textvariable=row["qty"], width=9)
+        # ---- the limit, big and editable, the way the main card has it ----
+        top = tk.Frame(inner, bg=T.SURFACE)
+        top.pack(fill="x")
+        tk.Label(top, text="LIMIT", bg=T.SURFACE, fg=T.FAINT,
+                 font=self.fonts.label, anchor="w").pack(side="left")
+        row["remove"] = T.Button(top, "x", lambda r=row: self._remove_rung(r),
+                                 self.fonts, width=24, height=20)
+        row["remove"].pack(side="right")
+
+        entry_row = tk.Frame(inner, bg=T.SURFACE)
+        entry_row.pack(fill="x", pady=(2, 0))
+        row["bps_box"] = T.entry(entry_row, self.fonts, textvariable=row["bps"],
+                                 width=5)
+        row["bps_box"].pack(side="left", ipady=3)
+        tk.Label(entry_row, text="bps", bg=T.SURFACE, fg=T.MUTED,
+                 font=self.fonts.ui_small).pack(side="left", padx=(T.PAD_XS, 0))
+        row["cells"]["rupees"] = tk.Label(entry_row, text="--", bg=T.SURFACE,
+                                          fg=T.TEXT, font=self.fonts.mono_medium,
+                                          anchor="e")
+        row["cells"]["rupees"].pack(side="right")
+
+        # ---- the verdict, which is what the eye goes to --------------------
+        row["cells"]["status"] = tk.Label(
+            inner, text="--", bg=T.SURFACE, fg=T.MUTED,
+            font=self.fonts.mono_medium, anchor="w")
+        row["cells"]["status"].pack(fill="x", pady=(T.PAD_S, 0))
+
+        row["cells"]["target"] = tk.Label(
+            inner, text="", bg=T.SURFACE, fg=T.FAINT,
+            font=self.fonts.ui_small, anchor="w")
+        row["cells"]["target"].pack(fill="x")
+
+        row["cells"]["gap"] = tk.Label(inner, text="", bg=T.SURFACE, fg=T.FAINT,
+                                       font=self.fonts.ui_small, anchor="w")
+        row["cells"]["gap"].pack(fill="x")
+
+        tk.Frame(inner, bg=T.BORDER, height=1).pack(fill="x", pady=T.PAD_S)
+
+        # ---- what it would trade ------------------------------------------
+        size_row = tk.Frame(inner, bg=T.SURFACE)
+        size_row.pack(fill="x")
+        tk.Label(size_row, text="QTY", bg=T.SURFACE, fg=T.FAINT,
+                 font=self.fonts.label).pack(side="left")
+        row["qty_box"] = T.entry(size_row, self.fonts, textvariable=row["qty"],
+                                 width=8)
+        row["qty_box"].pack(side="right", ipady=2)
+
+        row["cells"]["rolled"] = tk.Label(inner, text="", bg=T.SURFACE,
+                                          fg=T.FAINT, font=self.fonts.ui_small,
+                                          anchor="w")
+        row["cells"]["rolled"].pack(fill="x", pady=(2, 0))
+
         for box in (row["bps_box"], row["qty_box"]):
             box.bind("<Return>", lambda _e: self._apply_ladder())
             box.bind("<Escape>", lambda _e: self._rebuild_rung_rows())
 
-        for name in ("rupees", "target", "gap", "rolled", "status"):
-            row["cells"][name] = tk.Label(
-                self.ladder_grid, text="--", bg=T.SURFACE, fg=T.MUTED,
-                font=self.fonts.mono, anchor="e")
-
-        row["remove"] = T.Button(self.ladder_grid, "Remove",
-                                 lambda r=row: self._remove_rung(r),
-                                 self.fonts, width=88, height=26)
         self.rung_rows.append(row)
 
     def _reflow_rows(self) -> None:
-        """Place every row's widgets. Called after any add or remove."""
-        for index, row in enumerate(self.rung_rows, start=1):
-            row["bps_box"].grid(row=index, column=0, sticky="w",
-                                padx=(0, T.PAD_M), pady=2, ipady=3)
-            row["qty_box"].grid(row=index, column=1, sticky="w",
-                                padx=(0, T.PAD_M), pady=2, ipady=3)
-            for column, name in enumerate(("rupees", "target", "gap", "rolled"),
-                                          start=2):
-                row["cells"][name].grid(row=index, column=column, sticky="e",
-                                        padx=(0, T.PAD_M))
-            row["cells"]["status"].configure(anchor="w")
-            row["cells"]["status"].grid(row=index, column=6, sticky="w",
-                                        padx=(0, T.PAD_M))
-            row["remove"].grid(row=index, column=7, sticky="e", pady=2)
+        """Lay the cards out, wrapping onto further lines as they are added."""
+        for index, row in enumerate(self.rung_rows):
+            row["card"].grid(row=index // self.LADDER_COLUMNS,
+                             column=index % self.LADDER_COLUMNS,
+                             sticky="nsew", padx=(0, T.PAD_S),
+                             pady=(0, T.PAD_S))
 
     def _add_rung(self) -> None:
         self._add_row()
@@ -521,7 +553,7 @@ class RollWindow(tk.Toplevel):
         if row in self.rung_rows:
             self.rung_rows.remove(row)
         self._reflow_rows()
-        self._ladder_note("removed; press Set ladder to apply", T.WARN)
+        self._ladder_note("removed; press Set limits to apply", T.WARN)
 
     def _ladder_note(self, text: str, colour: str) -> None:
         self.ladder_note.configure(text=text, fg=colour)
@@ -534,7 +566,7 @@ class RollWindow(tk.Toplevel):
 
     # ---- applying ---------------------------------------------------------
     def _typed_ladder(self):
-        """The rows, split into rungs and watch lines. None on a complaint.
+        """The cards, split into rungs and watch lines. None on a complaint.
 
         A limit with a quantity is a rung: it will be traded, and it is bound
         by the tenor ceiling. A limit with the quantity left blank is a watch
@@ -551,7 +583,7 @@ class RollWindow(tk.Toplevel):
                     self._ladder_note("a quantity with no limit is not a rung",
                                       T.DANGER)
                     return None
-                continue                      # a row left blank is nothing
+                continue                      # a card left blank is nothing
             if qty:
                 rungs.append({"bps": bps, "qty": qty})
             else:
@@ -561,9 +593,9 @@ class RollWindow(tk.Toplevel):
     def _apply_ladder(self) -> None:
         """Validate what has been typed and put it into force.
 
-        The same validation config.json goes through, so a ladder that would
-        make the app unsafe is refused rather than accepted. Applying always
-        disarms: a typed digit must not fire a roll on the next tick.
+        The same validation config.json goes through, so a set of limits that
+        would make the app unsafe is refused rather than accepted. Applying
+        always disarms: a typed digit must not fire a roll on the next tick.
         """
         from dataclasses import replace
 
@@ -590,8 +622,8 @@ class RollWindow(tk.Toplevel):
             # could quietly be looser than the limit for this roll. Refusing is
             # the safe direction, and it clears as soon as the contracts load.
             self._ladder_note(
-                "the tenor is not known yet, so a rung cannot be checked "
-                "against the limit", T.DANGER)
+                "the tenor is not known yet, so a limit cannot be checked "
+                "against the roll limit", T.DANGER)
             return
 
         try:
@@ -610,7 +642,7 @@ class RollWindow(tk.Toplevel):
             self._ladder_note(first, T.DANGER)
             return
 
-        # Compare the rungs, not the text. config.json holds qty as a number
+        # Compare the limits, not the text. config.json holds qty as a number
         # and the box hands back a string, so comparing the raw entries made
         # every press look like a change: disarming and re-saving each time.
         current = getattr(self.engine, "ladder", None)
@@ -621,7 +653,7 @@ class RollWindow(tk.Toplevel):
             return
 
         was_armed = self.engine.armed
-        self.engine.disarm("ladder changed")
+        self.engine.disarm("limits changed")
         self.cfg.limit_ladder = wanted
         self.cfg.watch_limits = watch
         self.engine.rebuild_ladder()
@@ -646,7 +678,7 @@ class RollWindow(tk.Toplevel):
 
     # ---- the live numbers -------------------------------------------------
     def _draw_ladder(self, decision) -> None:
-        """Fill in what the market is doing against each rung."""
+        """Fill each card in with what the market is doing against its limit."""
         if (not self.rung_rows and not getattr(self.engine, "ladder", None)
                 and not self.cfg.watch_limits):
             if self._ladder_shown:
@@ -660,6 +692,7 @@ class RollWindow(tk.Toplevel):
                    for v in (getattr(decision, "watch_rungs", None) or [])}
         active = getattr(decision, "active_rung", None)
         active_key = active.rung.key if active else None
+        lot_size = getattr(decision, "lot_size", 1000) or 1000
 
         done = total = 0
         for row in self.rung_rows:
@@ -669,47 +702,56 @@ class RollWindow(tk.Toplevel):
 
             if view is None:
                 # Typed but not applied yet, or no quote to price it against.
-                for name in ("rupees", "target", "gap", "rolled"):
-                    cells[name].configure(text="--", fg=T.MUTED)
+                cells["rupees"].configure(text="--", fg=T.MUTED)
                 cells["status"].configure(text="not set", fg=T.FAINT)
+                cells["target"].configure(text="")
+                cells["gap"].configure(text="")
+                cells["rolled"].configure(text="")
                 continue
 
             total += view.rung.qty
             done += view.done
 
             if view.watch:
-                # It is priced for comparison and will never be traded, so it
-                # is shown in the colour of information rather than of action.
+                # Priced for comparison and never traded, so it is shown in the
+                # colour of information rather than of action.
                 colour = T.ACCENT_TEXT if view.qualifies else T.MUTED
-                status = view.status
+                status = "in range" if view.qualifies else "too dear"
             elif view.exhausted:
                 colour, status = T.FAINT, "done"
             elif view.rung.key == active_key:
-                colour, status = T.WARN, "WORKING"
+                colour, status = T.WARN, "READY"
             elif view.qualifies:
-                colour, status = T.SUCCESS, "READY"
+                colour, status = T.SUCCESS, "in range"
             else:
-                colour, status = T.MUTED, view.status
-
-            gap = "--"
-            if view.distance_bps is not None:
-                # Negative means the market is already through this rung, which
-                # reads better as how far past it we are.
-                inside = view.distance_bps < 0
-                gap = ("-" if inside else "+") + money(abs(view.distance_bps), 1)
+                colour, status = T.MUTED, "too dear"
 
             cells["rupees"].configure(
                 text=money(view.limit_rupees) if view.limit_rupees is not None
                 else "--", fg=T.TEXT)
-            cells["target"].configure(
-                text=money(view.required_far_ask)
-                if view.required_far_ask is not None else "--", fg=T.TEXT)
-            cells["gap"].configure(text=gap, fg=colour)
-            cells["rolled"].configure(
-                text="watching" if view.watch
-                else f"{view.done:,} / {view.rung.qty:,}",
-                fg=T.FAINT if view.watch else T.TEXT)
             cells["status"].configure(text=status, fg=colour)
+            cells["target"].configure(
+                text=f"far ask at or below {money(view.required_far_ask)}"
+                if view.required_far_ask is not None else "")
+
+            if view.distance_bps is None:
+                cells["gap"].configure(text="")
+            else:
+                inside = view.distance_bps < 0
+                cells["gap"].configure(
+                    text=(f"{money(abs(view.distance_bps), 1)} bps "
+                          + ("inside the limit" if inside else "away")),
+                    fg=colour)
+
+            if view.watch:
+                cells["rolled"].configure(text="watching only", fg=T.FAINT)
+            else:
+                lots = view.rung.qty // lot_size if lot_size else 0
+                cells["rolled"].configure(
+                    text=f"{view.done:,} of {view.rung.qty:,} rolled"
+                         + (f"  ({lots} lot{'s' if lots != 1 else ''})"
+                            if lots else ""),
+                    fg=T.FAINT)
 
         if total:
             left = max(0, total - done)
@@ -717,7 +759,7 @@ class RollWindow(tk.Toplevel):
                 text=f"{done:,} of {total:,} rolled, {left:,} left"
                      f"   clip {self.cfg.clip_qty:,}")
         else:
-            self.ladder_total.configure(text="no rungs set")
+            self.ladder_total.configure(text="no quantity set to trade")
 
     def _build_actions(self, parent) -> None:
         bar = tk.Frame(parent, bg=T.BG)
