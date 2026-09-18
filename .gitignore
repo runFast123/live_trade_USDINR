@@ -7,3 +7,5 @@ dist/
 __pycache__/
 *.pyc
 smoke_logs/
+state.json
+data/

@@ -23,8 +23,9 @@ not below the 0.30 limit, so nothing is sent.
 python -m unittest discover -s tests -t .
 ```
 
-276 tests, covering the rule, the tenor based limit, the gates, the order
-sequence, the price feed, the recorder, the probe and the updater.
+296 tests, covering the rule, the tenor based limit, the gates, the order
+sequence, the price feed, the recorder, the probe, crash-safe state and the
+updater.
 
 - [tests/test_limits.py](tests/test_limits.py) pins the basis point maths and
   the tenor schedule, including that 30 bps is not 30 paise.
@@ -158,6 +159,7 @@ The workflow refuses to release if the tag does not match
 | `rollover/recorder.py` | the market sampler that answers "what limit would have worked" |
 | `rollover/probe.py` | the one-order live probe |
 | `rollover/notify.py` | sound, because a screen alert is useless to someone not looking |
+| `rollover/state.py` | the clip count and any halt, kept across restarts |
 | `logs/` | a dated audit log of every decision and order |
 | `data/` | market samples and probe captures |
 
@@ -193,6 +195,11 @@ it sees is written verbatim to `data/probe-<timestamp>.json`.
   identical payload, server timestamp included, and a quiet far month has been
   seen thirteen minutes behind. The websocket feed is the real source; polling
   is only the fallback, and the header says which is in use.
+- **A halt outlives the process, and the trading day.** The clip count and any
+  halt are written to `state.json` on every change. Closing and reopening the
+  app will not let it roll twice, and will not erase a half-rolled halt — only
+  a person clears that. Daily counters reset at the date change; the halt does
+  not, because a half-rolled position does not repair itself overnight.
 - **The scrip master is reloaded when the day turns over**, because contracts
   expire out of it and every circuit limit moves. The app will not trade on a
   file that is not today's.

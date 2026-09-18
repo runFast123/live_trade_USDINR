@@ -10,6 +10,8 @@ A fill that cannot be read must halt rather than be assumed.
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 import unittest
 from datetime import date
 
@@ -88,6 +90,14 @@ def instrument(token, desc):
 
 
 class ExecutionCase(unittest.TestCase):
+    def setUp(self):
+        # Each engine persists its clip count and any halt, so every test needs
+        # its own directory or they would inherit each other's halts.
+        self.state_dir = tempfile.mkdtemp(prefix="engine_")
+
+    def tearDown(self):
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
     def build(self, outcomes, **cfg_kw):
         cfg_kw.setdefault("dry_run", False)
         cfg_kw.setdefault("use_live_feed", False)
@@ -96,7 +106,8 @@ class ExecutionCase(unittest.TestCase):
         self.log = StubLog()
         self.broker = StubBroker(outcomes, self.cfg)
 
-        engine = RollEngine(self.cfg, self.log, ".", broker=self.broker)
+        engine = RollEngine(self.cfg, self.log, self.state_dir,
+                            broker=self.broker)
         engine.session.near = instrument("1769", "USDINR26SEPFUT")
         engine.session.far = instrument("1584", "USDINR26NOVFUT")
 

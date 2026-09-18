@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from . import gates as gatelib
@@ -23,6 +23,7 @@ from .logbook import Logbook
 from .money import ceil_tick, money
 from .quotes import Quote, QuoteError, QuoteReader
 from .recorder import Recorder
+from .state import StateStore
 
 # States the operator sees on screen.
 STARTING = "STARTING"
@@ -42,6 +43,7 @@ class SessionState:
     market_open: Optional[bool] = None
     near_position_qty: Optional[int] = None
     clips_done_today: int = 0
+    lots_rolled: int = 0
     in_flight: bool = False
     halted_reason: Optional[str] = None
     scrip_file_date = None          # which day's scrip master is loaded
@@ -84,6 +86,7 @@ class RollEngine:
         # Whether the cost was clearing the limit on the previous tick,
         # so the crossing can be announced once rather than every tick.
         self._was_qualifying = False
+
         self.session = SessionState()
 
         self._thread: Optional[threading.Thread] = None
@@ -95,6 +98,21 @@ class RollEngine:
         self._note = "not started"
         self._last_slow_refresh = 0.0
         self._last_complaint = ("", 0.0)
+
+        # The day's budget and any halt have to outlive the process: the
+        # updater restarts it, and so does a crash. Loaded last, so it can
+        # overwrite the defaults set above.
+        self.store = StateStore(base_dir)
+        saved = self.store.load()
+        self.session.clips_done_today = saved.clips_done
+        self.session.lots_rolled = saved.lots_rolled
+        self.session.halted_reason = saved.halted_reason
+        if saved.halted:
+            self._state = HALTED
+            self._note = saved.halted_reason
+            log.alert(f"Resumed with a halt still in force: {saved.halted_reason}")
+        elif saved.clips_done:
+            log.info(f"Resumed: {saved.clips_done} clip(s) already done today.")
 
     # --------------------------------------------------------------- controls
     def start(self) -> None:
@@ -123,13 +141,18 @@ class RollEngine:
         Used when the operator changes the legs. The day's clip count is kept,
         so switching contracts cannot be used to get around the daily budget.
         """
+        if self.session.halted_reason:
+            # Changing contracts is not a way to make a halt go away. Whatever
+            # is wrong with the position is still wrong.
+            self.log.warn("Not restarting: a halt is in force. Clear it first.")
+            return
+
         self.stop()
         with self._lock:
             self._armed_until = None
             self._snapshot = None
             self.session.near = None
             self.session.far = None
-            self.session.halted_reason = None
             self.session.in_flight = False
             self._state = STARTING
             self._note = "reloading contracts"
@@ -162,6 +185,7 @@ class RollEngine:
             self._state = HALTED
             self._note = reason
         self.log.alert(f"HALTED: {reason}")
+        self._persist()
 
     def clear_halt(self) -> None:
         with self._lock:
@@ -169,6 +193,7 @@ class RollEngine:
             self._state = STARTING
             self._note = "halt cleared"
         self.log.info("Halt cleared by operator.")
+        self._persist()
         # A halt during startup ends the loop thread, so clearing it has to
         # start the loop again or the button would do nothing.
         if not (self._thread and self._thread.is_alive()):
@@ -275,6 +300,31 @@ class RollEngine:
 
             elapsed = time.monotonic() - cycle_started
             self._stop.wait(max(0.1, self.cfg.poll_interval_sec - elapsed))
+
+    def _count_clip(self, qty: int) -> None:
+        """Record a completed clip, on disk as well as in memory."""
+        self.session.clips_done_today += 1
+        self.session.lots_rolled += int(qty or 0)
+        self._persist()
+
+    def _persist(self) -> None:
+        """Write the day's state out. Never raises."""
+        from .state import DayState
+
+        try:
+            state = DayState(
+                trading_date=date.today().isoformat(),
+                clips_done=self.session.clips_done_today,
+                lots_rolled=self.session.lots_rolled,
+                halted_reason=self.session.halted_reason,
+                halted_at=(datetime.now().astimezone().isoformat(timespec="seconds")
+                           if self.session.halted_reason else None),
+            )
+            if not self.store.save(state):
+                self.log.warn("Could not write the state file; a restart would "
+                              "forget today's clips and any halt.")
+        except Exception as exc:
+            self.log.warn(f"Could not write the state file: {exc}")
 
     def _announce_crossing(self, decision) -> None:
         """Say something the first time the cost clears the limit.
@@ -409,7 +459,7 @@ class RollEngine:
                     f"DRY RUN, not sent -- leg 2 far BUY {decision.qty} of "
                     f"{self.session.far.token} at {money(leg2_price)}")
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
-                self.session.clips_done_today += 1
+                self._count_clip(decision.qty)
                 return
 
             if not leg1.certain:
@@ -429,7 +479,7 @@ class RollEngine:
             self.log.info(f"leg 2 result: {leg2.detail}")
 
             if leg2.fully_filled:
-                self.session.clips_done_today += 1
+                self._count_clip(leg2.filled_qty)
                 self.log.info(
                     f"ROLL COMPLETE: sold {leg1.filled_qty} near, bought {leg2.filled_qty} far, "
                     f"at a booked cost near {money(decision.roll_cost)} per unit.")
