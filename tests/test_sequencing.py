@@ -1,0 +1,216 @@
+"""Which leg goes out first.
+
+The decision that turns a half roll from the expected outcome into a rare one,
+and the one that can invert the problem if it is made carelessly. Every case
+here is a number and a verdict; there is no clock, no display and no network.
+"""
+from __future__ import annotations
+
+import unittest
+
+from rollover.sequencing import (AUTO, FAR_FIRST, NEAR_DEPTH_MULTIPLE,
+                                 NEAR_FIRST, Sequence, choose, valid_mode)
+
+CLIP = 25000
+
+
+class TestTheThinFarBook(unittest.TestCase):
+    """The case far-first exists for."""
+
+    def test_a_far_book_that_cannot_fill_the_clip_goes_first(self):
+        got = choose(CLIP, near_bid_qty=400000, far_ask_qty=8000)
+        self.assertTrue(got.far_first)
+        self.assertIn("far leg sets the size", got.reason)
+
+    def test_a_far_book_that_can_fill_the_clip_does_not(self):
+        """Both legs fill trivially, so near-first, which leaves you flat."""
+        got = choose(CLIP, near_bid_qty=400000, far_ask_qty=80000)
+        self.assertTrue(got.near_first)
+
+    def test_exactly_enough_is_enough(self):
+        self.assertTrue(choose(CLIP, 400000, far_ask_qty=CLIP).near_first)
+
+    def test_one_short_is_thin(self):
+        self.assertTrue(choose(CLIP, 400000, far_ask_qty=CLIP - 1).far_first)
+
+
+class TestTheNearDepthGuard(unittest.TestCase):
+    """Far-first commits you to selling the near leg afterwards.
+
+    If that sale then fails you are long both months, which is the mirror of
+    the problem it was meant to solve and no better.
+    """
+
+    def test_a_shallow_near_book_blocks_far_first(self):
+        got = choose(CLIP, near_bid_qty=CLIP, far_ask_qty=8000)
+        self.assertTrue(got.near_first)
+        self.assertIn("before committing to sell it second", got.reason)
+
+    def test_three_times_the_clip_is_enough(self):
+        got = choose(CLIP, near_bid_qty=CLIP * 3, far_ask_qty=8000)
+        self.assertTrue(got.far_first)
+
+    def test_one_short_of_three_times_is_not(self):
+        got = choose(CLIP, near_bid_qty=CLIP * 3 - 1, far_ask_qty=8000)
+        self.assertTrue(got.near_first)
+
+    def test_the_multiple_is_adjustable(self):
+        got = choose(CLIP, near_bid_qty=CLIP * 2, far_ask_qty=8000,
+                     near_depth_multiple=2)
+        self.assertTrue(got.far_first)
+
+    def test_a_nonsense_multiple_still_requires_the_clip(self):
+        for multiple in (0, -5):
+            got = choose(CLIP, near_bid_qty=CLIP - 1, far_ask_qty=8000,
+                         near_depth_multiple=multiple)
+            self.assertTrue(got.near_first, msg=multiple)
+
+    def test_the_default_multiple_is_three(self):
+        self.assertEqual(NEAR_DEPTH_MULTIPLE, 3)
+
+
+class TestUnknownSizes(unittest.TestCase):
+    """An unknown size is not a large one."""
+
+    def test_an_unknown_near_size_blocks_far_first(self):
+        got = choose(CLIP, near_bid_qty=None, far_ask_qty=8000)
+        self.assertTrue(got.near_first)
+        self.assertIn("near bid size is unknown", got.reason)
+
+    def test_an_unknown_far_size_is_not_assumed_thin(self):
+        got = choose(CLIP, near_bid_qty=400000, far_ask_qty=None)
+        self.assertTrue(got.near_first)
+        self.assertIn("far ask size is unknown", got.reason)
+
+    def test_neither_known_is_near_first(self):
+        self.assertTrue(choose(CLIP, None, None).near_first)
+
+
+class TestExpiryDay(unittest.TestCase):
+    """Unconditional, because after 12:30 the near contract is gone.
+
+    A sold near leg with no far leg cannot be corrected at any price on expiry
+    day: the instrument you would buy back stops trading.
+    """
+
+    def test_it_is_far_first_whatever_the_books_say(self):
+        for near, far in ((400000, 80000), (0, 0), (None, None), (1, 999999)):
+            got = choose(CLIP, near, far, expiry_day=True)
+            self.assertTrue(got.far_first, msg=(near, far))
+            self.assertIn("expiry day", got.reason)
+
+    def test_it_overrides_a_configured_near_first(self):
+        """"Unconditional" has to mean unconditional, or it is a preference."""
+        got = choose(CLIP, 400000, 80000, expiry_day=True, mode=NEAR_FIRST)
+        self.assertTrue(got.far_first)
+
+    def test_it_overrides_a_shallow_near_book(self):
+        got = choose(CLIP, near_bid_qty=1, far_ask_qty=1, expiry_day=True)
+        self.assertTrue(got.far_first)
+
+
+class TestTheConfiguredMode(unittest.TestCase):
+    def test_near_first_is_honoured(self):
+        got = choose(CLIP, 400000, far_ask_qty=8000, mode=NEAR_FIRST)
+        self.assertTrue(got.near_first)
+        self.assertIn("config", got.reason)
+
+    def test_far_first_is_honoured_even_against_the_depth_guard(self):
+        """An explicit instruction is the operator's to give."""
+        got = choose(CLIP, near_bid_qty=1, far_ask_qty=999999, mode=FAR_FIRST)
+        self.assertTrue(got.far_first)
+
+    def test_auto_is_the_default(self):
+        self.assertEqual(choose(CLIP, 400000, 8000).order,
+                         choose(CLIP, 400000, 8000, mode=AUTO).order)
+
+    def test_the_modes_are_recognised(self):
+        for mode in (AUTO, NEAR_FIRST, FAR_FIRST):
+            self.assertTrue(valid_mode(mode))
+        for mode in ("", "sideways", "FIRST", None):
+            self.assertFalse(valid_mode(mode))
+
+    def test_case_and_space_are_forgiven_when_validating(self):
+        self.assertTrue(valid_mode(" Far_First "))
+
+
+class TestDegenerateInputs(unittest.TestCase):
+    def test_no_clip_is_near_first(self):
+        for clip in (0, -1000):
+            got = choose(clip, 400000, 8000)
+            self.assertTrue(got.near_first, msg=clip)
+
+    def test_a_zero_far_book_is_thin(self):
+        self.assertTrue(choose(CLIP, 400000, far_ask_qty=0).far_first)
+
+    def test_a_zero_near_book_blocks_far_first(self):
+        self.assertTrue(choose(CLIP, near_bid_qty=0, far_ask_qty=0).near_first)
+
+
+class TestItSaysWhy(unittest.TestCase):
+    """The reason is logged and shown, so it has to read as a sentence."""
+
+    def test_every_branch_gives_a_reason(self):
+        cases = [
+            choose(CLIP, 400000, 8000),
+            choose(CLIP, 400000, 80000),
+            choose(CLIP, CLIP, 8000),
+            choose(CLIP, None, 8000),
+            choose(CLIP, 400000, None),
+            choose(CLIP, 400000, 8000, expiry_day=True),
+            choose(CLIP, 400000, 8000, mode=NEAR_FIRST),
+            choose(CLIP, 400000, 8000, mode=FAR_FIRST),
+            choose(0, 400000, 8000),
+        ]
+        for got in cases:
+            self.assertTrue(got.reason.strip(), msg=got.order)
+            self.assertGreater(len(got.reason), 12, msg=got.reason)
+
+    def test_the_description_names_the_leg(self):
+        self.assertIn("far leg first", choose(CLIP, 400000, 8000).describe())
+        self.assertIn("near leg first", choose(CLIP, 400000, 80000).describe())
+
+    def test_the_two_orders_are_exclusive(self):
+        for got in (choose(CLIP, 400000, 8000), choose(CLIP, 400000, 80000)):
+            self.assertNotEqual(got.far_first, got.near_first)
+
+    def test_a_sequence_is_immutable(self):
+        got = Sequence(FAR_FIRST, "because")
+        with self.assertRaises(Exception):
+            got.order = NEAR_FIRST
+
+
+class TestTheRealBooksObserved(unittest.TestCase):
+    """The depths actually seen on these contracts, in units not lots.
+
+    Far 8 to 80 lots at the touch, near 14 to 400. At a 25 lot clip the far
+    book is usually the binding side, which is the whole reason for this.
+    """
+
+    def clip(self, lots):
+        return lots * 1000
+
+    def test_a_typical_book_at_25_lots_goes_far_first(self):
+        got = choose(self.clip(25), near_bid_qty=self.clip(400),
+                     far_ask_qty=self.clip(8))
+        self.assertTrue(got.far_first)
+
+    def test_a_good_far_book_at_25_lots_goes_near_first(self):
+        got = choose(self.clip(25), near_bid_qty=self.clip(400),
+                     far_ask_qty=self.clip(80))
+        self.assertTrue(got.near_first)
+
+    def test_a_thin_near_book_at_25_lots_refuses_far_first(self):
+        """Near 14 lots against a 25 lot clip: cannot sell it second."""
+        got = choose(self.clip(25), near_bid_qty=self.clip(14),
+                     far_ask_qty=self.clip(8))
+        self.assertTrue(got.near_first)
+
+    def test_one_lot_is_comfortable_either_way(self):
+        got = choose(self.clip(1), near_bid_qty=self.clip(14),
+                     far_ask_qty=self.clip(8))
+        self.assertTrue(got.near_first, "a 1 lot clip fits in both books")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
