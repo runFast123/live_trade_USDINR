@@ -17,7 +17,15 @@ from typing import Callable, Optional
 from . import theme as T
 from . import __version__, updater
 from .engine import ARMED, DONE, HALTED, RollEngine, WATCHING, WORKING
-from .money import money
+from .money import D, money
+
+def _numeric(text: str) -> bool:
+    try:
+        D(text)
+        return True
+    except Exception:
+        return False
+
 
 STATE_COLOUR = {
     "STARTING": T.MUTED,
@@ -233,18 +241,23 @@ class RollWindow(tk.Toplevel):
 
         row = tk.Frame(limit_box, bg=T.SURFACE)
         row.pack(fill="x", pady=(2, 0))
-        self.limit_var = tk.StringVar(value=money(self.cfg.roll_limit_d))
+        self.limit_var = tk.StringVar()
         self.limit_entry = T.entry(row, self.fonts, textvariable=self.limit_var,
-                                   width=9)
+                                   width=8)
         self.limit_entry.pack(side="left", ipady=5)
         self.limit_entry.bind("<Return>", lambda _e: self._apply_limit())
         self.limit_entry.bind("<Escape>", lambda _e: self._reset_limit())
+        self.limit_unit = tk.Label(row, text="", bg=T.SURFACE, fg=T.MUTED,
+                                   font=self.fonts.ui_small)
+        self.limit_unit.pack(side="left", padx=(T.PAD_XS, 0))
         T.Button(row, "Set", self._apply_limit, self.fonts,
                  width=58, height=30).pack(side="left", padx=T.PAD_XS)
 
-        self.limit_note = tk.Label(limit_box, text="roll below this", bg=T.SURFACE,
+        self.limit_note = tk.Label(limit_box, text="", bg=T.SURFACE,
                                    fg=T.FAINT, font=self.fonts.ui_small, anchor="w")
         self.limit_note.pack(fill="x")
+        self._last_decision = None
+        self._reset_limit()
 
         stats = tk.Frame(box, bg=T.SURFACE)
         stats.pack(side="left", padx=T.PAD_M)
@@ -383,9 +396,34 @@ class RollWindow(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- the roll limit ---------------------------------------------------
+    @property
+    def _bps_mode(self) -> bool:
+        return self.cfg.limit_mode == "bps"
+
+    def _current_tenor(self):
+        """The tenor of the pair on screen, which is what the limit keys off."""
+        detail = getattr(self._last_decision, "limit_detail", None)
+        return detail.tenor_months if detail else None
+
     def _reset_limit(self) -> None:
-        self.limit_var.set(money(self.cfg.roll_limit_d))
-        self._limit_note("roll below this", T.FAINT)
+        if self._bps_mode:
+            months = self._current_tenor()
+            schedule = self.cfg.limit_bps_schedule or {}
+            current = schedule.get(str(months)) if months else None
+            self.limit_var.set(str(current) if current is not None else "")
+            self.limit_unit.configure(text="bps")
+        else:
+            self.limit_var.set(money(self.cfg.roll_limit_d))
+            self.limit_unit.configure(text="Rs")
+        self._describe_limit()
+
+    def _describe_limit(self) -> None:
+        """Spell out what the limit works out to, in both units."""
+        detail = getattr(self._last_decision, "limit_detail", None)
+        if detail is None:
+            self._limit_note("waiting for a quote", T.FAINT)
+        else:
+            self._limit_note(detail.describe(), T.FAINT)
 
     def _limit_note(self, text: str, colour: str) -> None:
         self.limit_note.configure(text=text, fg=colour)
@@ -406,26 +444,42 @@ class RollWindow(tk.Toplevel):
             self._limit_note("enter a limit", T.DANGER)
             return
 
+        if self._bps_mode:
+            months = self._current_tenor()
+            if months is None:
+                self._limit_note("no tenor yet, so there is nothing to set",
+                                 T.DANGER)
+                return
+            schedule = dict(self.cfg.limit_bps_schedule or {})
+            old_text = schedule.get(str(months))
+            schedule[str(months)] = typed
+            changes = {"limit_bps_schedule": schedule}
+            described = f"the {months} month limit from {old_text} to {typed} bps"
+            unchanged = (old_text == typed)
+        else:
+            changes = {"roll_limit": typed}
+            old_text = self.cfg.roll_limit
+            described = f"the limit from {old_text} to {typed}"
+            unchanged = (D(old_text) == D(typed)) if _numeric(typed) else False
+
         try:
-            candidate = replace(self.cfg, roll_limit=typed)
+            candidate = replace(self.cfg, **changes)
             candidate.validate()
         except Exception as exc:
             first = str(exc).splitlines()[-1].strip(" -")
-            self._limit_note(first[:60], T.DANGER)
+            self._limit_note(first[:70], T.DANGER)
             return
 
-        old_value = self.cfg.roll_limit_d
-        if candidate.roll_limit_d == old_value:
+        if unchanged:
             self._reset_limit()
             return
 
         was_armed = self.engine.armed
         self.engine.disarm("roll limit changed")
-        self.cfg.roll_limit = typed
-        self.limit_var.set(money(self.cfg.roll_limit_d))
+        for name, value in changes.items():
+            setattr(self.cfg, name, value)
 
-        self.log.info(f"Roll limit changed from {money(old_value)} to "
-                      f"{money(self.cfg.roll_limit_d)}"
+        self.log.info("Changed " + described
                       + (" (disarmed)" if was_armed else ""))
 
         if self.config_path:
@@ -438,7 +492,7 @@ class RollWindow(tk.Toplevel):
         else:
             self._limit_note("applied", T.SUCCESS)
 
-        self.after(4000, lambda: self._limit_note("roll below this", T.FAINT))
+        self.after(4000, self._describe_limit)
 
     def _change_contracts(self) -> None:
         self.engine.disarm("changing contracts")
@@ -597,7 +651,9 @@ class RollWindow(tk.Toplevel):
             cells["name"].configure(text=info.sec_desc or info.symbol or info.token)
             bits = [f"token {info.token}"]
             if info.expiry:
-                bits.append(f"expires {info.expiry}")
+                from datetime import date as _date
+                left = (info.expiry - _date.today()).days
+                bits.append(f"expires {info.expiry} ({left}d)")
             bits.append(f"lot {info.lot_size}")
             cells["meta"].configure(text="   ".join(bits))
 
@@ -638,6 +694,7 @@ class RollWindow(tk.Toplevel):
             self.cost.configure(text="--", fg=T.FAINT)
             self.cost_delta.configure(text="", fg=T.SURFACE)
             self.cost_rupees.configure(text="")
+            self._last_decision = None
             self.verdict.configure(text="NO DATA", fg=T.DANGER)
             self.verdict_note.configure(text="")
             for label in self.stat_labels.values():
@@ -650,9 +707,21 @@ class RollWindow(tk.Toplevel):
         self.cost.configure(text=money(dec.roll_cost),
                             fg=T.SUCCESS if dec.qualifies else T.TEXT)
         self._draw_delta("roll_cost", self.cost_delta, dec.roll_cost)
+
+        # Basis points are the unit the roll is actually discussed in, so the
+        # cost is shown in both.
+        bps = dec.cost_bps
         self.cost_rupees.configure(
-            text=f"Rs {money(dec.cost_per_lot, 2)} for {self.cfg.lots} lot"
-                 f"{'s' if self.cfg.lots != 1 else ''}")
+            text=(f"{money(bps, 1)} bps" if bps is not None else "")
+                 + f"     Rs {money(dec.cost_per_lot, 2)} for {self.cfg.lots} lot"
+                 + ("s" if self.cfg.lots != 1 else ""))
+
+        first = self._last_decision is None
+        self._last_decision = dec
+        if first:
+            self._reset_limit()
+        else:
+            self._describe_limit()
 
         self.stat_labels["worst"].configure(text=money(dec.worst_case))
         self.stat_labels["sell"].configure(text=money(dec.sell_limit))
@@ -669,7 +738,12 @@ class RollWindow(tk.Toplevel):
                 text=f"but {failing} gate{'s' if failing != 1 else ''} still blocking")
         else:
             self.verdict.configure(text="WAITING", fg=T.MUTED)
-            self.verdict_note.configure(text="cost is not below the limit")
+            over = None
+            if dec.cost_bps is not None and dec.limit_bps is not None:
+                over = dec.cost_bps - dec.limit_bps
+            self.verdict_note.configure(
+                text=(f"{money(over, 1)} bps too dear" if over and over > 0
+                      else "cost is not below the limit"))
 
     def _draw_gates(self, report) -> None:
         self.gates.delete(*self.gates.get_children())

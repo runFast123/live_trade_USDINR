@@ -36,20 +36,57 @@ else:
 The reverse, `near bid − far ask`, is negative in a normal market, and a negative
 number is always below a positive limit, so the app would fire on every tick.
 
-`ROLL_LIMIT` default: **0.30**. Configurable.
-
-Comparison is strictly less than. A roll cost of exactly `0.30` does **not**
+Comparison is strictly less than. A cost exactly equal to the limit does **not**
 trade.
 
-### Worked example (from the note)
+### The limit depends on how far you are rolling
 
-| | |
+A roll's cost scales with tenor. One month trades around thirty basis points and
+two months around sixty, so one fixed rupee figure is only ever right for one
+pair of contracts. The limit is therefore set in basis points against tenor:
+
+| Tenor | Limit |
 |---|---|
-| Near best bid | 95.9400 |
-| Far best ask | 96.5200 |
-| roll_cost | `96.5200 − 95.9400` = **0.5800** |
-| Per clip | 0.5800 × 1000 = **₹580** |
-| Decision | 0.5800 is not below 0.30 → **send nothing** |
+| 1 month | **30 bps** |
+| 2 months | **50 bps** |
+
+The tenor is the number of days between the two expiries, matched to the nearest
+scheduled month and required to be within ten days of it. A pair whose tenor
+matches nothing in the schedule does not trade; it is not given another tenor's
+number.
+
+**A basis point is a share of the price, not a fixed amount.**
+
+| USDINR | 30 bps | 50 bps |
+|---|---|---|
+| 90.00 | 0.2700 | 0.4500 |
+| 95.97 | **0.2879** | **0.4798** |
+| 100.00 | 0.3000 | 0.5000 |
+| 105.00 | 0.3150 | 0.5250 |
+
+Thirty basis points equals 0.30 only when the price is exactly 100. Treating the
+two as the same is the mistake this guards against: a one month roll was found
+running a 0.50 limit, which is 52 bps, seventy four percent looser than intended.
+
+The basis points are taken of the **near contract's mid**, not of the bid being
+hit, so the limit does not move with our own side of the spread. The result is
+quantized to four decimal places, the same grid prices sit on, so a decision can
+be reproduced exactly from the log.
+
+A fixed rupee limit is still available by setting `limit_mode` to `absolute`,
+in which case the tenor is ignored.
+
+### Worked examples, at prices actually observed
+
+| Roll | Near bid | Far ask | Cost | In bps | Limit | Decision |
+|---|---|---|---|---|---|---|
+| Sep → Oct, 1 month | 95.9675 | 96.2800 | 0.3125 | 32.6 | 30 bps = 0.2879 | **send nothing** |
+| Sep → Nov, 2 months | 95.9400 | 96.5200 | 0.5800 | 60.5 | 50 bps = 0.4797 | **send nothing** |
+| Sep → Oct, 1 month | 95.9675 | 96.2450 | 0.2775 | 28.9 | 30 bps = 0.2879 | **roll** |
+
+The same cost is judged differently by tenor. A cost of 0.4000 is 41.7 bps: too
+dear for a one month roll, comfortably inside the limit for a two month one.
+That is the whole reason the limit is not a single number.
 
 ### Arithmetic
 
@@ -96,6 +133,7 @@ duplicated order, a wrong price scale or a half-completed roll is not.
 | # | Gate | Blocks when |
 |---|---|---|
 | 0 | Scrip master is today's | the contract file is from a previous day, so expiries and circuit limits are behind |
+| 0a | Limit in force | the tenor between the two contracts matches nothing in the schedule, so there is no limit to compare against |
 | 1 | Not halted | a previous problem has not been cleared by a human |
 | 2 | No order in flight | an order from this app is already working |
 | 3 | Session | not logged in |
@@ -277,7 +315,7 @@ These come from the broker API and change what the rule can do:
 
 | Item | The note said | The message said | Decided |
 |---|---|---|---|
-| Roll limit | 0.30 | 0.50 | **0.30**, configurable. The stricter of the two. |
+| Roll limit | 0.30 | 0.50 | **Neither.** The client since specified 30 bps for one month and 50 bps for two. Both earlier numbers were fixed rupee figures with no tenor attached, and 0.30 was being applied to a two month roll while 0.50 was being applied to a one month roll. |
 | Formula | Nov price − Sep price | "26th Bid − 26th Ask" | **far ask − near bid.** The literal reading is negative and would trade on every tick. |
 | Near expiry | 28 Sep | 26 Sep | **Read from the scrip master, never hard-coded.** The configured date is a cross-check: if it disagrees with the scrip master, the app does not trade. |
 

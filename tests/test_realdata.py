@@ -100,6 +100,7 @@ class TestQuotesAtTheRealScale(unittest.TestCase):
 
     def setUp(self):
         self.cfg = RollConfig(near_token="1769", far_token="1584")
+        self.days = (far_leg().expiry - near_leg().expiry).days
         self.reader = QuoteReader(client=None, cfg=self.cfg)
         self.near, self.far = near_leg(), far_leg()
         self.reader.set_instruments({"1769": self.near, "1584": self.far})
@@ -119,7 +120,8 @@ class TestQuotesAtTheRealScale(unittest.TestCase):
 
     def test_the_worked_example_comes_out_of_real_raw_prices(self):
         quotes = self.reader.parse(self.payload(), ["1769", "1584"], time.monotonic())
-        decision = rule.compute(quotes["1769"], quotes["1584"], self.cfg)
+        decision = rule.compute(quotes["1769"], quotes["1584"], self.cfg,
+                                days=self.days)
         self.assertEqual(decision.roll_cost, D("0.5800"))
         self.assertEqual(decision.cost_per_lot, D("580.0000"))
         self.assertFalse(decision.qualifies)
@@ -158,7 +160,9 @@ class TestGatesOnRealContracts(unittest.TestCase):
             "1584": Quote("1584", D("96.2370"), D("96.2375"), time.monotonic(),
                           DIVISOR, bid_qty=5000, ask_qty=5000),
         }
-        self.decision = rule.compute(self.quotes["1769"], self.quotes["1584"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
+                                     self.cfg, days=self.days)
 
     def report(self):
         session = FakeSession(self.near, self.far)
@@ -176,7 +180,9 @@ class TestGatesOnRealContracts(unittest.TestCase):
 
     def test_a_tick_that_disagrees_with_config_is_blocked(self):
         self.cfg.tick = "0.0100"
-        self.decision = rule.compute(self.quotes["1769"], self.quotes["1584"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
+                                     self.cfg, days=self.days)
         report = self.report()
         self.assertFalse(report.ok)
         self.assertIn("the exchange tick is", str(report))
@@ -236,7 +242,7 @@ class TestOrderPriceScale(unittest.TestCase):
         self.assertIn("no PriceDivisor", str(ctx.exception))
 
     def test_the_limit_prices_from_the_rule_convert_cleanly(self):
-        cfg = RollConfig(allowance_ticks=1)
+        cfg = RollConfig(allowance_ticks=1, limit_mode="absolute")
         quotes = {
             "1769": Quote("1769", D("95.9400"), D("95.9450"), time.monotonic(),
                           DIVISOR, bid_qty=5000, ask_qty=5000),
@@ -289,6 +295,7 @@ class TestLiveTouchlineShape(unittest.TestCase):
 
     def setUp(self):
         self.cfg = RollConfig(near_token="1769", far_token="1584")
+        self.days = (far_leg().expiry - near_leg().expiry).days
         self.reader = QuoteReader(client=None, cfg=self.cfg)
         self.reader.set_instruments({"1769": near_leg(), "1584": far_leg()})
         self.quotes = self.reader.parse(self.LIVE, ["1769", "1584"], time.monotonic())
@@ -339,7 +346,8 @@ class TestLiveTouchlineShape(unittest.TestCase):
 
     def test_a_thin_far_offer_blocks_the_roll(self):
         """7 units on the far offer cannot fill a 1000 unit clip."""
-        decision = rule.compute(self.quotes["1769"], self.quotes["1584"], self.cfg)
+        decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
+                                self.cfg, days=59)
         session = FakeSession(near_leg(), far_leg())
         report = gates.evaluate(self.cfg, session, self.quotes, decision,
                                 datetime(2026, 9, 17, 11, 0, 0))
@@ -348,7 +356,8 @@ class TestLiveTouchlineShape(unittest.TestCase):
 
     def test_the_size_check_can_be_turned_off(self):
         self.cfg.require_touch_size = False
-        decision = rule.compute(self.quotes["1769"], self.quotes["1584"], self.cfg)
+        decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
+                                self.cfg, days=59)
         session = FakeSession(near_leg(), far_leg())
         report = gates.evaluate(self.cfg, session, self.quotes, decision,
                                 datetime(2026, 9, 17, 11, 0, 0))

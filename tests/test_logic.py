@@ -80,8 +80,14 @@ class TestMoney(unittest.TestCase):
 
 
 class TestRule(unittest.TestCase):
+    """The mechanics of the rule: rounding, the strict inequality, worst case.
+
+    Pinned to a fixed rupee limit so these stay about the arithmetic. The
+    tenor based limit has its own tests in TestBpsLimits.
+    """
+
     def setUp(self):
-        self.cfg = RollConfig()
+        self.cfg = RollConfig(limit_mode="absolute")
 
     def test_worked_example_does_not_trade(self):
         d = rule.compute(quote(bid="95.9400", ask="95.9450"),
@@ -107,7 +113,7 @@ class TestRule(unittest.TestCase):
         self.assertEqual(d.roll_cost, D("96.5200") - D("95.9400"))
 
     def test_limit_prices_sit_on_the_tick_grid(self):
-        cfg = RollConfig(allowance_ticks=1)
+        cfg = RollConfig(allowance_ticks=1, limit_mode="absolute")
         d = rule.compute(quote(bid="95.9400"), quote(bid="96.1895", ask="96.1900"), cfg)
         self.assertEqual(d.sell_limit, D("95.9375"))
         self.assertEqual(d.buy_limit, D("96.1925"))
@@ -115,14 +121,14 @@ class TestRule(unittest.TestCase):
         self.assertTrue(d.qualifies)
 
     def test_allowance_that_breaches_the_limit_is_blocked(self):
-        cfg = RollConfig(allowance_ticks=12)
+        cfg = RollConfig(allowance_ticks=12, limit_mode="absolute")
         d = rule.compute(quote(bid="95.9400"), quote(bid="96.1895", ask="96.1900"), cfg)
         self.assertLess(d.roll_cost, cfg.roll_limit_d)
         self.assertGreaterEqual(d.worst_case, cfg.roll_limit_d)
         self.assertFalse(d.qualifies)
 
     def test_worst_case_is_computed_from_rounded_prices(self):
-        cfg = RollConfig(allowance_ticks=1)
+        cfg = RollConfig(allowance_ticks=1, limit_mode="absolute")
         d = rule.compute(quote(bid="95.9400"), quote(bid="96.1895", ask="96.1900"), cfg)
         self.assertEqual(d.worst_case, d.buy_limit - d.sell_limit)
 
@@ -217,7 +223,9 @@ class TestGates(unittest.TestCase):
         self.now = datetime(2026, 9, 17, 11, 0, 0)
         self.quotes = {"1001": quote("1001", "95.9400", "95.9450"),
                        "1002": quote("1002", "96.2370", "96.2375")}
-        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"],
+                                     self.cfg, days=self.days)
 
     def report(self, **session_kw):
         # The scrip master is today's unless a test says otherwise, where
@@ -258,7 +266,9 @@ class TestGates(unittest.TestCase):
 
     def test_wide_leg_spread_blocks(self):
         self.quotes["1002"] = quote("1002", "96.0000", "96.2375")
-        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"],
+                                     self.cfg, days=self.days)
         self.assertFalse(self.report().ok)
 
     def test_expiry_mismatch_against_config_blocks(self):
@@ -292,12 +302,16 @@ class TestGates(unittest.TestCase):
 
     def test_implausible_roll_cost_blocks(self):
         self.quotes["1002"] = quote("1002", "100.0000", "100.0005")
-        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"],
+                                     self.cfg, days=self.days)
         self.assertFalse(self.report().ok)
 
     def test_cost_above_the_limit_blocks(self):
         self.quotes["1002"] = quote("1002", "96.5150", "96.5200")
-        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"],
+                                     self.cfg, days=self.days)
         self.assertFalse(self.report().ok)
 
     def test_in_flight_order_blocks(self):
@@ -330,7 +344,7 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_zero_limit_is_rejected(self):
         with self.assertRaises(ConfigError):
-            RollConfig(roll_limit="0").validate()
+            RollConfig(roll_limit="0", limit_mode="absolute").validate()
 
     def test_unknown_key_is_rejected(self):
         with self.assertRaises(TypeError):
@@ -520,7 +534,9 @@ class TestScripFreshnessGate(unittest.TestCase):
         self.now = datetime(2026, 9, 17, 11, 0, 0)
         self.quotes = {"1001": quote("1001", "95.9400", "95.9450"),
                        "1002": quote("1002", "96.2370", "96.2375")}
-        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"], self.cfg)
+        self.days = (self.far.expiry - self.near.expiry).days
+        self.decision = rule.compute(self.quotes["1001"], self.quotes["1002"],
+                                     self.cfg, days=self.days)
 
     def report(self, **session_kw):
         session_kw.setdefault("scrip_file_date", self.now.date())

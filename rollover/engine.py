@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from . import gates as gatelib
+from . import limits as limitlib
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
 from .config import RollConfig
@@ -278,6 +279,18 @@ class RollEngine:
                          else "polled, feed stale")
         return quotes
 
+    def tenor_days(self) -> Optional[int]:
+        """How far apart the two contracts expire.
+
+        The limit depends on this, so changing contracts changes the limit.
+        That is the point: a one month roll and a two month roll are not the
+        same trade and must not share a number.
+        """
+        near, far = self.session.near, self.session.far
+        if near is None or far is None:
+            return None
+        return limitlib.tenor_days(near.expiry, far.expiry)
+
     def _set_source(self, source: str) -> None:
         if source != self.quote_source:
             self.log.info(f"Quotes now coming from the {source}.")
@@ -308,7 +321,7 @@ class RollEngine:
         self._last_complaint = ("", 0.0)
         near_q = quotes[self.session.near.token]
         far_q = quotes[self.session.far.token]
-        decision = rule.compute(near_q, far_q, self.cfg)
+        decision = rule.compute(near_q, far_q, self.cfg, days=self.tenor_days())
         report = gatelib.evaluate(self.cfg, self.session, quotes, decision)
 
         if self.session.halted_reason:

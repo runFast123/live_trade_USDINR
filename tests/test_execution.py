@@ -91,6 +91,7 @@ class ExecutionCase(unittest.TestCase):
     def build(self, outcomes, **cfg_kw):
         cfg_kw.setdefault("dry_run", False)
         cfg_kw.setdefault("use_live_feed", False)
+        cfg_kw.setdefault("limit_mode", "absolute")
         self.cfg = RollConfig(near_token="1769", far_token="1584", **cfg_kw)
         self.log = StubLog()
         self.broker = StubBroker(outcomes, self.cfg)

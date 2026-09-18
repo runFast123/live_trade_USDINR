@@ -37,5 +37,11 @@
   "require_market_status": true,
   "require_position": true,
   "auto_unwind_on_leg2_failure": false,
-  "dry_run": true
+  "dry_run": true,
+  "limit_mode": "bps",
+  "limit_bps_schedule": {
+    "1": "30",
+    "2": "50"
+  },
+  "tenor_tolerance_days": 10
 }

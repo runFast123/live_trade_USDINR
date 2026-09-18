@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import time as dtime
 from decimal import Decimal
 from typing import Optional
@@ -54,7 +54,17 @@ class RollConfig:
     underlying: str = "USDINR"
 
     # --- the rule ----------------------------------------------------------
-    roll_limit: str = "0.30"             # roll when far_ask - near_bid is strictly below this
+    #
+    # A roll's cost scales with tenor, so the limit does too. In "bps" mode the
+    # limit comes from the schedule below, chosen by how far apart the two
+    # contracts actually expire, and converted to rupees against the live
+    # price. In "absolute" mode roll_limit is used as a fixed rupee figure and
+    # the tenor is ignored, which is only ever right for one pair.
+    limit_mode: str = "bps"              # "bps" or "absolute"
+    limit_bps_schedule: dict = field(     # months between expiries -> basis points
+        default_factory=lambda: {"1": "30", "2": "50"})
+    tenor_tolerance_days: int = 10       # how far from a nominal month still counts
+    roll_limit: str = "0.30"             # used only when limit_mode is "absolute"
     lots: int = 1                        # one clip
     allowance_ticks: int = 0             # price give on each leg; 0 is strictest
     tick: str = "0.0025"
@@ -146,6 +156,25 @@ class RollConfig:
             except PriceError as exc:
                 errors.append(f"{name}: {exc}")
 
+        if self.limit_mode not in ("bps", "absolute"):
+            errors.append('limit_mode must be "bps" or "absolute"')
+
+        if self.limit_mode == "bps":
+            from .limits import LimitError, parse_schedule
+            try:
+                schedule = parse_schedule(self.limit_bps_schedule)
+                if not schedule:
+                    errors.append("limit_mode is bps but limit_bps_schedule is empty")
+            except LimitError as exc:
+                errors.append(str(exc))
+            if self.tenor_tolerance_days < 1:
+                errors.append("tenor_tolerance_days must be at least 1")
+            elif self.tenor_tolerance_days > 15:
+                # Beyond a fortnight, neighbouring tenors start to overlap and a
+                # two month roll could be matched to the one month limit.
+                errors.append("tenor_tolerance_days above 15 would let one tenor "
+                              "be mistaken for another")
+
         if not errors:
             if self.roll_limit_d <= 0:
                 errors.append("roll_limit must be positive")
@@ -155,7 +184,8 @@ class RollConfig:
                 errors.append("price_band_low must be below price_band_high")
             if self.roll_cost_band_low_d >= self.roll_cost_band_high_d:
                 errors.append("roll_cost_band_low must be below roll_cost_band_high")
-            if self.roll_limit_d > self.roll_cost_band_high_d:
+            if (self.limit_mode == "absolute"
+                    and self.roll_limit_d > self.roll_cost_band_high_d):
                 errors.append("roll_limit sits above roll_cost_band_high, so the sanity "
                               "band would never let a qualifying quote through")
 

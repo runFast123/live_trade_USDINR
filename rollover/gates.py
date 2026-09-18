@@ -186,10 +186,21 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
                 "net position unknown; cannot confirm you hold the near contract")
         else:
             need = cfg.clip_qty
-            add("position", qty >= need,
-                f"long {qty} units in the near contract, need {need}"
-                if qty >= need
-                else f"long {qty} units, but the clip needs {need}")
+            if qty >= need:
+                # How many days of clips the whole position would take matters
+                # when expiry is close: one clip a day cannot roll ten lots in
+                # a week.
+                clips = -(-qty // need)          # ceiling division
+                days_left = ((near_info.expiry - today).days
+                             if near_info.expiry else None)
+                detail = f"long {qty:,} units, {clips} clip(s) to roll it all"
+                if days_left is not None and clips > max(days_left, 0) * cfg.max_clips_per_day:
+                    detail += (f" but only {days_left} day(s) and "
+                               f"{cfg.max_clips_per_day} clip(s) a day left")
+                add("position", True, detail)
+            else:
+                add("position", False,
+                    f"long {qty:,} units, but the clip needs {need:,}")
     else:
         add("position", True, "position check disabled in config")
 
@@ -232,6 +243,23 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
     if decision is None:
         add("rule evaluated", False, "no decision computed")
         return GateReport(gates)
+
+    # ---- which limit is in force, and why ----------------------------------
+    detail = getattr(decision, "limit_detail", None)
+    if detail is None:
+        add("limit in force", False,
+            "; ".join(decision.blockers) or "the limit could not be determined")
+    else:
+        add("limit in force", True, detail.describe())
+
+        if cfg.limit_mode == "bps" and detail.tenor_days is not None:
+            # The schedule is keyed by tenor, so a pair that matched a tenor
+            # only loosely is worth saying out loud.
+            nominal = float(detail.tenor_months) * 30.44
+            drift = abs(detail.tenor_days - nominal)
+            add("tenor matches the limit", drift <= cfg.tenor_tolerance_days,
+                f"{detail.tenor_days} days is {drift:.0f} day(s) from a "
+                f"{detail.tenor_months} month roll")
 
     in_band = (cfg.roll_cost_band_low_d <= decision.roll_cost <= cfg.roll_cost_band_high_d)
     add("roll cost plausible", in_band,

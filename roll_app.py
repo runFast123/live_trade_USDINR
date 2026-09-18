@@ -27,7 +27,15 @@ def cmd_check(cfg: RollConfig) -> int:
     print(f"  contract     {cfg.underlying}  segment {cfg.segment_id}")
     print(f"  near token   {cfg.near_token or '(not set)'}   expiry {cfg.near_expiry or '?'}")
     print(f"  far token    {cfg.far_token or '(not set)'}   expiry {cfg.far_expiry or '?'}")
-    print(f"  roll limit   {money(cfg.roll_limit_d)}")
+    if cfg.limit_mode == "bps":
+        print("  limit mode   basis points, by tenor")
+        for months, bps in sorted(cfg.limit_bps_schedule.items(),
+                                  key=lambda kv: int(kv[0])):
+            print(f"               {months} month(s): {bps} bps")
+        print(f"  tolerance    +/- {cfg.tenor_tolerance_days} days around a tenor")
+    else:
+        print("  limit mode   fixed")
+        print(f"  roll limit   {money(cfg.roll_limit_d)}")
     print(f"  size         {cfg.lots} lot(s) = {cfg.clip_qty} units")
     print(f"  allowance    {cfg.allowance_ticks} tick(s) = {money(cfg.allowance)}")
     print(f"  mode         {'DRY RUN' if cfg.dry_run else 'LIVE ORDERS'}")
@@ -45,26 +53,49 @@ def cmd_selftest(cfg: RollConfig) -> int:
     def quote(bid, ask):
         return Quote("0", D(bid), D(ask), time.monotonic(), D("1"))
 
+    # Tenor matters: the same rupee cost is cheap for two months and dear for
+    # one, so every case says how far apart the two contracts expire.
     cases = [
-        ("your note: Sep 95.9400 bid, Nov 96.5200 ask", "95.9400", "95.9450",
-         "96.5150", "96.5200"),
-        ("roll cost exactly at the limit", "95.9400", "95.9450", "96.2400", "96.2400"),
-        ("roll cost just under the limit", "95.9400", "95.9450", "96.2375", "96.2375"),
-        ("backwardation, far cheaper than near", "95.9400", "95.9450", "95.8000", "95.8050"),
+        ("Sep into Oct, one month, as measured", 30,
+         "95.9675", "95.9700", "96.2775", "96.2800"),
+        ("Sep into Oct, one month, cheaper", 30,
+         "95.9675", "95.9700", "96.2425", "96.2450"),
+        ("Sep into Nov, two months, as measured", 59,
+         "95.9400", "95.9450", "96.5150", "96.5200"),
+        ("Sep into Nov, two months, cheaper", 59,
+         "95.9400", "95.9450", "96.3800", "96.3850"),
+        ("the same 0.40 cost, judged as one month", 30,
+         "95.9675", "95.9700", "96.3650", "96.3675"),
+        ("the same 0.40 cost, judged as two months", 59,
+         "95.9675", "95.9700", "96.3650", "96.3675"),
+        ("a weekly, only three days apart", 3,
+         "95.9675", "95.9700", "95.9900", "95.9925"),
     ]
 
-    print(f"Rule: roll when (far ask - near bid) < {money(cfg.roll_limit_d)}")
+    if cfg.limit_mode == "bps":
+        pairs = ", ".join(
+            f"{m} month{'s' if str(m) != '1' else ''} at {b} bps"
+            for m, b in sorted(cfg.limit_bps_schedule.items()))
+        print("Rule: roll when (far ask - near bid) is below the limit for the tenor")
+        print(f"      {pairs}")
+        print("      A basis point is a share of the price, so 30 bps is 0.2879")
+        print("      at 95.97 and 0.3150 at 105.00. It is 0.30 only at exactly 100.")
+    else:
+        print(f"Rule: roll when (far ask - near bid) < {money(cfg.roll_limit_d)}")
     print(f"Size: {cfg.lots} lot(s) = {cfg.clip_qty} units, "
-          f"allowance {cfg.allowance_ticks} tick(s)\n")
+          f"allowance {cfg.allowance_ticks} tick(s)")
+    print()
 
-    for title, nb, na, fb, fa in cases:
-        decision = rule.compute(quote(nb, na), quote(fb, fa), cfg)
+    for title, days, nb, na, fb, fa in cases:
+        decision = rule.compute(quote(nb, na), quote(fb, fa), cfg, days=days)
         print(f"{title}")
         print(f"  near bid {money(decision.near_bid)}   far ask {money(decision.far_ask)}")
-        print(f"  roll cost {money(decision.roll_cost)}  "
-              f"(Rs {money(decision.cost_per_lot, 2)} per clip)")
-        print(f"  worst case {money(decision.worst_case)}  "
-              f"sell {money(decision.sell_limit)}  buy {money(decision.buy_limit)}")
+        bps = decision.cost_bps
+        print(f"  roll cost {money(decision.roll_cost)}"
+              + (f" = {money(bps, 1)} bps" if bps is not None else "")
+              + f"   Rs {money(decision.cost_per_lot, 2)} per clip")
+        if decision.limit_detail:
+            print(f"  limit     {decision.limit_detail.describe()}")
         print(f"  -> {'ROLL' if decision.qualifies else 'do nothing'}")
         for blocker in decision.blockers:
             print(f"     {blocker}")
@@ -106,8 +137,15 @@ def cmd_run(cfg: RollConfig, log: Logbook, base: str, config_path: str) -> int:
 
     log.info("=" * 70)
     log.info(f"Starting. Mode: {'DRY RUN' if cfg.dry_run else 'LIVE ORDERS'}")
-    log.info(f"Rule: roll when (far ask - near bid) < {money(cfg.roll_limit_d)}, "
-             f"size {cfg.lots} lot(s) = {cfg.clip_qty} units")
+    if cfg.limit_mode == "bps":
+        pairs = ", ".join(f"{m}m at {b} bps"
+                          for m, b in sorted(cfg.limit_bps_schedule.items(),
+                                             key=lambda kv: int(kv[0])))
+        log.info(f"Rule: roll when (far ask - near bid) is below the tenor limit "
+                 f"({pairs}), size {cfg.lots} lot(s) = {cfg.clip_qty} units")
+    else:
+        log.info(f"Rule: roll when (far ask - near bid) < {money(cfg.roll_limit_d)}, "
+                 f"size {cfg.lots} lot(s) = {cfg.clip_qty} units")
     if not cfg.dry_run:
         log.warn("LIVE MODE. Real orders will be sent when you arm the app "
                  "and every gate passes.")

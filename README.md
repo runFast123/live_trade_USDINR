@@ -23,9 +23,11 @@ not below the 0.30 limit, so nothing is sent.
 python -m unittest discover -s tests -t .
 ```
 
-194 tests, covering the rule, the gates, the order sequence, the price feed and
-the updater.
+226 tests, covering the rule, the tenor based limit, the gates, the order
+sequence, the price feed and the updater.
 
+- [tests/test_limits.py](tests/test_limits.py) pins the basis point maths and
+  the tenor schedule, including that 30 bps is not 30 paise.
 - [tests/test_realdata.py](tests/test_realdata.py) uses real captured responses:
   the scrip master row, the `MultipleTouchline` payload, `MarketStatus` and
   `NetPosition`.
@@ -70,9 +72,10 @@ says whether they are coming from the **live feed** or from **polling**.
 
 - **ARM** allows the next qualifying quote to trade. It expires after 120
   seconds and the app never arms itself.
-- **ROLL LIMIT** is editable here. A new value is validated the same way
-  `config.json` is, saved, and **always disarms**, so a typed digit can never
-  fire a roll on the next tick.
+- **ROLL LIMIT** is editable here, in whichever unit it is set in. In basis
+  point mode it edits the limit for the tenor currently on screen. A new value
+  is validated the same way `config.json` is, saved, and **always disarms**, so
+  a typed digit can never fire a roll on the next tick.
 - **Change contracts** reopens the chooser and restarts the watch loop on the
   new pair.
 
@@ -151,6 +154,10 @@ roll_app.exe --selftest      run the rule on worked examples, no network
 - **The scrip master is reloaded when the day turns over**, because contracts
   expire out of it and every circuit limit moves. The app will not trade on a
   file that is not today's.
+- **The limit is in basis points, by tenor.** One month is 30 bps and two
+  months 50, because a roll's cost scales with how far you are rolling. A basis
+  point is a share of the price: 30 bps is 0.2879 at USDINR 95.97, not 0.30.
+  The two are equal only at exactly 100.
 - **Two different price scales.** The quote feed returns rupees. Order prices go
   in the contract's own exchange units, which is the rupee price times the
   `PriceDivisor` the scrip master declares: 100 for equity, **10000000** for
