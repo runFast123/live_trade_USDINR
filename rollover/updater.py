@@ -38,6 +38,51 @@ USER_AGENT = f"usdinr-rollover/{__version__}"
 # A release may ship the checksum as a .sha256 asset or put it in the notes.
 _SHA_IN_NOTES = re.compile(r"\b([0-9a-f]{64})\b", re.IGNORECASE)
 
+# sha256sum writes "<hash>  <filename>", one line per file.
+_SHA_LINE = re.compile(r"^\s*([0-9a-f]{64})\s+\*?(\S+)\s*$",
+                       re.IGNORECASE | re.MULTILINE)
+
+# The release ships two executables, the window and the console tool, so
+# neither "the first .exe asset" nor "the first hash in the file" identifies
+# the one that is running. Both have to be matched by name.
+DEFAULT_EXE = "roll_app.exe"
+
+
+def running_exe_name() -> str:
+    """The basename of the executable that would be replaced."""
+    if getattr(sys, "frozen", False):
+        name = os.path.basename(sys.executable)
+        if name.lower().endswith(".exe"):
+            return name
+    return DEFAULT_EXE
+
+
+def _pick_asset(assets, wanted: str):
+    """The asset for this executable, by name. Never merely the first .exe."""
+    wanted = wanted.lower()
+    for asset in assets:
+        if str(asset.get("name", "")).lower() == wanted:
+            return asset
+    # A release that does not carry this name at all. Fall back to the window,
+    # which is what every release has shipped since the first one.
+    for asset in assets:
+        if str(asset.get("name", "")).lower() == DEFAULT_EXE:
+            return asset
+    return None
+
+
+def _sha_for(text: str, wanted: str) -> Optional[str]:
+    """The checksum belonging to `wanted`, out of a possibly multi-line file."""
+    wanted = os.path.basename(wanted).lower()
+    lines = _SHA_LINE.findall(text or "")
+    for digest, name in lines:
+        if os.path.basename(name).lower() == wanted:
+            return digest.lower()
+    if len(lines) == 1:
+        # A single-file checksum from an older release, whatever it names.
+        return lines[0][0].lower()
+    return None
+
 
 class UpdateError(RuntimeError):
     pass
@@ -80,12 +125,13 @@ def _get(url: str, accept: str = "application/vnd.github+json") -> bytes:
         return response.read()
 
 
-def check(repo: str) -> Optional[Release]:
+def check(repo: str, exe_name: Optional[str] = None) -> Optional[Release]:
     """Return the latest release when it is newer than this build, else None.
 
     Network problems return None rather than raising: a missed update check
     must never be able to stop the app from starting.
     """
+    wanted = exe_name or running_exe_name()
     try:
         payload = json.loads(_get(API.format(repo=repo)).decode("utf-8"))
     except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
@@ -96,8 +142,7 @@ def check(repo: str) -> Optional[Release]:
         return None
 
     assets = payload.get("assets") or []
-    exe = next((a for a in assets
-                if str(a.get("name", "")).lower().endswith(".exe")), None)
+    exe = _pick_asset(assets, wanted)
     if not exe:
         return None
 
@@ -110,13 +155,17 @@ def check(repo: str) -> Optional[Release]:
         try:
             text = _get(sha_asset["browser_download_url"],
                         accept="application/octet-stream").decode("utf-8")
-            found = _SHA_IN_NOTES.search(text)
-            sha = found.group(1).lower() if found else None
+            sha = _sha_for(text, str(exe.get("name") or wanted))
         except (urllib.error.URLError, OSError, UnicodeDecodeError):
             sha = None
     if sha is None:
-        found = _SHA_IN_NOTES.search(notes)
-        sha = found.group(1).lower() if found else None
+        sha = _sha_for(notes, str(exe.get("name") or wanted))
+    if sha is None and not _SHA_LINE.search(notes):
+        # Notes carrying a bare hash and no filename. Unambiguous only when
+        # there is exactly one of them; two would be a coin toss, and the
+        # download then refuses rather than verifying against the wrong file.
+        found = _SHA_IN_NOTES.findall(notes)
+        sha = found[0].lower() if len(found) == 1 else None
 
     return Release(
         version=str(tag).lstrip("vV"),

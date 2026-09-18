@@ -19,6 +19,51 @@ from rollover.logbook import Logbook
 from rollover.money import D, money
 
 
+def _attach_console() -> bool:
+    """Give a windowed build somewhere to print, and something to read.
+
+    The GUI build is --windowed so that double-clicking it does not open a
+    black console behind the window. The cost is that Windows does not attach a
+    GUI-subsystem executable to the console that launched it, so command line
+    output went nowhere and input() had no stdin.
+
+    The proper answer to that is roll_cli.exe, a console build of the same
+    program. This remains as a fallback for anyone who runs the GUI build with
+    a flag: borrow the parent console, or make one. Returns True when a console
+    was created, meaning the window would vanish on exit unless we wait.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    if sys.stdout is not None:
+        # A console build, or a parent that redirected our output. Either way
+        # there is somewhere to write already, and stealing a console would
+        # send the output somewhere the caller cannot see.
+        return False
+
+    import ctypes
+
+    created = False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        ATTACH_PARENT_PROCESS = -1
+        if not kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+            if not kernel32.AllocConsole():
+                return False
+            created = True
+
+        for name, mode, stream in (("CONOUT$", "w", "stdout"),
+                                   ("CONOUT$", "w", "stderr"),
+                                   ("CONIN$", "r", "stdin")):
+            try:
+                setattr(sys, stream, open(name, mode, buffering=1,
+                                          encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    except Exception:
+        return False
+    return created
+
+
 def _paths():
     base = app_dir()
     return base, os.path.join(base, "config.json"), os.path.join(base, "logs")
@@ -219,6 +264,10 @@ def main(argv=None) -> int:
                         help="quantity for --probe (default 1)")
     args = parser.parse_args(argv)
 
+    # Anything other than opening the windows needs somewhere to talk.
+    on_command_line = bool(args.probe or args.find or args.check or args.selftest)
+    own_console = _attach_console() if on_command_line else False
+
     base, config_path, log_dir = _paths()
     if args.config:
         config_path = args.config
@@ -243,19 +292,29 @@ def main(argv=None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
 
+    def finish(code: int) -> int:
+        # A console we created ourselves closes with the process, taking the
+        # output with it.
+        if own_console:
+            try:
+                input(os.linesep + "Press Enter to close. ")
+            except Exception:
+                pass
+        return code
+
     if args.selftest:
-        return cmd_selftest(cfg)
+        return finish(cmd_selftest(cfg))
     if args.check:
-        return cmd_check(cfg)
+        return finish(cmd_check(cfg))
 
     log = Logbook(log_dir)
     try:
         if args.probe:
             from rollover import probe
-            return probe.run(cfg, log, base, token=args.probe_token,
-                             qty=args.probe_qty)
+            return finish(probe.run(cfg, log, base, token=args.probe_token,
+                                    qty=args.probe_qty))
         if args.find:
-            return cmd_find(cfg, args.find, log, base)
+            return finish(cmd_find(cfg, args.find, log, base))
         return cmd_run(cfg, log, base, config_path)
     except Exception as exc:
         log.error(f"Fatal: {exc}")

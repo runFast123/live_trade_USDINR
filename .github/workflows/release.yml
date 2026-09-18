@@ -65,17 +65,39 @@ jobs:
             --exclude-module pytest `
             roll_app.py
 
+      # The window is built --windowed, so Windows will not attach it to the
+      # console that launched it and --probe cannot ask its question. The same
+      # program built as a console application can.
+      - name: Build the console tool
+        run: |
+          python -m PyInstaller `
+            --noconfirm --clean --onefile --console `
+            --name roll_cli `
+            --icon assets/icon.ico `
+            --add-data "assets;assets" `
+            --collect-all choice_api `
+            --hidden-import websocket `
+            --hidden-import tkinter `
+            --exclude-module PyQt5 --exclude-module PyQt6 `
+            --exclude-module PySide2 --exclude-module PySide6 `
+            --exclude-module matplotlib --exclude-module scipy `
+            --exclude-module IPython --exclude-module zmq `
+            --exclude-module notebook --exclude-module jupyter `
+            --exclude-module pytest `
+            roll_app.py
+
       - name: Checksum
         shell: bash
         run: |
           cd dist
-          sha256sum roll_app.exe | tee roll_app.exe.sha256
+          sha256sum roll_app.exe roll_cli.exe | tee roll_app.exe.sha256
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/roll_app.exe
+            dist/roll_cli.exe
             dist/roll_app.exe.sha256
           body_path: ${{ github.workspace }}/dist/roll_app.exe.sha256
           generate_release_notes: true

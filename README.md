@@ -127,8 +127,10 @@ contracts and the dry-run flag can be changed without rebuilding.
 
 ## Releasing
 
-Tag a commit and [the workflow](.github/workflows/release.yml) builds the exe,
-publishes it with its SHA256, and the update button then offers it to everyone:
+Tag a commit and [the workflow](.github/workflows/release.yml) builds both
+executables, publishes them with their SHA256s, and the update button then
+offers the new version to everyone. The in-app update replaces `roll_app.exe`
+only; download `roll_cli.exe` from the release when you need the newer one.
 
 ```
 git tag v1.0.1
@@ -167,11 +169,21 @@ The workflow refuses to release if the tag does not match
 
 ```
 roll_app.exe                 the windows
-roll_app.exe --find USDINR   list contracts and tokens
-roll_app.exe --check         validate config.json and exit
-roll_app.exe --selftest      run the rule on worked examples, no network
-roll_app.exe --probe         place ONE resting order, read it back, cancel it
+roll_cli.exe --find USDINR   list contracts and tokens
+roll_cli.exe --check         validate config.json and exit
+roll_cli.exe --selftest      run the rule on worked examples, no network
+roll_cli.exe --probe         place ONE resting order, read it back, cancel it
 ```
+
+**Two executables, one program.** `roll_app.exe` is built windowed so that
+double-clicking it opens the app and not a black console behind it. The price
+of that is that Windows does not attach a windowed program to the console that
+launched it, so anything it prints goes nowhere and it cannot read a typed
+answer -- run `roll_app.exe --check` from PowerShell and you get silence.
+
+`roll_cli.exe` is the same program built as a console application. Use it for
+everything on this list except the first line. It matters most for `--probe`,
+which has to be able to ask you a question and hear the answer.
 
 ### `--probe` places a real order
 

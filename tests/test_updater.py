@@ -101,6 +101,82 @@ class TestCheck(unittest.TestCase):
         self.assertIsNone(updater.check("owner/repo"))
 
 
+class TestTwoExecutablesInOneRelease(TestCheck):
+    """The release ships the window and the console tool side by side.
+
+    Before this, the updater took the first asset ending in .exe and the first
+    64-hex string in the checksum file. Both were correct only by accident of
+    ordering, and getting either wrong would overwrite the app with the console
+    build, or verify it against the wrong file's hash.
+    """
+
+    BOTH = [
+        {"name": "roll_cli.exe", "size": 7,
+         "browser_download_url": "https://example.invalid/roll_cli.exe"},
+        {"name": "roll_app.exe", "size": 5,
+         "browser_download_url": "https://example.invalid/roll_app.exe"},
+        {"name": "roll_app.exe.sha256", "size": 5,
+         "browser_download_url": "https://example.invalid/x.sha256"},
+    ]
+    SUMS = ("c" * 64 + "  roll_app.exe\n") + ("d" * 64 + "  roll_cli.exe\n")
+
+    def test_the_window_updates_itself_not_the_console_tool(self):
+        self.stub(self.payload(assets=self.BOTH), sha_text=self.SUMS)
+        release = updater.check("owner/repo", exe_name="roll_app.exe")
+        self.assertTrue(release.url.endswith("roll_app.exe"))
+        self.assertEqual(release.sha256, "c" * 64)
+
+    def test_the_console_tool_updates_itself(self):
+        self.stub(self.payload(assets=self.BOTH), sha_text=self.SUMS)
+        release = updater.check("owner/repo", exe_name="roll_cli.exe")
+        self.assertTrue(release.url.endswith("roll_cli.exe"))
+        self.assertEqual(release.sha256, "d" * 64)
+
+    def test_asset_order_does_not_decide_it(self):
+        """roll_cli is listed first; the window must still pick its own."""
+        self.assertEqual(self.BOTH[0]["name"], "roll_cli.exe")
+        self.stub(self.payload(assets=self.BOTH), sha_text=self.SUMS)
+        self.assertTrue(updater.check("owner/repo", exe_name="roll_app.exe")
+                        .url.endswith("roll_app.exe"))
+
+    def test_an_older_release_with_only_the_window_still_updates(self):
+        """Releases before this change carry one exe. Do not strand them."""
+        assets = [{"name": "roll_app.exe", "size": 5,
+                   "browser_download_url": "https://example.invalid/roll_app.exe"}]
+        self.stub(self.payload(assets=assets))
+        release = updater.check("owner/repo", exe_name="roll_cli.exe")
+        self.assertIsNotNone(release)
+        self.assertTrue(release.url.endswith("roll_app.exe"))
+
+    def test_an_old_single_line_checksum_is_still_read(self):
+        assets = [
+            {"name": "roll_app.exe", "size": 5, "browser_download_url": "u"},
+            {"name": "roll_app.exe.sha256", "size": 5,
+             "browser_download_url": "https://example.invalid/x.sha256"},
+        ]
+        self.stub(self.payload(assets=assets), sha_text="e" * 64 + "  build.exe")
+        self.assertEqual(updater.check("owner/repo").sha256, "e" * 64)
+
+    def test_a_bare_hash_in_the_notes_is_still_read(self):
+        self.stub(self.payload())
+        self.assertEqual(updater.check("owner/repo").sha256, "a" * 64)
+
+    def test_two_bare_hashes_in_the_notes_verify_nothing(self):
+        """Ambiguous is not the same as correct. Refuse rather than guess."""
+        notes = "SHA256 " + "a" * 64 + " and " + "b" * 64
+        self.stub(self.payload(body=notes))
+        self.assertIsNone(updater.check("owner/repo").sha256)
+
+    def test_a_named_line_in_the_notes_beats_position(self):
+        notes = ("f" * 64 + "  roll_cli.exe\n" + "0" * 64 + "  roll_app.exe\n")
+        self.stub(self.payload(body=notes))
+        self.assertEqual(updater.check("owner/repo", exe_name="roll_app.exe")
+                         .sha256, "0" * 64)
+
+    def test_the_default_is_the_window_when_not_frozen(self):
+        self.assertEqual(updater.running_exe_name(), "roll_app.exe")
+
+
 class TestDownloadRefusals(unittest.TestCase):
     def test_a_release_without_a_checksum_is_refused(self):
         release = Release(version="2.0.0", url="https://example.invalid/a.exe",
