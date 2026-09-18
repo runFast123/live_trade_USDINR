@@ -167,7 +167,7 @@ def cmd_selftest(cfg: RollConfig) -> int:
         bps = decision.cost_bps
         print(f"  roll cost {money(decision.roll_cost)}"
               + (f" = {money(bps, 1)} bps" if bps is not None else "")
-              + f"   Rs {money(decision.cost_per_lot, 2)} per clip")
+              + f"   Rs {money(decision.cost_per_lot, 2)} per lot")
         if decision.limit_detail:
             print(f"  limit     {decision.limit_detail.describe()}")
         print(f"  -> {'ROLL' if decision.qualifies else 'do nothing'}")

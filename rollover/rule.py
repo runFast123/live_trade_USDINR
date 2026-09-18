@@ -39,14 +39,33 @@ class RollDecision:
     # Limits carrying no quantity, priced for comparison only.
     watch_rungs: List["RungView"] = field(default_factory=list)
 
+    # Units in one lot, so a cost can be quoted per lot independently of
+    # whatever size the ladder has sized this particular clip at.
+    lot_size: int = 1000
+
     @property
     def cost_per_lot(self) -> Decimal:
-        """Rupees per lot at the observed roll cost."""
-        return q4(self.roll_cost * self.qty)
+        """What the observed roll cost is worth, in rupees, for one lot.
+
+        This used to multiply by `qty`, the size of the clip about to be sent.
+        That was the same number while a clip was always a whole lot, and then
+        the ladder made `qty` vary: a rung with nothing qualifying sizes the
+        clip at zero, so the screen showed "Rs 0.00 for 1 lot" against a live
+        cost of 0.6100. The market is priced whether or not an order is, so
+        this is per lot and nothing else.
+        """
+        return q4(self.roll_cost * self.lot_size)
 
     @property
     def worst_case_per_lot(self) -> Decimal:
-        return q4(self.worst_case * self.qty)
+        return q4(self.worst_case * self.lot_size)
+
+    @property
+    def cost_for_clip(self) -> Optional[Decimal]:
+        """What the clip about to be sent would cost. None when none is."""
+        if not self.qty:
+            return None
+        return q4(self.roll_cost * self.qty)
 
     @property
     def cost_bps(self) -> Optional[Decimal]:
@@ -193,7 +212,7 @@ def compute(near: Quote, far: Quote, cfg,
             limit=limit if limit is not None else q4(Decimal(0)), qty=0,
             qualifies=False, blockers=[ladder_blocker], limit_detail=detail,
             reference=reference, rungs=rungs, active_rung=None,
-            watch_rungs=watching,
+            watch_rungs=watching, lot_size=cfg.expected_lot_size,
         )
 
     if limit is None:
@@ -204,6 +223,7 @@ def compute(near: Quote, far: Quote, cfg,
             limit=q4(Decimal(0)), qty=cfg.clip_qty, qualifies=False,
             blockers=[limit_error], limit_detail=None, reference=reference,
             rungs=rungs, active_rung=None, watch_rungs=watching,
+            lot_size=cfg.expected_lot_size,
         )
 
     if roll_cost >= limit:
@@ -236,4 +256,5 @@ def compute(near: Quote, far: Quote, cfg,
         rungs=rungs,
         active_rung=active if not blockers else None,
         watch_rungs=watching,
+        lot_size=cfg.expected_lot_size,
     )

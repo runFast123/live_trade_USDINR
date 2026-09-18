@@ -1269,10 +1269,15 @@ class RollWindow(tk.Toplevel):
         # Basis points are the unit the roll is actually discussed in, so the
         # cost is shown in both.
         bps = dec.cost_bps
+        # Per lot, because that is the number an operator holds in their head
+        # and it does not depend on whether a clip happens to be sized right
+        # now. The cost of the clip itself, when there is one, goes beside it.
+        clip_cost = dec.cost_for_clip
         self.cost_rupees.configure(
             text=(f"{money(bps, 1)} bps" if bps is not None else "")
-                 + f"     Rs {money(dec.cost_per_lot, 2)} for {self.cfg.lots} lot"
-                 + ("s" if self.cfg.lots != 1 else ""))
+                 + f"     Rs {money(dec.cost_per_lot, 2)} per lot"
+                 + (f"     Rs {money(clip_cost, 2)} for this clip"
+                    if clip_cost is not None else ""))
 
         first = self._last_decision is None
         self._last_decision = dec
@@ -1284,7 +1289,10 @@ class RollWindow(tk.Toplevel):
         self.stat_labels["worst"].configure(text=money(dec.worst_case))
         self.stat_labels["sell"].configure(text=money(dec.sell_limit))
         self.stat_labels["buy"].configure(text=money(dec.buy_limit))
-        self.stat_labels["qty"].configure(text=f"{dec.qty:,}")
+        # Zero means no clip is sized, which reads as a broken number rather
+        # than as "nothing is being sent".
+        self.stat_labels["qty"].configure(
+            text=f"{dec.qty:,}" if dec.qty else "--")
 
         if ready:
             self.verdict.configure(text="READY", fg=T.SUCCESS)

@@ -214,6 +214,58 @@ class TestTheSizeThatGoesOut(unittest.TestCase):
         self.assertEqual(decision.qty, 1000)
 
 
+class TestWhatACostIsWorthInRupees(unittest.TestCase):
+    """The market is priced whether or not an order is.
+
+    cost_per_lot multiplied by `qty`, the size of the clip about to be sent.
+    That was the same number while a clip was always one whole lot, and then
+    the ladder made qty vary: with nothing qualifying the clip is sized at
+    zero, and the screen showed "Rs 0.00 for 1 lot" against a live cost of
+    0.6100.
+    """
+
+    def test_it_is_per_lot_when_nothing_qualifies(self):
+        decision = decide("96.5250", cfg=config(limit_bps_schedule={"2": "30"}),
+                          ladder=parse([{"bps": "30", "qty": 10000}],
+                                       lot_size=1000))
+        self.assertEqual(decision.qty, 0, "this test needs an unsized clip")
+        self.assertEqual(decision.roll_cost, D("0.7450"))
+        self.assertEqual(decision.cost_per_lot, D("745.0000"))
+
+    def test_it_does_not_change_with_the_clip_size(self):
+        """Per lot means per lot, whatever is being sent."""
+        for lots in (1, 3, 25):
+            decision = decide("96.0500", cfg=config(lots=lots))
+            self.assertEqual(decision.cost_per_lot, D("270.0000"), msg=lots)
+
+    def test_it_follows_the_contract_lot_size(self):
+        decision = decide("96.0500", cfg=config(expected_lot_size=500))
+        self.assertEqual(decision.cost_per_lot, D("135.0000"))
+
+    def test_the_clip_cost_is_separate_and_may_be_absent(self):
+        priced = decide("96.0500", cfg=config(lots=3))
+        self.assertEqual(priced.cost_for_clip, D("810.0000"))
+
+        unsized = decide("96.5250", cfg=config(limit_bps_schedule={"2": "30"}),
+                         ladder=parse([{"bps": "30", "qty": 10000}],
+                                      lot_size=1000))
+        self.assertIsNone(unsized.cost_for_clip)
+
+    def test_the_worst_case_is_per_lot_too(self):
+        decision = decide("96.0500", cfg=config(lots=25))
+        self.assertEqual(decision.worst_case_per_lot,
+                         decision.worst_case * 1000)
+
+    def test_without_a_ladder_nothing_changed(self):
+        from rollover.config import RollConfig
+        cfg = RollConfig(near_token="1769", far_token="1584", lots=1,
+                         limit_mode="absolute")
+        decision = rule.compute(quote("1769", "95.9400", "95.9450"),
+                                quote("1584", "96.5150", "96.5200"), cfg)
+        self.assertEqual(decision.roll_cost, D("0.5800"))
+        self.assertEqual(decision.cost_per_lot, D("580.0000"))
+
+
 class TestCrediting(unittest.TestCase):
     def setUp(self):
         self.ladder = two_rungs()
