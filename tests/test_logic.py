@@ -4,6 +4,8 @@ Run with:  python -m unittest discover -s tests -v
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 import unittest
 from datetime import date, datetime
@@ -372,6 +374,67 @@ class TestGatesSizeOnTheOrderNotTheClip(TestGates):
         """The plain path still measures the configured clip."""
         report = self.report()
         self.assertTrue(report.ok, msg=str(report))
+
+
+class TestAnUnrecognisedSetting(unittest.TestCase):
+    """A key this build does not know must not stop it starting.
+
+    The app ships two executables and writes config.json itself. The window
+    updates and the console tool does not, so a setting added by a newer build
+    used to stop an older one from starting at all -- which is what happened
+    the moment watch_limits was introduced.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="unknownkey_")
+        self.path = os.path.join(self.dir, "config.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, extra):
+        cfg = RollConfig(near_token="1769", far_token="1584")
+        cfg.save(self.path)
+        with open(self.path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        body.update(extra)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+    def test_it_loads_anyway(self):
+        self.write({"something_from_a_newer_build": [1, 2, 3]})
+        cfg = RollConfig.load(self.path)
+        self.assertEqual(cfg.near_token, "1769")
+
+    def test_it_says_what_it_did_not_recognise(self):
+        self.write({"something_new": 1, "another_thing": 2})
+        self.assertEqual(RollConfig.load(self.path).unknown_keys,
+                         ["another_thing", "something_new"])
+
+    def test_a_clean_file_reports_nothing(self):
+        self.write({})
+        self.assertEqual(RollConfig.load(self.path).unknown_keys, [])
+
+    def test_saving_does_not_invent_the_key_back(self):
+        """It does not know what the setting means, so it must not write it."""
+        self.write({"something_new": 1})
+        cfg = RollConfig.load(self.path)
+        cfg.save(self.path)
+        with open(self.path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        self.assertNotIn("unknown_keys", body)
+
+    def test_the_known_settings_still_apply(self):
+        self.write({"lots": 7, "something_new": 1})
+        self.assertEqual(RollConfig.load(self.path).lots, 7)
+
+    def test_a_genuinely_invalid_setting_is_still_refused(self):
+        """Forgiving an unknown key is not forgiving a wrong value."""
+        self.write({"lots": 0})
+        with self.assertRaises(ConfigError):
+            RollConfig.load(self.path)
 
 
 class TestExpiryParsing(unittest.TestCase):

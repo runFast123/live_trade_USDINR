@@ -146,16 +146,14 @@ class RollConfig:
     dry_run: bool = True                 # nothing is sent to the exchange while true
 
     # Whether an order quantity reaches the exchange as contracts or as units
-    # of the underlying has never been established, and the app sends
-    # lots x MarketLot. If the exchange counts contracts, that is a
-    # thousandfold over-order. The live probe of 18 Sep 2026 could not settle
-    # it: the order was refused on account entitlement before the exchange
-    # validated anything. See LIVE-FINDINGS.md.
+    # of the underlying decides whether `lots x MarketLot` is right or a
+    # thousandfold over-order. The account holder confirmed units on 18 Sep
+    # 2026; the live probe could not, because the order was refused on account
+    # entitlement before the exchange validated anything. See LIVE-FINDINGS.md.
     #
-    # Set to true only once Choice have confirmed it, or once an accepted order
-    # has proved it. Live mode refuses to engage while it is false, which is
-    # the app being honest about what it does not know rather than a limit on
-    # what the operator may decide.
+    # Live mode refuses to engage while this is false, which is the app being
+    # honest about what it does not know rather than a limit on what the
+    # operator may decide.
     quantity_unit_confirmed: bool = False
 
     # --- observing -----------------------------------------------------------
@@ -167,6 +165,11 @@ class RollConfig:
     # --- updates -----------------------------------------------------------
     update_check: bool = True            # ask GitHub once at startup
     update_repo: str = "runFast123/live_trade_USDINR"
+
+    # Keys in config.json this build does not recognise. Kept so they can be
+    # reported rather than ignored, and excluded from save() so they are never
+    # written back by a build that does not understand them.
+    unknown_keys: list = field(default_factory=list, compare=False, repr=False)
 
     # ---------------------------------------------------------------- loaders
     @classmethod
@@ -186,19 +189,24 @@ class RollConfig:
             raise ConfigError("config.json must contain a JSON object")
 
         known = set(cls.__dataclass_fields__)
-        unknown = set(raw) - known
-        if unknown:
-            raise ConfigError(
-                "config.json has keys this app does not understand: "
-                + ", ".join(sorted(unknown))
-            )
-        cfg = cls(**raw)
+        unknown = sorted(set(raw) - known)
+        # Refusing here used to be the behaviour, on the grounds that a typo
+        # silently ignored is a setting you believe is applied and is not. But
+        # the app ships two executables and writes this file itself: the window
+        # updates and the console tool does not, so a setting added by a newer
+        # build stopped an older one from starting at all. A key it does not
+        # know is not a reason to refuse to trade; it is a reason to say so.
+        cfg = cls(**{k: v for k, v in raw.items() if k in known})
+        cfg.unknown_keys = unknown
         cfg.validate()
         return cfg
 
     def save(self, path: str) -> None:
+        # Keys this build did not recognise are deliberately not written back:
+        # it does not know what they mean, so it must not claim to.
+        body = {k: v for k, v in asdict(self).items() if k != "unknown_keys"}
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(asdict(self), fh, indent=2)
+            json.dump(body, fh, indent=2)
 
     # ------------------------------------------------------------- validation
     def validate(self) -> None:

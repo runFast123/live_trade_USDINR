@@ -71,6 +71,10 @@ def _paths():
 
 def cmd_check(cfg: RollConfig) -> int:
     print("config.json is valid.")
+    if cfg.unknown_keys:
+        print("  NOTE         this build does not recognise: "
+              + ", ".join(cfg.unknown_keys))
+        print("               they are ignored, and left untouched when saving")
     print(f"  contract     {cfg.underlying}  segment {cfg.segment_id}")
     print(f"  near token   {cfg.near_token or '(not set)'}   expiry {cfg.near_expiry or '?'}")
     print(f"  far token    {cfg.far_token or '(not set)'}   expiry {cfg.far_expiry or '?'}")
@@ -222,6 +226,10 @@ def cmd_run(cfg: RollConfig, log: Logbook, base: str, config_path: str) -> int:
     if not cfg.quantity_unit_confirmed:
         log.warn("The order quantity unit has not been confirmed with Choice, so "
                  "live mode will refuse to engage. See LIVE-FINDINGS.md.")
+    if cfg.unknown_keys:
+        log.warn("config.json has settings this build does not recognise, so "
+                 "they are being ignored: " + ", ".join(cfg.unknown_keys)
+                 + ". Check the spelling, or update this build.")
 
     # An update that never finished leaves a whole build behind in temp.
     from rollover import updater
