@@ -1,0 +1,190 @@
+# What the live order probe established
+
+**18 September 2026, 11:19 IST.** One real order was placed on the account:
+BUY 1 of USDINR26SEPFUT (token 1769) at 93.0600, the contract's lower circuit,
+with the market bid at 95.7800. It was priced so it could not trade, and it did
+not trade. The exchange **rejected** it.
+
+Raw capture: `dist/data/probe-2026-09-18_111951.json`. Every claim below is
+taken from that file, and each one is pinned by a test in
+[tests/test_live_findings.py](tests/test_live_findings.py).
+
+---
+
+## The headline: this account cannot trade currency derivatives
+
+```
+"OrderStatus":  "REJECTED"
+"ErrorString":  "exchg not enabled for this acct"
+```
+
+The rejection is an **entitlement** problem, not a price, quantity or margin
+problem. The account is not enabled for the NSE currency derivatives segment
+(segment 13).
+
+**This blocks every remaining live step.** Phases 3.2 and 3.3 of the plan — one
+lot watched, then one clip at production size — cannot run at all until Choice
+enables the segment on this account. It is worth raising with them today, since
+it is a back-office change with a lead time we do not control, and it sits on
+the critical path in front of everything else.
+
+It is also, in a narrow sense, a good result: the safest possible order found
+the problem. Had this surfaced during a real roll, it would have surfaced as a
+sold near leg and a refused far leg.
+
+---
+
+## Confirmed working
+
+### The price scale, twice over
+
+This was the single largest unverified risk in the program — an earlier version
+sent paisa instead of exchange units and would have priced orders 100,000×
+wrong.
+
+| | |
+|---|---|
+| we sent | `930600000` |
+| the order book echoed | `Price: 93.06` |
+
+930600000 ÷ 10,000,000 = 93.06 exactly. Had rupees been sent, the echo would
+have read 0.0000093.
+
+A second, independent witness in the same response: `LTP: 957800000.0` against
+a live market bid of 95.7800. The same divisor, from a field we do not set.
+
+**The USDINR PriceDivisor of 10,000,000 is confirmed.**
+
+### The plumbing
+
+- login, session reuse, and the daily scrip master refresh all worked unattended
+- `place_order` reached the broker and returned a reference
+- the order appeared in the order book, in `get_order_book_v2`, and in
+  `get_order_by_no`
+- the trade book is reachable and returned `{"Trades": []}`, correctly
+
+### The response shapes, now known rather than guessed
+
+```
+order book      {"Status": "...", "Response": {"Orders":  [ ... ]}, "Reason": "..."}
+trade book      {"Status": "...", "Response": {"Trades":  [ ... ]}, "Reason": "..."}
+place_order     {"Status": "Success", "Response": "260918000069382", "Reason": ""}
+cancel_order    {"Status": "Fail", "Response": "Invalid Exchange Order Number", ...}
+```
+
+Order row fields, verbatim: `AvgBuyPrice, BS, BracketGatewayOrderId,
+BracketOrderId, BracketOrderModifyBit, BracketOrderStatus, ClientOrderNo,
+DisclosedQty, ErrorString, ExchangeOrderNo, ExchangeOrderTime, GTDDays,
+GTDStatus, GatewayOrderNo, InitiatedBy, LTP, LTPJumpPrice, LegIndicator,
+ModifiedBy, OrderStatus, OrderType, Price, ProductType, ProfitOrderPrice,
+Qty, Remarks, ResponseType, SLJumpprice, SLOrderPrice, SLTriggerPrice,
+SegmentId, SeqNo, Symbol, Time, Token, TotalQtyRemaining, TradedQty,
+TriggerPrice, Validity`
+
+The fill quantity is **`TradedQty`**, with `TotalQtyRemaining` alongside it. The
+app's guess list had `FilledQty` first and `TradedQty` second, so it would have
+worked — but by luck, not by knowledge.
+
+---
+
+## Four faults the probe exposed, now fixed
+
+### 1. "Success" did not mean accepted
+
+`place_order` returned `{"Status": "Success"}` for an order the exchange
+rejected. Anything reading that response as confirmation is wrong. A failure
+there is still conclusive — nothing was sent — but a success means only that
+the request was carried.
+
+### 2. A failed call arrived as an ordinary response
+
+The cancel came back `{"Status": "Fail", "Response": "Invalid Exchange Order
+Number"}`. It raised nothing, so the app logged **"cancel sent"** for a cancel
+that had been refused. The vendor client treats any HTTP 200 as success, so
+every envelope now gets looked inside (`call_failed`).
+
+This was the most dangerous of the four: under the planned hardening a failed
+cancel must halt the roll, and the app could not see that one had failed.
+
+### 3. The rejection reason was thrown away
+
+`ErrorString` carries the only actionable sentence in the whole response, and
+nothing read it. The operator would have seen `filled 0 of 1 (rejected)` and had
+no way to learn the account was not enabled. The reason now travels with the
+status into the log and the outcome detail.
+
+### 4. An order's reference changed between polls
+
+`GatewayOrderNo` was `null` and `ExchangeOrderNo` was `""` on a freshly placed
+order, so the app identified it by `ClientOrderNo`. Once the exchange
+acknowledges an order, `ExchangeOrderNo` fills in and the preference order makes
+the *same order* answer to a *different* reference. Two polls, two identities.
+
+Worse, orders are found by "the row on this token and side that was not here
+before". An order placed moments earlier by someone else, recorded under its
+ClientOrderNo, would acquire an ExchangeOrderNo and then look new — and be
+treated as ours.
+
+Identity is now `ClientOrderNo` alone, which is present from the first moment
+and does not change.
+
+A related discovery: `choice_api` hard-codes `"ClientOrderNo": 123456` into
+every payload, and the app was built believing the book would echo that back,
+making it useless for identification. The broker in fact overwrites it with its
+own per-account sequence (`100000014`). That is one observation, so the
+placeholder value is still treated as meaningless and falls back to the old
+behaviour rather than collapsing every order onto one identity.
+
+### And one found while fixing them
+
+`"PartiallyFilled"` contains the substring `"filled"`. The terminal-order check
+would have read a partly filled, still-working order as finished, skipped the
+cancel, and moved to the second leg leaving the remainder live at the exchange.
+Partial statuses are now excluded explicitly.
+
+---
+
+## Still unknown: what a quantity means
+
+**The probe did not settle this, and must not be read as having settled it.**
+
+The order book shows `Qty: 1` — but that only proves the broker echoed what we
+sent. The order was refused on account entitlement *before* the exchange
+validated anything, so no exchange-side check of the quantity ever ran.
+
+The open question is unchanged:
+
+| Field (USDINR Sep, 17 Sep) | As contracts | As USD units |
+|---|---|---|
+| open interest 2,942,758 | $2.94 bn | $2.94 m |
+| day volume 643,253 | $643 m | $643 k |
+| best bid 338 | 338 lots | 0.338 of a lot |
+
+NSE front-month USDINR open interest is billions, not millions, which points at
+**contracts**. If that is right, the app's `qty = lots × 1000` orders a thousand
+lots when it means one.
+
+Two ways to settle it, neither of which needs a fill:
+
+1. **Ask Choice directly**, at the same time as asking them to enable the
+   segment. They can answer it in one sentence.
+2. **Re-run the probe once the segment is enabled.** A rejection reading
+   "quantity not a multiple of market lot" would prove units; acceptance of
+   `qty=1` at the circuit floor would prove contracts.
+
+Until then the clip size stays unverified and no live order should be sent.
+
+---
+
+## What this changes in the plan
+
+- **Phase 0 (quantity unit): still open.** Now blocked behind the entitlement.
+- **Phase 1.3 (honest order outcomes): largely done**, and no longer theorised —
+  every part of it was observed.
+- **Phase 1.4 (trade book as the fill record):** the endpoint is confirmed
+  reachable and its shape is known. Not yet wired in.
+- **Phases 3.2, 3.3 and 4: blocked** until the account is enabled.
+
+The evidence recorder can keep running throughout. It needs no order permissions
+and the question it answers — whether the cost ever reaches the client's limit —
+is independent of all of this.

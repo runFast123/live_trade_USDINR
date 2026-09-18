@@ -145,6 +145,7 @@ The workflow refuses to release if the tag does not match
 | Path | What it is |
 |---|---|
 | [BRD.md](BRD.md) | the trading logic, and only that |
+| [LIVE-FINDINGS.md](LIVE-FINDINGS.md) | what the live order probe proved, and what it did not |
 | `roll_app.py` | entry point and command line |
 | `rollover/money.py` | exact decimal prices, tick rounding, exchange units |
 | `rollover/rule.py` | the roll rule; no network, no clock, no state |

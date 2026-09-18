@@ -38,13 +38,43 @@ _MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
 
 _ORDER_NO_KEYS = ("GatewayOrderNo", "ExchangeOrderNo", "ClientOrderNo",
                   "OrderNo", "OrderNumber", "NestOrderNumber")
+
+# Identity is a separate question from display, and the live probe on 18 Sep
+# 2026 showed why. A freshly placed order comes back with GatewayOrderNo null
+# and ExchangeOrderNo "", so _ORDER_NO_KEYS resolves it to ClientOrderNo; once
+# the exchange acknowledges it, ExchangeOrderNo fills in and the very same
+# order answers to a different reference. Anything comparing references across
+# two polls needs the field that is there from the first moment and does not
+# change.
+#
+# choice_api hard-codes "ClientOrderNo": 123456 into every place_order payload,
+# and the app was written believing the book would echo that back, which would
+# make every order look alike. The probe showed the broker overwrites it with
+# its own per-account sequence (100000014). That is a single observation, so
+# the placeholder is still treated as meaningless and falls back to the old
+# behaviour rather than collapsing every order onto one identity.
+_IDENTITY_KEYS = ("ClientOrderNo",)
+VENDOR_CLIENT_ORDER_NO = "123456"
+
 _FILLED_KEYS = ("FilledQty", "TradedQty", "FilledQuantity", "ExecutedQty",
                 "TradedQuantity", "FillQty", "FilledShares")
 _STATUS_KEYS = ("OrderStatus", "Status", "OrdStatus", "OrderStatusDesc", "Stat")
 _NET_QTY_KEYS = ("NetQty", "NetQuantity", "NetQTY", "Netqty", "NQty")
 
+# Why an order was refused. The probe's rejection carried
+# "exchg not enabled for this acct" here and nowhere else; without it the
+# operator sees "filled 0 of 1 (rejected)" and has nothing to act on.
+_REASON_KEYS = ("ErrorString", "RejectionReason", "ErrorMessage", "Remarks",
+                "Reason")
+
 _FILLED_WORDS = ("complete", "filled", "executed", "traded", "fullyexecuted")
 _DEAD_WORDS = ("reject", "cancel", "expired", "lapsed")
+
+# "PartiallyFilled" contains "filled" and "partiallyexecuted" contains
+# "executed", so a substring test reads a live, partly-filled order as a
+# finished one. That would skip the cancel and leave the remainder working at
+# the exchange while the app moved on to the second leg.
+_PARTIAL_WORDS = ("partial", "partly")
 
 
 class BrokerError(RuntimeError):
@@ -148,6 +178,59 @@ def _as_int(value: Any) -> Optional[int]:
         return int(D(value))
     except Exception:
         return None
+
+
+def call_failed(resp: Any) -> Optional[str]:
+    """The reason a call failed, or None if it did not.
+
+    The vendor client treats any HTTP 200 as success, so a refusal arrives as
+    an ordinary return value rather than an exception. The probe's cancel came
+    back as {"Status": "Fail", "Response": "Invalid Exchange Order Number",
+    "Reason": "Error"} and the code logged "cancel sent". Nothing that matters
+    may be decided without looking inside the envelope.
+    """
+    if not isinstance(resp, dict):
+        return None
+    status = str(resp.get("Status", "")).strip().lower()
+    if not status or status in ("success", "ok", "true"):
+        return None
+    inner = resp.get("Response")
+    detail = inner if isinstance(inner, str) and inner.strip() else resp.get("Reason")
+    return str(detail).strip() if detail else f"the broker returned {status!r}"
+
+
+def order_identity(record: Dict[str, Any]) -> Optional[str]:
+    """A reference for this order that will not change between two polls."""
+    value = _first(record, _IDENTITY_KEYS)
+    if value is not None and str(value).strip() != VENDOR_CLIENT_ORDER_NO:
+        return str(value)
+    value = _first(record, _ORDER_NO_KEYS)
+    return str(value) if value is not None else None
+
+
+def order_reason(record: Dict[str, Any]) -> str:
+    """Whatever the broker said about why an order ended as it did."""
+    value = _first(record, _REASON_KEYS)
+    return str(value).strip() if value is not None else ""
+
+
+def status_word(record: Dict[str, Any]) -> str:
+    """The order's status, letters only, e.g. "rejected"."""
+    raw = _first(record, _STATUS_KEYS)
+    return re.sub(r"[^a-z]", "", str(raw).lower()) if raw is not None else ""
+
+
+def is_terminal(record: Dict[str, Any]) -> bool:
+    """True when the order is finished and there is nothing left to cancel.
+
+    Read from the status field alone. The human-readable detail now carries the
+    broker's reason text as well, and a reason such as "cannot cancel" must not
+    be mistaken for a cancelled order.
+    """
+    word = status_word(record)
+    if any(w in word for w in _PARTIAL_WORDS):
+        return False
+    return any(w in word for w in _DEAD_WORDS + _FILLED_WORDS)
 
 
 def _iter_records(node: Any):
@@ -532,9 +615,9 @@ class Broker:
             return set()
         refs = set()
         for record in _iter_records(resp):
-            ref = _first(record, _ORDER_NO_KEYS)
+            ref = order_identity(record)
             if ref is not None:
-                refs.add(str(ref))
+                refs.add(ref)
         return refs
 
     def _find_order(self, token: str, side: int, known_before: set) -> Optional[Dict[str, Any]]:
@@ -552,8 +635,8 @@ class Broker:
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
                 continue
-            ref = _first(record, _ORDER_NO_KEYS)
-            if ref is None or str(ref) in known_before:
+            ref = order_identity(record)
+            if ref is None or ref in known_before:
                 continue
             rec_side = _first(record, ("BS", "BuySell", "TransactionType", "Side"))
             if rec_side is not None:
@@ -569,14 +652,25 @@ class Broker:
         status_raw = _first(record, _STATUS_KEYS)
         status = re.sub(r"[^a-z]", "", str(status_raw).lower()) if status_raw else ""
 
+        # A refusal without its reason is not something anyone can act on. The
+        # probe's order came back REJECTED carrying "exchg not enabled for this
+        # acct", which is the difference between "the market moved" and "this
+        # account cannot trade this segment at all".
+        reason = order_reason(record)
+        spoken = f"{status}: {reason}" if reason and status else (reason or status)
+
         filled = _as_int(_first(record, _FILLED_KEYS))
         if filled is not None:
-            return filled, status or "unknown status"
+            return filled, spoken or "unknown status"
 
-        if any(word in status for word in _FILLED_WORDS):
-            return requested, status
-        if any(word in status for word in _DEAD_WORDS):
-            return 0, status
+        if not any(word in status for word in _PARTIAL_WORDS):
+            # Without a quantity field, only an all-or-nothing status says
+            # anything. "Partially filled" with no number attached is exactly
+            # the case the caller must not guess at.
+            if any(word in status for word in _FILLED_WORDS):
+                return requested, spoken
+            if any(word in status for word in _DEAD_WORDS):
+                return 0, spoken
         return None, (f"order book has no filled-quantity field and status {status_raw!r} "
                       "is not conclusive")
 
@@ -643,6 +737,15 @@ class Broker:
 
         self.log.info(f"{label} response: {resp}")
 
+        # The place response says only that the request was carried; it said
+        # "Success" for the probe's order, which the exchange then rejected. A
+        # failure here, though, is conclusive: nothing was sent.
+        problem = call_failed(resp)
+        if problem:
+            return OrderOutcome(sent=False, filled_qty=0, requested_qty=qty,
+                                order_ref=None, certain=True, raw=resp,
+                                detail=f"the broker refused the order: {problem}")
+
         deadline = time.monotonic() + self.cfg.fill_timeout_sec
         record, filled, status = None, None, "not seen in the order book"
         while time.monotonic() < deadline:
@@ -650,6 +753,12 @@ class Broker:
             if record is not None:
                 filled, status = self.read_fill(record, qty)
                 if filled is not None and filled >= qty:
+                    break
+                # Rejected or cancelled: nothing more is going to happen, and
+                # sitting out the rest of the timeout only delays telling
+                # somebody. The probe spent its whole fill window watching an
+                # order the exchange had already refused.
+                if is_terminal(record):
                     break
             time.sleep(0.25)
 
@@ -666,7 +775,17 @@ class Broker:
                                 certain=False, raw=record, detail=status)
 
         if filled < qty:
-            self._cancel(record, info, side, qty - filled, units, label)
+            cancelled = self._cancel(record, info, side, qty - filled, units, label)
+            if not cancelled:
+                # The remainder may still be working. Reporting a settled
+                # quantity here would let the other leg be sized against a
+                # position that is still moving.
+                return OrderOutcome(
+                    sent=True, filled_qty=filled, requested_qty=qty, order_ref=ref,
+                    certain=False, raw=record,
+                    detail=(f"filled {filled} of {qty}, but the cancel was refused, "
+                            "so the rest may still be live at the exchange. Check "
+                            "the terminal before anything else is sent."))
 
             # A cancel is not instantaneous. Whatever traded between the last
             # poll and the cancel taking effect is absent from `filled`, and
@@ -712,18 +831,30 @@ class Broker:
                 value, status = self.read_fill(record, qty)
                 if value is not None:
                     last, last_status = value, status
-                    settled = any(word in status for word in _DEAD_WORDS + _FILLED_WORDS)
-                    if settled or value >= qty:
+                    if is_terminal(record) or value >= qty:
                         return value, status
             time.sleep(0.25)
 
         return last, last_status
 
     def _cancel(self, record: Dict[str, Any], info: InstrumentInfo, side: int,
-                remainder: int, units: Decimal, label: str) -> None:
+                remainder: int, units: Decimal, label: str) -> bool:
+        """Cancel the remainder. Returns False when it is not known to be gone.
+
+        Nothing is sent for an order that has already finished. The probe's
+        rejected order had an empty ExchangeOrderNo, and cancelling it was
+        refused with "Invalid Exchange Order Number" -- a failure the caller
+        would otherwise have to treat as a possibly-live order.
+        """
+        if is_terminal(record):
+            self.log.info(
+                f"{label}: the order is already {status_word(record)}, "
+                "so there is nothing to cancel")
+            return True
+
         self.log.warn(f"{label}: cancelling the unfilled {remainder} units")
         try:
-            self.client.orders.cancel_order(
+            resp = self.client.orders.cancel_order(
                 client_order_no=_as_int(_first(record, ("ClientOrderNo",))) or 0,
                 exchange_order_no=str(_first(record, ("ExchangeOrderNo",)) or ""),
                 gateway_order_no=str(_first(record, ("GatewayOrderNo",)) or ""),
@@ -737,7 +868,15 @@ class Broker:
                 validity=self.cfg.validity,
                 product_type=self.cfg.product_type,
             )
+            problem = call_failed(resp)
+            if problem:
+                self.log.error(
+                    f"{label}: CANCEL REFUSED ({problem}). A working order may "
+                    "still be live at the exchange -- check the terminal now.")
+                return False
             self.log.info(f"{label}: cancel sent")
+            return True
         except Exception as exc:
             self.log.error(f"{label}: CANCEL FAILED ({exc}). A working order may still "
                            "be live at the exchange -- check the terminal now.")
+            return False

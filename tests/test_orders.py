@@ -1,9 +1,12 @@
 """Tests for placing a single order and reading back what happened to it.
 
-The vendor hard-codes ClientOrderNo, so an order cannot be identified by an id
-we chose. It is found instead as the new one on that token and side, and these
-tests pin that down along with the fill reading, which is the part the app
-refuses to guess at.
+choice_api hard-codes ClientOrderNo into the payload, so an order cannot be
+identified by an id we chose. It is found instead as the new one on that token
+and side, keyed on the ClientOrderNo the broker assigns back. These tests pin
+that down along with the fill reading, which is the part the app refuses to
+guess at.
+
+The fixtures follow the order book of 18 Sep 2026, captured by the live probe.
 """
 from __future__ import annotations
 
@@ -65,10 +68,18 @@ def instrument(token="1769", divisor="10000000", tick_units="25000"):
         low_range=D("93"), high_range=D("99"))
 
 
-def order_row(token="1769", side="2", filled=1000, status="Complete", ref="A1"):
+def order_row(token="1769", side="2", filled=1000, status="Complete", ref="A1",
+              client_no=None, error=""):
+    """A row shaped like the one the live probe brought back on 18 Sep 2026.
+
+    The broker assigns its own ClientOrderNo rather than echoing the 123456
+    that choice_api hard-codes, so it is unique per order and is what the app
+    identifies orders by.
+    """
     return {"Token": token, "BS": side, "GatewayOrderNo": ref,
-            "ExchangeOrderNo": ref, "ClientOrderNo": 123456,
-            "FilledQty": filled, "OrderStatus": status}
+            "ExchangeOrderNo": ref,
+            "ClientOrderNo": ref if client_no is None else client_no,
+            "FilledQty": filled, "OrderStatus": status, "ErrorString": error}
 
 
 def broker_with(orders, **cfg_kw):
@@ -136,7 +147,7 @@ class TestPlacingAnOrder(unittest.TestCase):
         self.assertEqual(orders.placed[0]["qty"], 1000)
 
     def test_an_order_already_in_the_book_is_not_mistaken_for_ours(self):
-        """ClientOrderNo is hard-coded by the vendor, so ours is the new row."""
+        """Ours is the new row on this token and side."""
         existing = order_row(ref="OLD", filled=500)
         orders = StubOrders([
             {"Response": [existing]},                       # snapshot before
