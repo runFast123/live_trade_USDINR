@@ -46,6 +46,14 @@ class DayState:
     halted_at: Optional[str] = None
     working_orders: List[Dict[str, Any]] = field(default_factory=list)
 
+    # How much of each ladder rung has been rolled, keyed by the rung's basis
+    # points. This is campaign progress, not daily: rolling thirty thousand
+    # takes as long as it takes, and resetting it overnight would roll the
+    # whole position again every morning. It resets when the contracts change,
+    # because that is a different roll.
+    ladder_campaign: str = ""
+    ladder_done: Dict[str, int] = field(default_factory=dict)
+
     @property
     def halted(self) -> bool:
         return bool(self.halted_reason)
@@ -91,11 +99,23 @@ class StateStore:
             )
 
         if state.trading_date != stamp:
-            # A new day: the budget resets, the halt does not.
+            # A new day: the daily budget resets. The halt does not, and
+            # neither does ladder progress, which belongs to the campaign.
             state.trading_date = stamp
             state.clips_done = 0
             state.lots_rolled = 0
             state.working_orders = []
+        return state
+
+    def for_campaign(self, state: DayState, campaign: str) -> DayState:
+        """Clear ladder progress if this is a different roll from last time.
+
+        Changing contracts starts a new campaign. Carrying the old one over
+        would report a fresh roll as already part done.
+        """
+        if campaign and state.ladder_campaign != campaign:
+            state.ladder_campaign = campaign
+            state.ladder_done = {}
         return state
 
     # ----------------------------------------------------------------- write

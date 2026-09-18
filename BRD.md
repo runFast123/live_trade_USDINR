@@ -76,6 +76,51 @@ running a 0.50 limit, which is 52 bps, seventy four percent looser than intended
 The basis points are taken of the **near contract's mid**, not of the bid being
 hit, so the limit does not move with our own side of the spread.
 
+### Several limits at once, each with its own quantity
+
+The tenor limit answers "may I roll?". It cannot answer "how much am I willing
+to roll, and at what price?", which are different amounts at different prices.
+An optional **ladder** replaces the single limit with a list of rungs:
+
+| Limit | Quantity |
+|---|---|
+| 30 bps | 10,000 |
+| 50 bps | 20,000 |
+
+Three rules govern it.
+
+**Each rung is its own allocation, and they add up.** The ladder above is a
+campaign of 30,000: ten thousand at up to thirty basis points, and twenty
+thousand more at up to fifty. It is not twenty thousand in total.
+
+**The cheapest rung with quantity left is always worked first.** When the market
+prints twenty eight basis points both rungs qualify, and which one is credited
+decides what is still tradeable later:
+
+| | rolled | left at 30 bps | left at 50 bps | reachable if the market turns to 42 bps |
+|---|---|---|---|---|
+| credit the 30 rung | 10,000 | 0 | 20,000 | **20,000** |
+| credit the 50 rung | 10,000 | 10,000 | 10,000 | 10,000 |
+
+The same quantity at the same price either way. Working cheapest-first simply
+leaves more of the campaign reachable, so it is never worse.
+
+**No rung may be looser than the tenor limit.** The tenor schedule is the
+instruction about what this roll is worth paying; a ladder decides how to spend
+within it and may not raise it. A rung above the ceiling is a configuration
+error, not a silent loosening.
+
+A rung is a budget for the campaign, not an order size. What goes out in one
+order is still the clip size, so the depth and daily-budget gates are unchanged.
+A 10,000 rung with a 1,000 clip is ten orders.
+
+Progress is campaign-level, not daily: it survives a restart and does not reset
+overnight, because a roll takes as long as it takes. It resets only when the
+contracts change, which is a different roll, or when the operator resets it by
+hand after reconciling against the position book.
+
+When no ladder is configured the single tenor limit applies exactly as above.
+
 ### The cost measured is what you pay, not what is quoted
 
 A calendar spread is normally quoted mid to mid. What this app measures is bid

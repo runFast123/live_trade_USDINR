@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from . import gates as gatelib
+from . import ladder as ladderlib
 from . import limits as limitlib
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
@@ -104,6 +105,9 @@ class RollEngine:
         # overwrite the defaults set above.
         self.store = StateStore(base_dir)
         saved = self.store.load()
+        saved = self.store.for_campaign(saved, self.campaign_key())
+        self.ladder = self._build_ladder()
+        self.ladder_progress = dict(saved.ladder_done or {})
         self.session.clips_done_today = saved.clips_done
         self.session.lots_rolled = saved.lots_rolled
         self.session.halted_reason = saved.halted_reason
@@ -319,6 +323,8 @@ class RollEngine:
                 halted_reason=self.session.halted_reason,
                 halted_at=(datetime.now().astimezone().isoformat(timespec="seconds")
                            if self.session.halted_reason else None),
+                ladder_campaign=self.campaign_key(),
+                ladder_done=dict(getattr(self, "ladder_progress", {}) or {}),
             )
             if not self.store.save(state):
                 self.log.warn("Could not write the state file; a restart would "
@@ -365,6 +371,70 @@ class RollEngine:
                          else "polled, feed stale")
         return quotes
 
+    # ---- the ladder -------------------------------------------------------
+    def campaign_key(self) -> str:
+        return ladderlib.campaign_key(self.cfg.near_token, self.cfg.far_token)
+
+    def _build_ladder(self) -> "ladderlib.Ladder":
+        """Parse the configured ladder, capped at the limit for this tenor.
+
+        A rung looser than the tenor limit would quietly spend more than the
+        client's instruction allows, so it is refused. Refusing means running
+        without a ladder, on the single limit, which is the safe direction.
+        """
+        raw = getattr(self.cfg, "limit_ladder", None)
+        if not raw:
+            return ladderlib.Ladder([])
+        try:
+            ceiling = self._tenor_ceiling_bps()
+            built = ladderlib.parse(raw, lot_size=self.cfg.expected_lot_size,
+                                    ceiling_bps=ceiling)
+        except Exception as exc:
+            self.log.error(
+                f"The ladder in config.json cannot be used ({exc}). Running on "
+                "the single tenor limit instead.")
+            return ladderlib.Ladder([])
+
+        if built:
+            self.log.info(
+                f"Ladder: {', '.join(r.describe(self.cfg.expected_lot_size) for r in built.rungs)}"
+                f"  (total {built.total_qty:,})")
+        return built
+
+    def _tenor_ceiling_bps(self):
+        """The bps limit for this pair of contracts, if it can be determined."""
+        if self.cfg.limit_mode != "bps":
+            return None
+        try:
+            from .limits import match_tenor, parse_schedule
+            days = self.tenor_days()
+            if days is None:
+                return None
+            _, bps = match_tenor(days, parse_schedule(self.cfg.limit_bps_schedule),
+                                 self.cfg.tenor_tolerance_days)
+            return bps
+        except Exception:
+            return None
+
+    def _credit_rung(self, decision, qty: int) -> None:
+        """Record a fill against the rung that was being worked."""
+        rung = getattr(decision, "active_rung", None)
+        if rung is None or not self.ladder or qty <= 0:
+            return
+        self.ladder_progress = self.ladder.credit(
+            self.ladder_progress, rung.rung, qty)
+        done = self.ladder.done_total(self.ladder_progress)
+        self.log.info(
+            f"Ladder: {qty:,} credited to the {money(rung.rung.bps, 0)} bps rung; "
+            f"{done:,} of {self.ladder.total_qty:,} rolled, "
+            f"{self.ladder.remaining_total(self.ladder_progress):,} left.")
+
+    def reset_ladder(self) -> None:
+        """Start the campaign again. The operator's decision, never the app's."""
+        self.ladder_progress = {}
+        self._persist()
+        self.log.warn("Ladder progress reset. The whole campaign is outstanding again.")
+
     def tenor_days(self) -> Optional[int]:
         """How far apart the two contracts expire.
 
@@ -407,7 +477,9 @@ class RollEngine:
         self._last_complaint = ("", 0.0)
         near_q = quotes[self.session.near.token]
         far_q = quotes[self.session.far.token]
-        decision = rule.compute(near_q, far_q, self.cfg, days=self.tenor_days())
+        decision = rule.compute(near_q, far_q, self.cfg, days=self.tenor_days(),
+                                ladder=self.ladder,
+                                progress=self.ladder_progress)
         report = gatelib.evaluate(self.cfg, self.session, quotes, decision)
 
         if self.session.halted_reason:
@@ -460,6 +532,7 @@ class RollEngine:
                     f"{self.session.far.token} at {money(leg2_price)}")
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
                 self._count_clip(decision.qty)
+                self._credit_rung(decision, decision.qty)
                 return
 
             if not leg1.certain:
@@ -480,6 +553,7 @@ class RollEngine:
 
             if leg2.fully_filled:
                 self._count_clip(leg2.filled_qty)
+                self._credit_rung(decision, leg2.filled_qty)
                 self.log.info(
                     f"ROLL COMPLETE: sold {leg1.filled_qty} near, bought {leg2.filled_qty} far, "
                     f"at a booked cost near {money(decision.roll_cost)} per unit.")
@@ -510,6 +584,14 @@ class RollEngine:
             f"only bought {leg2.filled_qty}. You are short {short_by} units of the "
             f"intended position. Far leg detail: {leg2.detail}"
         )
+        if self.ladder:
+            # Crediting a rung from a half-rolled clip would be a guess in one
+            # direction or the other, and the position has to be reconciled by
+            # hand regardless. Say so rather than quietly picking a number.
+            message += (
+                f" The ladder has NOT been credited with the {leg2.filled_qty} that did "
+                "roll; check the position book and use Reset ladder if the "
+                "progress shown no longer matches it.")
         self.log.alert(message)
 
         if not self.cfg.auto_unwind_on_leg2_failure:

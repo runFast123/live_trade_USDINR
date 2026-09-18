@@ -215,6 +215,7 @@ class RollWindow(tk.Toplevel):
         self._build_header(root)
         self._build_legs(root)
         self._build_cost(root)
+        self._build_ladder(root)
         self._build_actions(root)
         self._build_gates_and_log(root)
 
@@ -393,9 +394,109 @@ class RollWindow(tk.Toplevel):
             value.pack(fill="x")
             self.stat_labels[key] = value
 
+    LADDER_COLUMNS = (
+        ("bps", "Limit", 90, "e"),
+        ("rupees", "In rupees", 100, "e"),
+        ("target", "Far ask at or below", 160, "e"),
+        ("gap", "Distance", 110, "e"),
+        ("progress", "Rolled", 150, "e"),
+        ("status", "", 130, "w"),
+    )
+
+    def _build_ladder(self, parent) -> None:
+        """One row per rung, so every limit is visible at once.
+
+        This is the answer to "what would it cost me at thirty, and at fifty?".
+        With a single limit the screen can only say how far the market is from
+        that one number, which is not the question an operator has when they
+        are willing to do different sizes at different prices.
+        """
+        self.ladder_card = T.card(parent, padx=T.PAD_L, pady=self.gap)
+        box = self.ladder_card.inner
+
+        head = tk.Frame(box, bg=T.SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text="LADDER", bg=T.SURFACE, fg=T.FAINT,
+                 font=self.fonts.label, anchor="w").pack(side="left")
+        self.ladder_total = tk.Label(head, text="", bg=T.SURFACE, fg=T.MUTED,
+                                     font=self.fonts.ui_small, anchor="e")
+        self.ladder_total.pack(side="right")
+
+        self.ladder_tree = ttk.Treeview(
+            box, columns=[c[0] for c in self.LADDER_COLUMNS],
+            show="headings", height=3, selectmode="none")
+        for key, title, width, anchor in self.LADDER_COLUMNS:
+            self.ladder_tree.heading(key, text=title)
+            self.ladder_tree.column(key, width=width, anchor=anchor,
+                                    stretch=(key == "status"))
+        self.ladder_tree.pack(fill="x", pady=(T.PAD_S, 0))
+
+        self.ladder_tree.tag_configure("ready", foreground=T.SUCCESS)
+        self.ladder_tree.tag_configure("working", foreground=T.WARN)
+        self.ladder_tree.tag_configure("done", foreground=T.FAINT)
+        self.ladder_tree.tag_configure("waiting", foreground=T.MUTED)
+
+        # Packed only when a ladder is configured, so a single-limit setup
+        # looks exactly as it did before.
+        self._ladder_shown = False
+
+    def _draw_ladder(self, decision) -> None:
+        rungs = getattr(decision, "rungs", None) if decision else None
+        if not rungs:
+            if self._ladder_shown:
+                self.ladder_card.pack_forget()
+                self._ladder_shown = False
+            return
+
+        if not self._ladder_shown:
+            self.ladder_card.pack(fill="x", pady=self.gap,
+                                  before=self.actions_bar)
+            self._ladder_shown = True
+
+        active = getattr(decision, "active_rung", None)
+        active_key = active.rung.key if active else None
+
+        self.ladder_tree.delete(*self.ladder_tree.get_children())
+        total = done = 0
+        for view in rungs:
+            total += view.rung.qty
+            done += view.done
+
+            if view.exhausted:
+                tag = "done"
+            elif view.rung.key == active_key:
+                tag = "working"
+            elif view.qualifies:
+                tag = "ready"
+            else:
+                tag = "waiting"
+
+            gap = "--"
+            if view.distance_bps is not None:
+                # Negative means the market is already through this rung, which
+                # reads better as how far past it we are.
+                inside = view.distance_bps < 0
+                gap = ("-" if inside else "+") + money(abs(view.distance_bps), 1)
+
+            self.ladder_tree.insert(
+                "", "end", tags=(tag,), values=(
+                    f"{money(view.rung.bps, 0)} bps",
+                    money(view.limit_rupees) if view.limit_rupees is not None else "--",
+                    money(view.required_far_ask) if view.required_far_ask is not None else "--",
+                    gap,
+                    f"{view.done:,} / {view.rung.qty:,}",
+                    "WORKING" if tag == "working" else view.status,
+                ))
+
+        left = max(0, total - done)
+        self.ladder_total.configure(
+            text=f"{done:,} of {total:,} rolled, {left:,} left"
+                 f"   clip {self.cfg.clip_qty:,}")
+
     def _build_actions(self, parent) -> None:
         bar = tk.Frame(parent, bg=T.BG)
         bar.pack(fill="x", pady=(0, self.gap))
+        self.actions_bar = bar
 
         self.arm_button = T.Button(bar, "ARM", self.engine.arm, self.fonts,
                                    kind="success", width=170, height=42)
@@ -416,11 +517,34 @@ class RollWindow(tk.Toplevel):
         self.mode_button = T.Button(bar, "Go live...", self._switch_mode,
                                     self.fonts, kind="warn", width=150, height=42)
         self.mode_button.pack(side="left", padx=T.PAD_S)
+
+        if getattr(self.engine, "ladder", None):
+            T.Button(bar, "Reset ladder", self._reset_ladder, self.fonts,
+                     width=150, height=42).pack(side="left")
         self._refresh_mode()
 
         self.arm_timer = tk.Label(bar, text="", bg=T.BG, fg=T.WARN,
                                   font=self.fonts.mono_medium)
         self.arm_timer.pack(side="right", padx=T.PAD_S)
+
+    def _reset_ladder(self) -> None:
+        from tkinter import messagebox
+
+        ladder = getattr(self.engine, "ladder", None)
+        if not ladder:
+            return
+        done = ladder.done_total(self.engine.ladder_progress)
+        if not messagebox.askyesno(
+                "Reset ladder",
+                f"This forgets that {done:,} of {ladder.total_qty:,} has been "
+                "rolled, and offers the whole campaign again.\n\n"
+                "It changes nothing at the exchange. Only do this when the "
+                "progress shown no longer matches the position book.\n\n"
+                "Reset it?",
+                parent=self, default="no"):
+            return
+        self.engine.disarm("ladder reset")
+        self.engine.reset_ladder()
 
     # ---- dry run and live -------------------------------------------------
     def _refresh_mode(self, dry_run=None) -> None:
@@ -752,6 +876,7 @@ class RollWindow(tk.Toplevel):
         self.state_pill.set(snap.state.lower(),
                             STATE_COLOUR.get(snap.state, T.MUTED))
         self._refresh_mode(snap.dry_run)
+        self._draw_ladder(snap.decision)
 
         source = snap.quote_source or "connecting"
         self.source_pill.set(source,

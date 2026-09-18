@@ -69,6 +69,18 @@ class RollConfig:
         default_factory=lambda: {"1": "30", "2": "50"})
     tenor_tolerance_days: int = 10       # how far from a nominal month still counts
     roll_limit: str = "0.30"             # used only when limit_mode is "absolute"
+
+    # Several limits at once, each with its own quantity, cheapest worked
+    # first. Empty means the single tenor limit and a clip of `lots`.
+    #
+    #   "limit_ladder": [{"bps": "30", "qty": 10000},
+    #                    {"bps": "50", "qty": 20000}]
+    #
+    # That is a campaign of 30,000: ten thousand at up to thirty basis points
+    # and twenty thousand more at up to fifty. No rung may be looser than the
+    # tenor limit -- see rollover/ladder.py.
+    limit_ladder: list = field(default_factory=list)
+
     lots: int = 1                        # one clip
     allowance_ticks: int = 0             # price give on each leg; 0 is strictest
     tick: str = "0.0025"
@@ -207,6 +219,18 @@ class RollConfig:
                 # two month roll could be matched to the one month limit.
                 errors.append("tenor_tolerance_days above 15 would let one tenor "
                               "be mistaken for another")
+
+        if self.limit_ladder:
+            from .ladder import LadderError, parse as parse_ladder
+            try:
+                # The tenor ceiling cannot be known without the contracts, so
+                # the shape is checked here and the ceiling where the tenor is.
+                parse_ladder(self.limit_ladder, lot_size=self.expected_lot_size)
+            except LadderError as exc:
+                errors.append(str(exc))
+            if self.limit_mode != "bps":
+                errors.append("limit_ladder needs limit_mode to be bps; the rungs "
+                              "are expressed in basis points")
 
         if not errors:
             if self.roll_limit_d <= 0:

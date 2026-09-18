@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import List, Optional
 
+from .ladder import Ladder, RungView
 from .limits import Limit, LimitError, resolve, to_bps
 from .money import ceil_tick, floor_tick, money, q4
 from .quotes import Quote
@@ -29,6 +30,11 @@ class RollDecision:
     blockers: List[str] = field(default_factory=list)
     limit_detail: Optional[Limit] = None    # how that limit was arrived at
     reference: Optional[Decimal] = None     # the price basis points are taken of
+
+    # Every rung priced against this quote, cheapest first, and the one being
+    # worked. Empty when no ladder is configured.
+    rungs: List["RungView"] = field(default_factory=list)
+    active_rung: Optional["RungView"] = None
 
     @property
     def cost_per_lot(self) -> Decimal:
@@ -72,12 +78,20 @@ class RollDecision:
             f"qty           {self.qty}",
             f"qualifies     {'YES' if self.qualifies else 'no'}",
         ]
+        if self.rungs:
+            lines.append("ladder        " + ", ".join(
+                f"{money(v.rung.bps, 0)}bps {v.done:,}/{v.rung.qty:,} {v.status}"
+                for v in self.rungs))
+            if self.active_rung is not None:
+                lines.append(f"working rung  {money(self.active_rung.rung.bps, 0)} bps")
         lines.extend(f"blocked by    {b}" for b in self.blockers)
         return "\n".join(lines)
 
 
 def compute(near: Quote, far: Quote, cfg,
-            days: Optional[int] = None) -> RollDecision:
+            days: Optional[int] = None,
+            ladder: Optional[Ladder] = None,
+            progress: Optional[dict] = None) -> RollDecision:
     """Evaluate the roll rule against one pair of quotes.
 
     roll_cost = far.ask - near.bid
@@ -89,6 +103,11 @@ def compute(near: Quote, far: Quote, cfg,
     `days` is how far apart the two contracts expire. In basis point mode it
     decides which limit applies, so without it there is no limit and the rule
     refuses rather than falling back to some other tenor's number.
+
+    A `ladder` replaces the single limit with several, each carrying its own
+    quantity. The cheapest rung that both qualifies and has budget left sets
+    the limit and the size; every rung is still priced and returned, because
+    seeing how far the market is from each one is most of the point.
     """
     tick = cfg.tick_d
     allowance = cfg.allowance
@@ -120,7 +139,53 @@ def compute(near: Quote, far: Quote, cfg,
     buy_limit = ceil_tick(far_ask + allowance, tick)
     worst_case = q4(buy_limit - sell_limit)
 
+    # The ladder, if there is one. Priced against this quote whatever else
+    # happens, so the screen can show every rung even when none qualifies.
+    rungs: List[RungView] = []
+    active: Optional[RungView] = None
+    qty = cfg.clip_qty
+    ladder_blocker: Optional[str] = None
+
+    if ladder:
+        rungs = ladder.evaluate(roll_cost, reference, near_bid, progress)
+        active = ladder.active(rungs)
+        if active is None:
+            remaining = ladder.remaining_total(progress or {})
+            if remaining <= 0:
+                ladder_blocker = (
+                    f"the ladder is complete: all {ladder.total_qty:,} rolled")
+            else:
+                nearest = min(
+                    (v for v in rungs if not v.exhausted),
+                    key=lambda v: (v.distance_bps if v.distance_bps is not None
+                                   else Decimal("9999")), default=None)
+                if nearest is None or nearest.distance_bps is None:
+                    ladder_blocker = "no rung of the ladder can be priced"
+                else:
+                    ladder_blocker = (
+                        f"no rung qualifies; the nearest is {money(nearest.rung.bps, 0)} "
+                        f"bps, {money(nearest.distance_bps, 1)} bps away, with "
+                        f"{nearest.remaining:,} left on it")
+        else:
+            # The rung is a budget for the campaign, not an order size. What
+            # goes out in one order is still capped by `lots`, so the depth
+            # gate and the daily clip cap keep meaning what they meant.
+            limit = active.limit_rupees
+            qty = min(active.remaining, cfg.clip_qty)
+            detail = Limit(rupees=limit, mode="bps", bps=active.rung.bps,
+                           reference=reference, tenor_days=days,
+                           tenor_months=detail.tenor_months if detail else None)
+
     blockers: List[str] = []
+    if ladder and ladder_blocker:
+        return RollDecision(
+            near_bid=near_bid, far_ask=far_ask, roll_cost=roll_cost,
+            sell_limit=sell_limit, buy_limit=buy_limit, worst_case=worst_case,
+            limit=limit if limit is not None else q4(Decimal(0)), qty=0,
+            qualifies=False, blockers=[ladder_blocker], limit_detail=detail,
+            reference=reference, rungs=rungs, active_rung=None,
+        )
+
     if limit is None:
         # No limit means no comparison, and no comparison means no trade.
         return RollDecision(
@@ -128,6 +193,7 @@ def compute(near: Quote, far: Quote, cfg,
             sell_limit=sell_limit, buy_limit=buy_limit, worst_case=worst_case,
             limit=q4(Decimal(0)), qty=cfg.clip_qty, qualifies=False,
             blockers=[limit_error], limit_detail=None, reference=reference,
+            rungs=rungs, active_rung=None,
         )
 
     if roll_cost >= limit:
@@ -152,9 +218,11 @@ def compute(near: Quote, far: Quote, cfg,
         buy_limit=buy_limit,
         worst_case=worst_case,
         limit=limit,
-        qty=cfg.clip_qty,
+        qty=qty,
         qualifies=not blockers,
         blockers=blockers,
         limit_detail=detail,
         reference=reference,
+        rungs=rungs,
+        active_rung=active if not blockers else None,
     )
