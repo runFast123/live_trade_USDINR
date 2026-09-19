@@ -208,6 +208,7 @@ class Candidate:
     limit_bps: Optional[Decimal]
     qualifies: bool
     payload: Any = None        # the caller's decision object, carried through
+    outstanding: Optional[int] = None   # what this section still has to roll
 
     @property
     def inside_bps(self) -> Optional[Decimal]:
@@ -217,28 +218,51 @@ class Candidate:
         return D(self.limit_bps) - D(self.cost_bps)
 
 
-def pick(candidates: List[Candidate]) -> Optional[Candidate]:
+def pick(candidates: List[Candidate],
+         expiry_day: bool = False) -> Optional[Candidate]:
     """The section that should trade, or None if none should.
 
     Furthest inside its own limit wins. Ties keep the order they were given in,
     so the result is reproducible from the log rather than depending on how a
     dictionary happened to be ordered.
+
+    **On the near contract's expiry day the priority changes.** Every section
+    sells the same near month, so any of them rolling reduces the exposure that
+    is about to be force settled -- but each is capped by its own ladder, so a
+    section left unworked can strand near-leg inventory that no other section
+    has the allowance to absorb. With hours left, the question stops being
+    which price is best and becomes how much can be got done, so the section
+    with the most still to roll goes first and price decides only ties.
+
+    That is a real change of objective, not a tweak, which is why it is
+    confined to the one day where not finishing cannot be corrected.
     """
     workable = [c for c in (candidates or [])
                 if c.qualifies and c.inside_bps is not None]
     if not workable:
         return None
 
+    def better(candidate, best):
+        if expiry_day:
+            mine = candidate.outstanding if candidate.outstanding is not None else -1
+            theirs = best.outstanding if best.outstanding is not None else -1
+            if mine != theirs:
+                return mine > theirs
+        return candidate.inside_bps > best.inside_bps
+
     best = workable[0]
     for candidate in workable[1:]:
-        if candidate.inside_bps > best.inside_bps:
+        if better(candidate, best):
             best = candidate
     return best
 
 
-def explain(candidates: List[Candidate], chosen: Optional[Candidate]) -> str:
+def explain(candidates: List[Candidate], chosen: Optional[Candidate],
+            expiry_day: bool = False) -> str:
     """One line per section, saying where each stands and which was taken."""
     lines = []
+    if expiry_day:
+        lines.append("  expiry day: most still to roll goes first, not best price")
     for candidate in (candidates or []):
         inside = candidate.inside_bps
         if inside is None:
@@ -250,7 +274,9 @@ def explain(candidates: List[Candidate], chosen: Optional[Candidate]) -> str:
         else:
             where = f"{-inside} bps above its limit"
         mark = " <- trading" if chosen is not None and candidate is chosen else ""
-        lines.append(f"  {candidate.name}: {where}{mark}")
+        left = ("" if candidate.outstanding is None
+                else f", {candidate.outstanding:,} left")
+        lines.append(f"  {candidate.name}: {where}{left}{mark}")
     return "\n".join(lines)
 
 

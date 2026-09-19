@@ -324,6 +324,114 @@ class TestWhichSectionTrades(unittest.TestCase):
         self.assertIs(pick([a, b, c]), b)
 
 
+class TestExpiryDayChangesTheObjective(unittest.TestCase):
+    """With hours left the question stops being price and becomes completion.
+
+    Every section sells the same near month, so any of them rolling reduces
+    the exposure about to be force settled. But each is capped by its own
+    ladder, so a section left unworked can strand near-leg inventory that no
+    other section has the allowance to absorb. On the last day the section
+    with the most still to roll goes first and price decides only ties.
+    """
+
+    def setUp(self):
+        # Nov is doing better on price; Oct has four times the work left.
+        self.oct = Candidate("Sep into Oct", D("26"), D("30"), True,
+                             payload="oct", outstanding=20000)
+        self.nov = Candidate("Sep into Nov", D("44"), D("50"), True,
+                             payload="nov", outstanding=5000)
+        self.both = [self.oct, self.nov]
+
+    def test_on_an_ordinary_day_price_decides(self):
+        self.assertIs(pick(self.both), self.nov)
+
+    def test_on_expiry_day_the_larger_job_decides(self):
+        self.assertIs(pick(self.both, expiry_day=True), self.oct)
+
+    def test_price_still_breaks_a_tie_on_expiry_day(self):
+        even = Candidate("Sep into Dec", D("20"), D("30"), True,
+                         outstanding=20000)          # same size, better price
+        self.assertIs(pick([self.oct, even], expiry_day=True), even)
+
+    def test_a_section_that_does_not_qualify_is_still_skipped(self):
+        """Urgency does not loosen the limit. It only reorders."""
+        blocked = Candidate("blocked", D("99"), D("30"), False,
+                            outstanding=999999)
+        self.assertIs(pick([blocked, self.nov], expiry_day=True), self.nov)
+
+    def test_nothing_qualifying_still_trades_nothing(self):
+        none = [Candidate("a", D("99"), D("30"), False, outstanding=50000)]
+        self.assertIsNone(pick(none, expiry_day=True))
+
+    def test_a_section_with_no_known_size_loses_to_one_with_a_size(self):
+        unknown = Candidate("unknown", D("10"), D("30"), True, outstanding=None)
+        self.assertIs(pick([unknown, self.nov], expiry_day=True), self.nov)
+
+    def test_two_unknown_sizes_fall_back_to_price(self):
+        a = Candidate("a", D("26"), D("30"), True, outstanding=None)
+        b = Candidate("b", D("44"), D("50"), True, outstanding=None)
+        self.assertIs(pick([a, b], expiry_day=True), b)
+
+    def test_a_finished_section_does_not_win_on_urgency(self):
+        finished = Candidate("finished", D("10"), D("30"), True, outstanding=0)
+        self.assertIs(pick([finished, self.nov], expiry_day=True), self.nov)
+
+    def test_ties_on_both_keep_the_order_given(self):
+        first = Candidate("first", D("26"), D("30"), True, outstanding=9000)
+        second = Candidate("second", D("46"), D("50"), True, outstanding=9000)
+        self.assertIs(pick([first, second], expiry_day=True), first)
+        self.assertIs(pick([second, first], expiry_day=True), second)
+
+    def test_one_section_is_unaffected_by_the_day(self):
+        self.assertIs(pick([self.nov]), self.nov)
+        self.assertIs(pick([self.nov], expiry_day=True), self.nov)
+
+    def test_the_operator_is_told_the_rule_changed(self):
+        text = explain(self.both, pick(self.both, expiry_day=True),
+                       expiry_day=True)
+        self.assertIn("expiry day", text)
+        self.assertIn("not best price", text)
+
+    def test_an_ordinary_day_says_nothing_about_expiry(self):
+        text = explain(self.both, pick(self.both))
+        self.assertNotIn("expiry day", text)
+
+    def test_how_much_is_left_is_shown_either_way(self):
+        for expiry in (False, True):
+            text = explain(self.both, pick(self.both, expiry_day=expiry),
+                           expiry_day=expiry)
+            self.assertIn("20,000 left", text)
+            self.assertIn("5,000 left", text)
+
+    def test_a_section_with_no_size_shows_no_figure(self):
+        unknown = Candidate("unknown", D("26"), D("30"), True, outstanding=None)
+        self.assertNotIn("left", explain([unknown], None))
+
+
+class TestWhyTheLargerJobFirst(unittest.TestCase):
+    """The case the rule exists for, spelled out as an outcome.
+
+    Each section is capped by its own ladder. Work the small one and its cap
+    binds, leaving near-leg inventory that the other cannot absorb in the time
+    remaining -- and unrolled September on expiry day is forced settlement.
+    """
+
+    def test_working_the_small_section_first_can_strand_inventory(self):
+        small = Candidate("small", D("20"), D("30"), True, outstanding=2000)
+        large = Candidate("large", D("44"), D("50"), True, outstanding=28000)
+
+        # Price alone would take the small one, which runs out after 2,000.
+        self.assertIs(pick([small, large]), small)
+        # Urgency takes the one that can actually absorb the position.
+        self.assertIs(pick([small, large], expiry_day=True), large)
+
+    def test_the_choice_is_recorded_so_it_can_be_read_back(self):
+        small = Candidate("small", D("20"), D("30"), True, outstanding=2000)
+        large = Candidate("large", D("44"), D("50"), True, outstanding=28000)
+        chosen = pick([small, large], expiry_day=True)
+        self.assertEqual(chosen.payload, large.payload)
+
+
 class TestExplaining(unittest.TestCase):
     """The operator has to be able to see why the other section did not go."""
 
