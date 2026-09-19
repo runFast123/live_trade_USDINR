@@ -37,16 +37,31 @@ from .money import D
 
 @dataclass
 class Claim:
-    """One section's outstanding claim on the shared near-leg position."""
+    """One section's outstanding claim on the shared near-leg position.
+
+    `total` is None when the section has no ladder, and that is not the same as
+    zero. A section without a ladder has no campaign cap: it rolls a clip at a
+    time for as long as the market allows, so its claim on the position is
+    "as much as it likes". Counting that as nothing is what makes the whole
+    check vacuous -- two sections would sum to less than the position while one
+    of them quietly consumed all of it.
+    """
     name: str
     near_token: str
     far_token: str
-    total: int                 # what the ladder would roll in all
+    total: Optional[int]       # what the ladder would roll in all; None = uncapped
     done: int                  # what it has rolled so far
     halted: bool = False
 
     @property
-    def outstanding(self) -> int:
+    def uncapped(self) -> bool:
+        return self.total is None
+
+    @property
+    def outstanding(self) -> Optional[int]:
+        """What is left to roll, or None when there is no cap on it."""
+        if self.total is None:
+            return None
         return max(0, self.total - self.done)
 
 
@@ -57,34 +72,57 @@ class Allocation:
     held: Optional[int] = None
 
     @property
-    def outstanding(self) -> int:
+    def uncapped(self) -> List[Claim]:
+        return [c for c in self.claims if c.uncapped]
+
+    @property
+    def outstanding(self) -> Optional[int]:
+        """Total still to roll, or None when any section is uncapped."""
+        if self.uncapped:
+            return None
         return sum(c.outstanding for c in self.claims)
 
     @property
     def known(self) -> bool:
-        return self.held is not None
+        return self.held is not None and not self.uncapped
 
     @property
     def spare(self) -> Optional[int]:
-        if self.held is None:
+        if self.held is None or self.outstanding is None:
             return None
         return self.held - self.outstanding
 
     @property
     def fits(self) -> Optional[bool]:
-        """True, False, or None when the position could not be read."""
+        """True, False, or None when the position could not be read.
+
+        A single uncapped section is the original single-pair arrangement and
+        is allowed: the per-clip position gate is what bounds it. More than one
+        section with any of them uncapped cannot be shown to fit, because an
+        inventory cannot be divided between claims when one of them is
+        unlimited.
+        """
         if self.held is None:
             return None
+        if self.uncapped:
+            return len(self.claims) == 1
         return self.outstanding <= self.held
 
     def describe(self) -> str:
+        count = len(self.claims)
+        if self.uncapped and count > 1:
+            names = ", ".join(c.name for c in self.uncapped)
+            return (f"{count} sections, and {names} has no ladder, so there is "
+                    "no cap on what it would roll")
+        if self.outstanding is None:
+            return "one section with no ladder; the position gate bounds it"
         if self.held is None:
             return (f"{self.outstanding:,} still to roll across "
-                    f"{len(self.claims)} section(s); the near position could "
+                    f"{count} section(s); the near position could "
                     "not be read, so it is not known whether that fits")
         verdict = "fits" if self.fits else "DOES NOT FIT"
         return (f"{self.outstanding:,} still to roll across "
-                f"{len(self.claims)} section(s) against {self.held:,} held: "
+                f"{count} section(s) against {self.held:,} held: "
                 f"{verdict} ({self.spare:,} spare)")
 
     def refusal(self) -> Optional[str]:
@@ -94,6 +132,12 @@ class Allocation:
         that the claims cannot exceed the inventory, and that cannot be
         established against a number nobody has.
         """
+        if self.uncapped and len(self.claims) > 1:
+            names = ", ".join(c.name for c in self.uncapped)
+            return (f"{names} has no ladder, so there is no limit on how much "
+                    "of the position it would roll. With more than one section "
+                    "selling the same contract, every section needs a ladder, "
+                    "or the others cannot be guaranteed anything to sell.")
         if self.held is None:
             return ("the near position could not be read, so it cannot be "
                     "shown that the sections together will not sell more than "
@@ -180,11 +224,14 @@ def claims_from(sections: List[Dict[str, Any]]) -> List[Claim]:
                 name=str(section.get("name") or f"section {index + 1}"),
                 near_token=str(section.get("near_token") or ""),
                 far_token=str(section.get("far_token") or ""),
-                total=int(section.get("total") or 0),
+                total=(None if section.get("total") is None
+                       else int(section["total"])),
                 done=int(section.get("done") or 0),
                 halted=bool(section.get("halted")),
             ))
         except Exception:
+            # Unreadable, so it is treated as uncapped: a section whose size
+            # cannot be established must not be assumed to want nothing.
             out.append(Claim(name=f"section {index + 1}", near_token="",
-                             far_token="", total=0, done=0, halted=True))
+                             far_token="", total=None, done=0, halted=True))
     return out

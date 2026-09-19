@@ -90,6 +90,74 @@ class TestTheInvariantHoldsAsItRuns(unittest.TestCase):
         self.assertTrue(got.fits)
 
 
+class TestASectionWithNoLadder(unittest.TestCase):
+    """No ladder is not a claim of nothing. It is a claim of everything.
+
+    A section without a ladder has no campaign cap: it rolls a clip at a time
+    for as long as the market allows. Summing it as zero made the whole check
+    vacuous -- two sections would total less than the position while one of
+    them quietly consumed all of it, which is the exact double sell this
+    module exists to prevent.
+    """
+
+    def uncapped(self, name="Sep->Nov"):
+        return Claim(name=name, near_token="1769", far_token="X",
+                     total=None, done=0)
+
+    def test_it_is_uncapped_not_empty(self):
+        got = self.uncapped()
+        self.assertTrue(got.uncapped)
+        self.assertIsNone(got.outstanding)
+
+    def test_it_makes_the_total_unknowable(self):
+        got = allocation([claim("Sep->Oct", 100000), self.uncapped()],
+                         held=100000)
+        self.assertIsNone(got.outstanding)
+        self.assertFalse(got.known)
+
+    def test_two_sections_with_one_uncapped_do_not_fit(self):
+        got = allocation([claim("Sep->Oct", 100000), self.uncapped()],
+                         held=100000)
+        self.assertFalse(got.fits)
+
+    def test_it_is_refused_and_says_what_to_do(self):
+        why = allocation([claim("Sep->Oct", 100000), self.uncapped()],
+                         held=100000).refusal()
+        self.assertIn("Sep->Nov", why)
+        self.assertIn("no ladder", why)
+        self.assertIn("every section needs a ladder", why)
+
+    def test_a_generous_position_does_not_rescue_it(self):
+        """There is no position large enough to bound something unlimited."""
+        got = allocation([claim("Sep->Oct", 1000), self.uncapped()],
+                         held=99_000_000)
+        self.assertFalse(got.fits)
+
+    def test_one_uncapped_section_alone_is_the_original_arrangement(self):
+        """Single-pair rolling has always been bounded by the position gate."""
+        got = allocation([self.uncapped()], held=100000)
+        self.assertTrue(got.fits)
+        self.assertIsNone(got.refusal())
+
+    def test_the_description_names_the_uncapped_section(self):
+        text = allocation([claim("a", 1000), self.uncapped()], held=100000).describe()
+        self.assertIn("Sep->Nov", text)
+        self.assertIn("no cap", text)
+
+    def test_a_section_that_could_not_be_parsed_is_uncapped_not_empty(self):
+        """Its size could not be established, so it must not be assumed small."""
+        got = claims_from([{"name": "good", "total": 1000},
+                           {"name": "broken", "total": "not a number"}])
+        self.assertTrue(got[1].uncapped)
+        self.assertFalse(allocation(got, held=999999).fits)
+
+    def test_a_section_with_an_explicit_zero_is_still_zero(self):
+        """Nothing to roll is a real, bounded answer. It is not "no ladder"."""
+        got = claims_from([{"name": "empty", "total": 0}])
+        self.assertFalse(got[0].uncapped)
+        self.assertEqual(got[0].outstanding, 0)
+
+
 class TestAnUnreadablePosition(unittest.TestCase):
     """The check cannot be made against a number nobody has."""
 

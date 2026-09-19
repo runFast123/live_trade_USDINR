@@ -212,5 +212,113 @@ class TestTheRealBooksObserved(unittest.TestCase):
         self.assertTrue(got.near_first, "a 1 lot clip fits in both books")
 
 
+class TestFarFirstCanActuallyReachAnOrder(unittest.TestCase):
+    """The touch-size gate and far-first were exactly complementary.
+
+    Far-first is chosen when the far ask is BELOW the clip. The far touch gate
+    passed when the far ask was AT OR ABOVE it. So every market that selected
+    far-first was a market the gate blocked, and no far-first order could ever
+    have been sent. The feature was dead on arrival.
+
+    The gate's reasoning - "sell the near leg in full and then find only a
+    handful on the far offer" - is about the SECOND leg. When the far leg goes
+    first, a thin far book is not the hazard, it is the premise.
+    """
+
+    def setUp(self):
+        import time
+        from datetime import date
+        from rollover import gates, rule
+        from rollover.broker import InstrumentInfo
+        from rollover.config import RollConfig
+        from rollover.money import D
+        from rollover.quotes import Quote
+
+        self.gates, self.rule, self.D, self.Quote = gates, rule, D, Quote
+        self.now = time.monotonic()
+
+        def contract(token, expiry):
+            return InstrumentInfo(
+                token=token, symbol="USDINR", sec_desc="USDINR" + token,
+                segment="13", lot_size=1000, expiry=expiry,
+                instrument="FUTCUR", price_divisor=D("10000000"),
+                tick=D("0.0025"), tick_units=D("25000"),
+                low_range=D("93"), high_range=D("99"))
+
+        class Session:
+            logged_in = True
+            near = contract("1769", date(2026, 9, 28))
+            far = contract("1584", date(2026, 11, 26))
+            market_open = True
+            near_position_qty = 500000
+            margin = None
+            clips_done_today = 0
+            in_flight = False
+            halted_reason = None
+            scrip_file_date = date.today()
+
+        self.session = Session()
+        self.cfg = RollConfig(near_token="1769", far_token="1584",
+                              near_expiry="2026-09-28", far_expiry="2026-11-26",
+                              lots=25, dry_run=True, require_margin=False,
+                              limit_mode="absolute")
+
+    def report(self, far_depth, sequence=None, near_depth=400000):
+        nq = self.Quote("1769", self.D("95.9400"), self.D("95.9450"), self.now,
+                        self.D(1), bid_qty=near_depth, ask_qty=near_depth)
+        fq = self.Quote("1584", self.D("96.2370"), self.D("96.2375"), self.now,
+                        self.D(1), bid_qty=far_depth, ask_qty=far_depth)
+        decision = self.rule.compute(nq, fq, self.cfg)
+        return self.gates.evaluate(self.cfg, self.session,
+                                   {"1769": nq, "1584": fq}, decision,
+                                   sequence=sequence)
+
+    def gate(self, report, name):
+        return next(g for g in report.gates if g.name == name)
+
+    def test_the_market_that_selects_far_first_used_to_be_blocked(self):
+        """The defect, stated as the arithmetic that produced it."""
+        clip = self.cfg.clip_qty
+        thin = 8000
+        self.assertLess(thin, clip, "this market selects far-first")
+        self.assertTrue(choose(clip, 400000, thin).far_first)
+        self.assertFalse(self.gate(self.report(thin), "far touch size").ok)
+
+    def test_with_the_sequence_known_that_market_passes(self):
+        clip = self.cfg.clip_qty
+        seq = choose(clip, 400000, 8000)
+        self.assertTrue(seq.far_first)
+        self.assertTrue(self.gate(self.report(8000, seq), "far touch size").ok)
+
+    def test_the_depth_is_still_reported_not_hidden(self):
+        seq = choose(self.cfg.clip_qty, 400000, 8000)
+        detail = self.gate(self.report(8000, seq), "far touch size").detail
+        self.assertIn("8000", detail)
+        self.assertIn("not required", detail)
+
+    def test_the_near_leg_is_still_required_to_cover_the_clip(self):
+        """Far-first commits you to selling near. That leg still has to fill."""
+        seq = choose(self.cfg.clip_qty, 400000, 8000)
+        report = self.report(8000, seq, near_depth=1000)
+        self.assertFalse(self.gate(report, "near touch size").ok)
+
+    def test_near_first_is_unchanged(self):
+        seq = choose(self.cfg.clip_qty, 400000, 80000)
+        self.assertTrue(seq.near_first)
+        self.assertTrue(self.gate(self.report(80000, seq), "far touch size").ok)
+        self.assertFalse(self.gate(self.report(8000, seq), "far touch size").ok)
+
+    def test_no_sequence_given_behaves_as_before(self):
+        """Every existing caller passes nothing, and must be unaffected."""
+        self.assertFalse(self.gate(self.report(8000), "far touch size").ok)
+        self.assertTrue(self.gate(self.report(80000), "far touch size").ok)
+
+    def test_a_missing_far_size_still_blocks_even_under_far_first(self):
+        """No size at all is not a thin book; it is an unreadable one."""
+        seq = choose(self.cfg.clip_qty, 400000, 8000)
+        report = self.report(None, seq)
+        self.assertFalse(self.gate(report, "far touch size").ok)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

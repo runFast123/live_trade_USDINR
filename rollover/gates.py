@@ -39,7 +39,8 @@ class GateReport:
         return "\n".join(str(g) for g in self.gates)
 
 
-def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> GateReport:
+def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None,
+             sequence=None) -> GateReport:
     """Run every gate. `session` carries what was learned at startup and during the day.
 
     session is expected to provide:
@@ -50,6 +51,11 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
         clips_done_today     int
         in_flight            bool
         halted_reason        str or None
+
+    `sequence` is the rollover.sequencing.Sequence chosen for this clip, when
+    one has been. It changes only the far touch-size gate, because whether a
+    thin far book is a hazard depends entirely on whether the far leg goes
+    first. None means the near leg goes first, which is the original behaviour.
     """
     now = now or datetime.now()
     today = now.date()
@@ -227,6 +233,17 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
     # Selling the near leg in full and then finding only a handful of units on
     # the far offer is how a roll ends up half done, which is the one outcome
     # this app must not produce.
+    #
+    # That reasoning is about the SECOND leg, so it depends on which leg is
+    # second. When the far leg goes first, a thin far book is not a hazard --
+    # it is the premise: buy what is there, then sell exactly that much near,
+    # and the size is decided by the fill rather than gambled on.
+    #
+    # Without this, far-first was unreachable. It is chosen exactly when the
+    # far ask is below the clip, and the gate passed exactly when it was at or
+    # above it, so the two were complementary and no far-first order could ever
+    # have been sent.
+    far_first = bool(sequence is not None and getattr(sequence, "far_first", False))
     if cfg.require_touch_size:
         need = clip
         for label, quote, side, size in (("near", near_q, "bid", near_q.bid_qty),
@@ -234,6 +251,12 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None) -> 
             if size is None:
                 add(f"{label} touch size", False,
                     "the feed did not give a size at the top of book")
+            elif far_first and label == "far":
+                # Still reported, so the depth stays visible; just not a
+                # condition of trading.
+                add("far touch size", True,
+                    f"{size} resting at the ask; not required, the far leg "
+                    "goes first and its fill sets the size")
             else:
                 add(f"{label} touch size", size >= need,
                     f"{size} resting at the {side}, clip needs {need}")
