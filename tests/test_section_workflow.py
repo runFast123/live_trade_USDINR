@@ -111,6 +111,10 @@ class WorkflowCase(unittest.TestCase):
             far_token="1584", far_expiry="2026-11-26",
             limit_ladder=[], watch_limits=[], sections=[],
             limit_bps_schedule={"1": "30", "2": "30"},
+            # The whole day, so the suite does not depend on the wall
+            # clock. Without this these tests were green before 16:55
+            # and red after, which trains people to dismiss failures.
+            window_open="00:00", window_close="23:59",
             use_live_feed=False, record_market=False, update_check=False,
             journal=False, dry_run=True, quantity_unit_confirmed=True)
         self.cfg.save(self.path)

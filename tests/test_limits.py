@@ -430,3 +430,60 @@ class TestThePositionUnitCatchesItself(unittest.TestCase):
     def test_a_different_lot_size_is_respected(self):
         self.assertEqual(self.named(self.report(500, lot=100)), [])
         self.assertTrue(self.named(self.report(550, lot=100)))
+
+
+class TestTheExampleConfigStaysHonest(unittest.TestCase):
+    """config.example.json is copied on a first run and is the only place an
+    operator can see what settings exist.
+
+    It had fallen ten settings behind, and when I brought it up to date I put
+    in one that does not exist and one whose value was not the shipped
+    default. Both are the sort of thing that reads as documentation and is
+    simply wrong, so they are checked here rather than by eye.
+    """
+
+    def setUp(self):
+        import json
+        import os
+        self.path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.example.json")
+        with open(self.path, encoding="utf-8") as fh:
+            self.raw = json.load(fh)
+
+    def names(self):
+        from dataclasses import fields
+        return {f.name for f in fields(RollConfig)} - {"unknown_keys"}
+
+    def test_it_loads(self):
+        RollConfig.load(self.path)
+
+    def test_every_key_in_it_is_a_real_setting(self):
+        self.assertEqual(sorted(set(self.raw) - self.names()), [])
+
+    def test_every_setting_appears_in_it(self):
+        """Otherwise a setting exists that nobody can discover."""
+        self.assertEqual(sorted(self.names() - set(self.raw)), [])
+
+    def test_a_new_install_starts_in_dry_run(self):
+        self.assertTrue(RollConfig.load(self.path).dry_run)
+
+    def test_a_new_install_has_not_confirmed_the_quantity_unit(self):
+        """It is confirmed per account, not per build."""
+        self.assertFalse(RollConfig.load(self.path).quantity_unit_confirmed)
+
+    def test_it_has_no_contracts_chosen(self):
+        cfg = RollConfig.load(self.path)
+        self.assertEqual((cfg.near_token, cfg.far_token), ("", ""))
+
+    def test_it_changes_no_behaviour_beyond_the_credentials(self):
+        """A value in the example that differs from the shipped default is a
+        second, competing default that nobody knows about."""
+        from dataclasses import fields
+        allowed = {"vendor_id", "api_key", "mobile_no", "base_url",
+                   "near_expiry", "far_expiry", "roll_limit", "unknown_keys"}
+        cfg, plain = RollConfig.load(self.path), RollConfig()
+        differs = [f.name for f in fields(RollConfig)
+                   if f.name not in allowed
+                   and getattr(cfg, f.name) != getattr(plain, f.name)]
+        self.assertEqual(differs, [])

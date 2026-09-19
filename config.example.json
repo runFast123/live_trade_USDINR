@@ -43,5 +43,25 @@
     "1": "30",
     "2": "50"
   },
-  "tenor_tolerance_days": 10
+  "tenor_tolerance_days": 10,
+  "quantity_unit_confirmed": false,
+  "depth_in_lots": true,
+  "require_margin": true,
+  "reconcile_wait_sec": 6.0,
+  "max_clips_per_day_account": null,
+  "leg_order": "auto",
+  "far_first_near_depth_multiple": 3,
+  "limit_ladder": [],
+  "watch_limits": [],
+  "sections": [],
+  "record_market": true,
+  "record_interval_sec": 5.0,
+  "journal": true,
+  "update_check": true,
+  "use_live_feed": true,
+  "feed_max_silence": 120.0,
+  "require_fresh_scrip": true,
+  "require_touch_size": true,
+  "alert_on_qualify": true,
+  "update_repo": "runFast123/live_trade_USDINR"
 }

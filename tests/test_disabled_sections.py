@@ -76,6 +76,10 @@ class DisabledCase(unittest.TestCase):
             far_token="1584", far_expiry="2026-11-26",
             limit_ladder=[{"bps": "50", "qty": 20000}],
             limit_bps_schedule={"1": "50", "2": "50"},
+            # The whole day, so the suite does not depend on the wall
+            # clock. Without this these tests were green before 16:55
+            # and red after, which trains people to dismiss failures.
+            window_open="00:00", window_close="23:59",
             sections=sections, use_live_feed=False, record_market=False,
             update_check=False, journal=False, dry_run=True)
         engine = RollEngine(cfg, self.log, self.dir, broker=Broker())
@@ -241,6 +245,10 @@ class TestTheAccountWideDayBudget(DisabledCase):
             far_token="1584", far_expiry="2026-11-26",
             limit_ladder=[{"bps": "50", "qty": 20000}],
             limit_bps_schedule={"1": "50", "2": "50"},
+            # The whole day, so the suite does not depend on the wall
+            # clock. Without this these tests were green before 16:55
+            # and red after, which trains people to dismiss failures.
+            window_open="00:00", window_close="23:59",
             max_clips_per_day_account=cap, max_clips_per_day=each,
             sections=sections, use_live_feed=False, record_market=False,
             update_check=False, journal=False, dry_run=True)
