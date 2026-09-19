@@ -88,9 +88,12 @@ class Section:
         self.ladder_progress: Dict[str, int] = {}
         self.watch_limits: List[Any] = []
 
-        # What it last decided, for the screen.
+        # What it last decided, for the screen -- and the leg order that went
+        # with it, so the gates and the orders that follow cannot disagree.
         self.decision = None
         self.report = None
+        self.sequence = None
+        self.quotes = None
         self.note = ""
 
     # ------------------------------------------------------- the config

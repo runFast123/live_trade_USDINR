@@ -20,9 +20,10 @@ from . import margin as marginlib
 from . import book
 from . import reconcile
 from . import sections as sectionlib
+from . import sequencing
 from . import limits as limitlib
 from . import rule
-from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
+from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo
 from .config import RollConfig
 from .feed import LiveFeed
 from .logbook import Logbook
@@ -57,6 +58,19 @@ class Snapshot:
     clips_done: int = 0
     halted_reason: Optional[str] = None
     quote_source: str = ""
+
+
+class _Leg:
+    """One side of a roll: which contract, which way, at what price."""
+
+    __slots__ = ("role", "info", "side", "price", "token")
+
+    def __init__(self, role, info, side, price, token):
+        self.role = role          # "near" or "far"
+        self.info = info
+        self.side = side          # BUY or SELL
+        self.price = price
+        self.token = token
 
 
 def _expiry(text):
@@ -813,8 +827,16 @@ class RollEngine:
                                     ladder=section.ladder,
                                     progress=section.ladder_progress,
                                     watch=section.watch_limits)
-            report = gatelib.evaluate(cfg, section, quotes, decision)
+            # The leg order is decided BEFORE the gates, and the same object
+            # is handed to both, so the gate and the order that follows cannot
+            # disagree. Without that the far touch-size gate would refuse
+            # exactly the market that selects far-first, and no far-first order
+            # could ever be sent.
+            sequence = self._choose_sequence(decision, near_q, far_q, section)
+            report = gatelib.evaluate(cfg, section, quotes, decision,
+                                      sequence=sequence)
             section.decision, section.report = decision, report
+            section.sequence = sequence
             section.quotes = (near_q, far_q)
 
             candidates.append(book.Candidate(
@@ -857,7 +879,8 @@ class RollEngine:
         section = chosen.payload
         self.disarm("condition met, firing")
         near_q, far_q = section.quotes
-        self._execute(section.decision, near_q, far_q, section=section)
+        self._execute(section.decision, near_q, far_q, section=section,
+                      sequence=section.sequence)
 
     def _set_account_state(self) -> None:
         """One state for the window, from however many sections there are."""
@@ -893,22 +916,46 @@ class RollEngine:
         return max(0, int(cap) - done)
 
     # -------------------------------------------------------------- execution
-    def _execute(self, decision: rule.RollDecision, near_q: Quote, far_q: Quote,
-                 section=None) -> None:
-        """Sell the near leg, confirm, then buy the far leg for exactly what filled.
+    def _choose_sequence(self, decision, near_q, far_q, section):
+        """Which leg goes out first for this clip."""
+        cfg = section.cfg
+        return sequencing.choose(
+            decision.qty or cfg.clip_qty,
+            near_bid_qty=getattr(near_q, "bid_qty", None),
+            far_ask_qty=getattr(far_q, "ask_qty", None),
+            expiry_day=self._expiry_day(section),
+            mode=cfg.leg_order,
+            near_depth_multiple=cfg.far_first_near_depth_multiple)
 
-        The near leg goes first on purpose. If the second leg fails after the
-        first has filled, this order of operations leaves the account flat,
-        which can be corrected. Buying the far leg first would leave it long
-        two contracts with one of them about to expire.
+    def _execute(self, decision: rule.RollDecision, near_q: Quote, far_q: Quote,
+                 section=None, sequence=None) -> None:
+        """Send both legs, in whichever order this clip calls for.
+
+        Near first is right when both legs fill trivially: if the second fails
+        the account is left flat, which can be corrected at leisure. It inverts
+        when the far leg is thin, because then the second leg is the one likely
+        to come up short and a half roll becomes the expected outcome rather
+        than the exception. See rollover/sequencing.py for the choice.
+
+        Whichever way round, the SECOND leg is sized from what the first
+        actually filled, never from what was asked for. That is what keeps the
+        two sides equal when a leg fills partially.
         """
         section = section if section is not None else self.sections[0]
         cfg = section.cfg
+        if sequence is None:
+            sequence = self._choose_sequence(decision, near_q, far_q, section)
+
         self.account.in_flight = True
-        self._set_state(WORKING, f"{section.label()}: sending the near leg")
         self.log.info(f"--- ROLL: {section.label()} ---")
         self.log.info(decision.describe().replace("\n", " | "))
+        self.log.info(f"Order of legs: {sequence.describe()}")
         self.journal.decision(decision, dry_run=cfg.dry_run, armed=True)
+        self.journal.note("sequence", sequence.describe(),
+                          section=section.label(), order=sequence.order,
+                          near_bid_qty=getattr(near_q, "bid_qty", None),
+                          far_ask_qty=getattr(far_q, "ask_qty", None),
+                          clip=decision.qty)
 
         # Read before anything is sent. Both are the baseline for afterwards:
         # the position book says what the account held, the trade book says
@@ -925,10 +972,9 @@ class RollEngine:
         # The gate's copy is up to a slow beat old and was sized on the
         # configured clip. This one is taken now, for the quantity actually
         # about to be sent, and is what stops the order.
-        if self.cfg.require_margin and not self.cfg.dry_run:
+        if cfg.require_margin and not cfg.dry_run:
             estimate = marginlib.estimate(
-                self.broker, self.cfg.near_token, self.cfg.far_token,
-                decision.qty)
+                self.broker, cfg.near_token, cfg.far_token, decision.qty)
             self.account.margin = estimate
             self.journal.margin(estimate, decision.qty)
             if estimate.affordable is not True:
@@ -941,58 +987,81 @@ class RollEngine:
                 self._set_state(WATCHING, "margin")
                 return
 
+        if sequence.far_first:
+            first = _Leg("far", section.far, BUY, decision.buy_limit,
+                         cfg.far_token)
+            second = _Leg("near", section.near, SELL, decision.sell_limit,
+                          cfg.near_token)
+        else:
+            first = _Leg("near", section.near, SELL, decision.sell_limit,
+                         cfg.near_token)
+            second = _Leg("far", section.far, BUY, decision.buy_limit,
+                          cfg.far_token)
+
         try:
-            leg1 = self.broker.place_leg(
-                section.near, SELL, decision.qty, decision.sell_limit,
-                "leg 1 near SELL")
+            self._set_state(WORKING, f"{section.label()}: sending the {first.role} leg")
+            leg1 = self.broker.place_leg(first.info, first.side, decision.qty,
+                                         first.price, f"leg 1 {first.role} "
+                                         f"{'BUY' if first.side == BUY else 'SELL'}")
             self.log.info(f"leg 1 result: {leg1.detail}")
-            self.journal.order("near", SELL, cfg.near_token, decision.qty,
-                               decision.sell_limit, leg1)
+            self.journal.order(first.role, first.side, first.token, decision.qty,
+                               first.price, leg1)
 
             if cfg.dry_run:
-                leg2_price = decision.buy_limit
                 self.log.info(
-                    f"DRY RUN, not sent -- leg 2 far BUY {decision.qty} of "
-                    f"{section.far.token} at {money(leg2_price)}")
+                    f"DRY RUN, not sent -- leg 2 {second.role} "
+                    f"{'BUY' if second.side == BUY else 'SELL'} {decision.qty} "
+                    f"of {second.info.token} at {money(second.price)}")
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
                 self._count_clip(decision.qty, section)
                 self._credit_rung(decision, decision.qty, section)
                 return
 
             if not leg1.certain:
-                self.halt("the near leg was sent but its fill could not be confirmed: "
-                          f"{leg1.detail}. Check the terminal before doing anything else.")
+                self.halt(
+                    f"{section.label()}: the {first.role} leg was sent but its "
+                    f"fill could not be confirmed: {leg1.detail}. Check the "
+                    "terminal before doing anything else.")
                 return
 
             if leg1.filled_qty == 0:
-                self.log.info("Near leg did not fill and was cancelled. "
-                              "No exposure changed. Back to watching.")
+                self.log.info(
+                    f"The {first.role} leg did not fill and was cancelled. "
+                    "No exposure changed. Back to watching.")
                 return
 
-            self._set_state(WORKING, "sending the far leg")
-            leg2 = self.broker.place_leg(
-                section.far, BUY, leg1.filled_qty, decision.buy_limit,
-                "leg 2 far BUY")
+            # The second leg is sized from what the FIRST actually filled. Ask
+            # for what was wanted and a partial first leg leaves the two sides
+            # unequal, which is the half roll this whole arrangement exists to
+            # avoid.
+            self._set_state(WORKING, f"{section.label()}: sending the {second.role} leg")
+            leg2 = self.broker.place_leg(second.info, second.side,
+                                         leg1.filled_qty, second.price,
+                                         f"leg 2 {second.role} "
+                                         f"{'BUY' if second.side == BUY else 'SELL'}")
             self.log.info(f"leg 2 result: {leg2.detail}")
-            self.journal.order("far", BUY, cfg.far_token, leg1.filled_qty,
-                               decision.buy_limit, leg2)
+            self.journal.order(second.role, second.side, second.token,
+                               leg1.filled_qty, second.price, leg2)
 
             if leg2.fully_filled:
-                self._confirm_trades(leg1, leg2, before_trades)
+                near_leg = leg1 if first.role == "near" else leg2
+                far_leg = leg2 if first.role == "near" else leg1
+                self._confirm_trades(near_leg, far_leg, before_trades)
 
                 # The order book is the broker's summary of what it believes.
                 # The position book is what the account actually holds. Saying
                 # ROLL COMPLETE without comparing them takes one on trust.
                 verdict = reconcile.check(
-                    self.broker, self.cfg.near_token, self.cfg.far_token,
+                    self.broker, cfg.near_token, cfg.far_token,
                     before_positions or reconcile.Positions(None, None),
-                    leg2.filled_qty, wait=self.cfg.reconcile_wait_sec)
+                    leg2.filled_qty, wait=cfg.reconcile_wait_sec)
                 self.journal.reconciliation(verdict)
                 if verdict.contradicted:
                     # Count the clip before halting: whatever else is wrong,
                     # this much was sent, and the daily budget must reflect it.
                     self._count_clip(leg2.filled_qty, section)
-                    self.halt("BOTH LEGS REPORTED FILLED, BUT " + verdict.detail)
+                    self.halt(f"{section.label()}: BOTH LEGS REPORTED FILLED, "
+                              "BUT " + verdict.detail)
                     return
                 if verdict.checked:
                     self.log.info(verdict.detail)
@@ -1002,20 +1071,25 @@ class RollEngine:
                 self._count_clip(leg2.filled_qty, section)
                 self._credit_rung(decision, leg2.filled_qty, section)
                 self.log.info(
-                    f"ROLL COMPLETE: sold {leg1.filled_qty} near, bought {leg2.filled_qty} far, "
-                    f"at a booked cost near {money(decision.roll_cost)} per unit.")
+                    f"{section.label()}: ROLL COMPLETE: sold "
+                    f"{near_leg.filled_qty} near, bought {far_leg.filled_qty} "
+                    f"far, at a booked cost near {money(decision.roll_cost)} "
+                    "per unit.")
                 self.journal.note(
-                    "complete", "roll complete",
-                    near_filled=leg1.filled_qty, far_filled=leg2.filled_qty,
+                    "complete", "roll complete", section=section.label(),
+                    near_filled=near_leg.filled_qty,
+                    far_filled=far_leg.filled_qty,
+                    order=sequence.order,
                     roll_cost=decision.roll_cost, cost_bps=decision.cost_bps,
                     limit_bps=decision.limit_bps,
-                    clips_done=self.session.clips_done_today,
-                    ladder_done=dict(self.ladder_progress))
+                    clips_done=section.clips_done_today,
+                    ladder_done=dict(section.ladder_progress))
                 self._slow_refresh()
                 return
 
             short_by = leg1.filled_qty - leg2.filled_qty
-            self._handle_leg2_failure(leg1, leg2, short_by, near_q, section)
+            self._handle_second_leg_failure(leg1, leg2, short_by, near_q, far_q,
+                                            section, first, second)
 
         except Exception as exc:
             # Anything unexpected in here can have left a leg filled. Without
@@ -1023,39 +1097,74 @@ class RollEngine:
             # carried on: no halt, every gate passing again, and the operator
             # able to arm on top of a position that is already half moved.
             self.halt(
-                f"{type(exc).__name__} during execution: {exc}. A leg may have "
-                "filled. Check the terminal and the position book before doing "
-                "anything else.")
+                f"{section.label()}: {type(exc).__name__} during execution: "
+                f"{exc}. A leg may have filled. Check the terminal and the "
+                "position book before doing anything else.")
             self.log.error(f"Execution failed after the roll had started: {exc!r}")
 
         finally:
             self.account.in_flight = False
 
-    def _handle_leg2_failure(self, leg1: OrderOutcome, leg2: OrderOutcome,
-                             short_by: int, near_q: Quote, section=None) -> None:
-        section = section if section is not None else self.sections[0]
-        message = (
-            f"{section.label()}: HALF ROLLED. The near leg sold "
-            f"{leg1.filled_qty} units but the far leg "
-            f"only bought {leg2.filled_qty}. You are short {short_by} units of the "
-            f"intended position. Far leg detail: {leg2.detail}"
-        )
+    def _handle_second_leg_failure(self, leg1, leg2, short_by, near_q, far_q,
+                                   section, first, second) -> None:
+        """One leg filled and the other did not. What that leaves depends.
+
+        Near first leaves the account SHORT the near month: sold and not
+        replaced. Far first leaves it LONG BOTH months: bought and not paid for
+        by a sale. They are not the same problem and they are not undone the
+        same way.
+
+        The far-first case is the more dangerous one to correct automatically.
+        Undoing it means selling the far leg back into the same thin book that
+        made far-first the right choice in the first place, and sweeping a thin
+        book in a hurry is how a small legging cost becomes a large one. So it
+        is never done without being asked for, and the default is to stop and
+        say so.
+        """
+        far_first = first.role == "far"
+        cfg = section.cfg
+
+        if far_first:
+            message = (
+                f"{section.label()}: HALF ROLLED THE OTHER WAY. The far leg "
+                f"bought {leg1.filled_qty} units but the near leg only sold "
+                f"{leg2.filled_qty}, so the account is long both months by "
+                f"{short_by} units. Near leg detail: {leg2.detail}")
+        else:
+            message = (
+                f"{section.label()}: HALF ROLLED. The near leg sold "
+                f"{leg1.filled_qty} units but the far leg only bought "
+                f"{leg2.filled_qty}. You are short {short_by} units of the "
+                f"intended position. Far leg detail: {leg2.detail}")
+
         if section.ladder:
             # Crediting a rung from a half-rolled clip would be a guess in one
             # direction or the other, and the position has to be reconciled by
             # hand regardless. Say so rather than quietly picking a number.
             message += (
-                f" The ladder has NOT been credited with the {leg2.filled_qty} that did "
-                "roll; check the position book and use Reset ladder if the "
-                "progress shown no longer matches it.")
+                f" The ladder has NOT been credited with the {leg2.filled_qty} "
+                "that did roll; check the position book and use Reset ladder "
+                "if the progress shown no longer matches it.")
         self.log.alert(message)
 
-        if not self.cfg.auto_unwind_on_leg2_failure:
-            self.halt(message + " Auto unwind is off, so this needs you at the terminal now.")
+        if not cfg.auto_unwind_on_leg2_failure:
+            self.halt(message + " Auto unwind is off, so this needs you at the "
+                                "terminal now.")
+            return
+
+        if far_first:
+            # Selling the far leg back into the book that was too thin to fill
+            # it is the one action most likely to turn a small problem into a
+            # large one.
+            self.halt(
+                message + " Undoing this means selling the far leg back into "
+                "the same thin book that made far-first the right choice, so "
+                "it is not done automatically whatever auto unwind says. This "
+                "needs you at the terminal now.")
             return
 
         # Buy the near contract back so the account returns to where it started.
-        unwind_price = ceil_tick(near_q.ask + self.cfg.tick_d * 4, self.cfg.tick_d)
+        unwind_price = ceil_tick(near_q.ask + cfg.tick_d * 4, cfg.tick_d)
         self.log.alert(f"Auto unwind: buying back {short_by} of the near contract "
                        f"at {money(unwind_price)}")
         undo = self.broker.place_leg(
