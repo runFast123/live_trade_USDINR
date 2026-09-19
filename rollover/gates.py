@@ -194,6 +194,17 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None,
         session.clips_done_today < cfg.max_clips_per_day,
         f"{session.clips_done_today} of {cfg.max_clips_per_day} done today")
 
+    # And the cap across every section. Each section's own budget cannot see
+    # its siblings, so two sections allowed one clip each are two clips on one
+    # account -- which is what max_clips_per_day_account is for. It is a gate
+    # so that it stops a clip and shows on screen with the rest of them.
+    account_left = getattr(session, "account_clips_left", None)
+    if account_left is not None:
+        add("account clips", account_left > 0,
+            f"{account_left} left today across all sections"
+            if account_left > 0 else
+            "the account's clips for today are all used")
+
     # ---- position ----------------------------------------------------------
     if cfg.require_position:
         qty = session.near_position_qty

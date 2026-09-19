@@ -971,6 +971,9 @@ class RollEngine:
         quotes = self._read_quotes(tokens)
         self._last_complaint = ("", 0.0)
         self._share_out()
+        # Published to the account BEFORE the sections are gated, so the gate
+        # below sees this tick's figure rather than the previous one.
+        self.account.clips_left = self._account_clips_left()
 
         expiry_day = self._expiry_day()
         candidates = []
@@ -1085,22 +1088,28 @@ class RollEngine:
                            for s in working):
             self._set_state(DONE, "the day's clips are done")
             return
-        if self._account_clips_left() <= 0:
+        left = self._account_clips_left()
+        if left is not None and left <= 0:
             self._set_state(DONE, "the account's clips for the day are done")
             return
         self._set_state(WATCHING, "watching both legs" if len(working) < 2
                         else f"watching {len(working)} sections")
 
-    def _account_clips_left(self) -> int:
+    def _account_clips_left(self) -> Optional[int]:
         """How many clips the account may still do today, across all sections.
 
         Two sections each allowed one clip a day means the ACCOUNT does two
         where it used to do one. That follows from asking for two sections that
         both trade, but it does not leap off the page, so it can be capped.
+
+        None means uncapped. It used to return 1 for that, a sentinel meaning
+        "not exhausted" -- and since the only caller compared it against zero
+        to label the screen, the cap labelled the screen and stopped nothing.
+        A cap of 1 let two sections send a clip each.
         """
         cap = self.cfg.max_clips_per_day_account
         if cap is None:
-            return 1 if any(s.enabled for s in self.sections) else 0
+            return None
         done = sum(s.clips_done_today for s in self.sections)
         return max(0, int(cap) - done)
 

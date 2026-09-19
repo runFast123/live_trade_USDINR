@@ -51,6 +51,10 @@ class AccountState:
     # inventory and the same margin, so two in flight could each be sound on
     # its own and wrong together.
     in_flight: bool = False
+    # Clips the account may still do today across every section. None is
+    # uncapped. Account-wide, like in_flight: two sections each allowed one
+    # clip a day are two clips on one account.
+    clips_left: Optional[int] = None
 
     # A halt that concerns the account rather than one campaign: a half rolled
     # position, an unreadable state file, a fill that could not be confirmed.
@@ -171,6 +175,10 @@ class Section:
     @margin.setter
     def margin(self, value) -> None:
         self.account.margin = value
+
+    @property
+    def account_clips_left(self) -> Optional[int]:
+        return self.account.clips_left
 
     @property
     def in_flight(self) -> bool:

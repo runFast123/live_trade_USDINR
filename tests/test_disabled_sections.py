@@ -221,3 +221,85 @@ class TestSwitchingOneOnChangesOnlyWhatItMayDo(DisabledCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheAccountWideDayBudget(DisabledCase):
+    """max_clips_per_day_account caps the clips ALL sections do together.
+
+    It did not. _account_clips_left returned 1 as a sentinel for "uncapped",
+    and its only caller compared it against zero to label the screen -- so the
+    setting changed a word in the status pill and stopped nothing. A cap of 1
+    let two sections send a clip each, which is exactly the case it exists
+    for: each section's own budget cannot see its siblings.
+    """
+
+    def engine(self, sections, cap=None, each=3):
+        from rollover.engine import RollEngine
+
+        cfg = RollConfig(
+            near_token="1769", near_expiry="2026-09-28",
+            far_token="1584", far_expiry="2026-11-26",
+            limit_ladder=[{"bps": "50", "qty": 20000}],
+            limit_bps_schedule={"1": "50", "2": "50"},
+            max_clips_per_day_account=cap, max_clips_per_day=each,
+            sections=sections, use_live_feed=False, record_market=False,
+            update_check=False, journal=False, dry_run=True)
+        engine = RollEngine(cfg, self.log, self.dir, broker=Broker())
+        for s in engine.sections:
+            s.near = contract(s.cfg.near_token)
+            s.far = contract(s.cfg.far_token)
+        engine.near_positions = {"1769": 100000}
+        engine.account.logged_in = True
+        engine.account.market_open = True
+        engine.account.scrip_file_date = date.today()
+
+        def fake(dec, nq, fq, section=None, sequence=None):
+            self.sent.append(section.name)
+            section.clips_done_today += 1
+        engine._execute = fake
+        self.engine = engine
+        return engine
+
+    def run_day(self, cap, attempts=8):
+        self.sent = []
+        self.engine([SEP_OCT, SEP_NOV], cap=cap)
+        for _ in range(attempts):
+            self.engine.arm()
+            self.tick()
+        return self.sent
+
+    def test_a_cap_of_one_means_one_clip_on_the_account(self):
+        self.assertEqual(len(self.run_day(1)), 1)
+
+    def test_a_cap_of_two_means_two(self):
+        self.assertEqual(len(self.run_day(2)), 2)
+
+    def test_no_cap_leaves_each_section_to_its_own_budget(self):
+        """Three each, two sections, so six."""
+        self.assertEqual(len(self.run_day(None)), 6)
+
+    def test_the_cap_counts_across_sections_not_within_one(self):
+        """A cap of 2 spent on one section leaves nothing for the other."""
+        sent = self.run_day(2)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(set(sent)), 1)
+
+    def test_it_is_a_gate_so_it_says_why_on_screen(self):
+        self.run_day(1)
+        self.tick()
+        gates = []
+        for s in self.engine.sections:
+            if s.report is not None:
+                gates += [(g.name, g.ok, g.detail) for g in s.report.gates]
+        named = [g for g in gates if g[0] == "account clips"]
+        self.assertTrue(named, "the account budget is not shown as a gate")
+        self.assertFalse(named[0][1])
+        self.assertIn("all used", named[0][2])
+
+    def test_no_gate_appears_when_there_is_no_cap(self):
+        """An uncapped budget is not a condition, so it is not a row."""
+        self.run_day(None)
+        self.tick()
+        names = [g.name for s in self.engine.sections
+                 if s.report is not None for g in s.report.gates]
+        self.assertNotIn("account clips", names)
