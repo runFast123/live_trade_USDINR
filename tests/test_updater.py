@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import unittest
 
-from rollover import updater
+from rollover import __version__, updater
 from rollover.updater import Release, UpdateError, is_newer, parse_version
+
+# A release that is always newer than this build, whatever version it reaches.
+NEWER = f"v{parse_version(__version__)[0] + 1}.0.0"
 
 
 class TestVersionCompare(unittest.TestCase):
@@ -44,7 +47,12 @@ class TestCheck(unittest.TestCase):
     def tearDown(self):
         updater._get = self._real_get
 
-    def payload(self, tag="v2.0.0", assets=None, body=None):
+    def payload(self, tag=None, assets=None, body=None):
+        # Derived from this build rather than written down. A fixed "newer"
+        # version stops being newer the moment the app reaches it, which is
+        # exactly what happened at 2.0.0: nine of these turned red on a version
+        # bump that had changed nothing they test.
+        tag = tag or NEWER
         if assets is None:
             assets = [{"name": "roll_app.exe", "size": 123,
                        "browser_download_url": "https://example.invalid/roll_app.exe"}]
@@ -69,7 +77,7 @@ class TestCheck(unittest.TestCase):
         self.stub(self.payload())
         release = updater.check("owner/repo")
         self.assertIsNotNone(release)
-        self.assertEqual(release.version, "2.0.0")
+        self.assertEqual(release.version, NEWER.lstrip("v"))
         self.assertEqual(release.sha256, "a" * 64)
 
     def test_the_same_version_is_not_an_update(self):
