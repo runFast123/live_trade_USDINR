@@ -163,6 +163,23 @@ class LiveModeDialog(tk.Toplevel):
             self.on_done()
 
 
+def _sortable(value):
+    """A missing figure sorts last, not first: "--" is not the cheapest."""
+    from decimal import Decimal
+    return Decimal("999999") if value is None else value
+
+
+def _inside_bps(view):
+    """How far inside its own limit a section is. Missing sorts last."""
+    from decimal import Decimal
+    decision = view.decision
+    cost = getattr(decision, "cost_bps", None)
+    limit = getattr(decision, "limit_bps", None)
+    if cost is None or limit is None:
+        return Decimal("-999999")
+    return limit - cost
+
+
 def _why_waiting(gate) -> str:
     """Why a section is not trading, in words that are not the gate's name.
 
@@ -173,7 +190,16 @@ def _why_waiting(gate) -> str:
     detail is already written to stand on its own.
     """
     detail = (getattr(gate, "detail", "") or "").strip()
-    return detail or (getattr(gate, "name", "") or "waiting")
+    name = (getattr(gate, "name", "") or "").strip()
+    if not detail:
+        return name or "waiting"
+    # A detail that opens with a number is a measurement -- "0.1250 (max
+    # 0.0500)" -- and a measurement has to say what was measured. Next to the
+    # gate's own name in the table below it is clear; alone in a column it
+    # names nothing at all.
+    if name and not detail[0].isalpha():
+        return f"{name}: {detail}"
+    return detail
 
 
 class RollWindow(tk.Toplevel):
@@ -451,16 +477,29 @@ class RollWindow(tk.Toplevel):
             box, columns=[c[0] for c in self.STRIP_COLUMNS],
             show="headings", height=3, selectmode="browse")
         for key, title, width, anchor in self.STRIP_COLUMNS:
-            self.strip.heading(key, text=title)
+            # Click a heading to sort by it, again to reverse. With several
+            # rolls the question is usually "which is cheapest" or "which has
+            # most left", and both are a column already on screen.
+            self.strip.heading(key, text=title,
+                               command=lambda k=key: self._sort_strip(k))
             self.strip.column(key, width=width, anchor=anchor,
                               stretch=(key == "state"))
         self.strip.pack(fill="x", pady=(T.PAD_S, 0))
         self.strip.bind("<<TreeviewSelect>>", lambda _e: self._focus_selected())
+        # Double-click switches a section on or off: it is the thing an
+        # operator does most, and hunting for the button each time is friction
+        # on a screen they check every twenty minutes.
+        self.strip.bind("<Double-1>", self._strip_double_click)
 
         self.strip.tag_configure("ready", foreground=T.SUCCESS)
         self.strip.tag_configure("halted", foreground=T.DANGER)
         self.strip.tag_configure("off", foreground=T.FAINT)
         self.strip.tag_configure("waiting", foreground=T.MUTED)
+        self.strip.tag_configure("next", background=T.SURFACE_2)
+
+        # None means the order they are configured in, which is the default.
+        self._sort_by = None
+        self._sort_down = False
 
         row = tk.Frame(box, bg=T.SURFACE)
         row.pack(fill="x", pady=(T.PAD_M, 0))
@@ -477,10 +516,12 @@ class RollWindow(tk.Toplevel):
                                       self.fonts, kind="danger",
                                       width=190, height=30)
         self.remove_button.pack(side="left", padx=T.PAD_XS)
-        self.section_note = tk.Label(row, text="", bg=T.SURFACE, fg=T.FAINT,
+        # Under the buttons, not beside them: beside them it had 520 pixels
+        # and a refusal that runs to two sentences was cut off mid-word.
+        self.section_note = tk.Label(box, text="", bg=T.SURFACE, fg=T.FAINT,
                                      font=self.fonts.ui_small, anchor="w",
-                                     justify="left", wraplength=520)
-        self.section_note.pack(side="left", padx=T.PAD_S, fill="x", expand=True)
+                                     justify="left", wraplength=1100)
+        self.section_note.pack(fill="x", pady=(T.PAD_S, 0))
 
         self.allocation_label = tk.Label(
             box, text="", bg=T.SURFACE, fg=T.MUTED, font=self.fonts.ui_small,
@@ -489,6 +530,9 @@ class RollWindow(tk.Toplevel):
 
         self._strip_shown = False
         self.focus_key = None
+        # Tree row id -> section key. The row text is for people to
+        # read, not for the program to identify a section by.
+        self._strip_keys = {}
 
     def _focused_section(self):
         """The engine's Section for whatever the strip has selected."""
@@ -498,6 +542,58 @@ class RollWindow(tk.Toplevel):
                 if section.key == view.key:
                     return section
         return self.engine.sections[0] if self.engine.sections else None
+
+    # ---- working the strip -------------------------------------------------
+    SORT_KEYS = {
+        "name": lambda v: (v.name or "").lower(),
+        "legs": lambda v: ((v.near.sec_desc if v.near else ""),
+                           (v.far.sec_desc if v.far else "")),
+        "cost": lambda v: _sortable(getattr(v.decision, "cost_bps", None)),
+        "limit": lambda v: _sortable(getattr(v.decision, "limit_bps", None)),
+        "gap": lambda v: -_inside_bps(v),          # furthest inside first
+        "rolled": lambda v: -(v.done or 0),
+        "state": lambda v: (0 if not v.enabled else
+                            (1 if v.halted_reason else 2), v.name or ""),
+    }
+
+    def _sort_strip(self, key: str) -> None:
+        """Sort by a column, and reverse it on a second click.
+
+        Sorting only changes the order they are listed in. Which section
+        rolls next is decided in the engine and shown as a mark on the row,
+        so re-ordering the table cannot change what trades.
+        """
+        if key not in self.SORT_KEYS:
+            return
+        if self._sort_by == key:
+            if self._sort_down:
+                self._sort_by, self._sort_down = None, False   # back to config
+            else:
+                self._sort_down = True
+        else:
+            self._sort_by, self._sort_down = key, False
+        self._draw_strip(self._last_snapshot) if self._last_snapshot else None
+
+    def _ordered(self, views):
+        if self._sort_by is None:
+            return list(views)
+        try:
+            out = sorted(views, key=self.SORT_KEYS[self._sort_by])
+        except Exception:
+            return list(views)
+        return list(reversed(out)) if self._sort_down else out
+
+    def _strip_double_click(self, event) -> None:
+        """Switch the row under the pointer on or off."""
+        if self.strip.identify_region(event.x, event.y) == "heading":
+            return
+        item = self.strip.identify_row(event.y)
+        if not item:
+            return
+        self.strip.selection_set(item)
+        self._focus_selected()
+        self._toggle_section()
+        return "break"
 
     def _section_note(self, text: str, colour: str) -> None:
         self.section_note.configure(text=text, fg=colour)
@@ -517,17 +613,28 @@ class RollWindow(tk.Toplevel):
         return views[0]
 
     def _focus_selected(self) -> None:
+        """Follow the selected row to its section.
+
+        Through an explicit row -> key map. It used to match the displayed
+        name against the section name, which quietly stopped working the
+        moment the cell gained a marker for which section rolls next: nothing
+        raised, the selection simply stopped doing anything.
+        """
         picked = self.strip.selection()
         if not picked:
             return
-        chosen = self.strip.item(picked[0])["values"]
-        for view in self._views():
-            if view.name == chosen[0]:
-                if view.key != self.focus_key:
-                    self.focus_key = view.key
-                    self._rebuild_rung_rows()
-                    self._reset_limit()
-                break
+        key = self._strip_keys.get(picked[0])
+        if key is None or key == self.focus_key:
+            self._update_enable_button()
+            return
+        if key in {v.key for v in self._views()}:
+            self.focus_key = key
+            self._rebuild_rung_rows()
+            self._reset_limit()
+            # Whatever was last said was about the section that was selected
+            # when it was said. Leaving it up next to another section's name
+            # reads as a complaint about that one.
+            self._section_note("", T.FAINT)
         self._update_enable_button()
 
     def _update_enable_button(self) -> None:
@@ -569,8 +676,11 @@ class RollWindow(tk.Toplevel):
         self.strip.configure(height=max(1, min(len(views) or 1, 6)))
 
         focused = self._focused()
+        ordered = self._ordered(views)
+        next_key = getattr(snap, "next_key", None)
         self.strip.delete(*self.strip.get_children())
-        for view in views:
+        self._strip_keys = {}
+        for view in ordered:
             decision = view.decision
             cost = (f"{money(decision.cost_bps, 1)} bps"
                     if decision is not None and decision.cost_bps is not None
@@ -603,22 +713,35 @@ class RollWindow(tk.Toplevel):
             if view.near is not None and view.far is not None:
                 legs = f"{view.near.sec_desc} -> {view.far.sec_desc}"
 
-            self.strip.insert("", "end", values=(
-                view.name, legs, cost, limit, gap, rolled, state),
-                tags=(tag, view.key))
+            # Which section would go first if a roll fired now. Decided by
+            # the engine, never worked out again here, so the mark and the
+            # section actually chosen cannot drift apart.
+            is_next = next_key is not None and view.key == next_key
+            name = ("> " + view.name) if is_next else ("   " + view.name)
+            tags = [tag, view.key] + (["next"] if is_next else [])
+
+            item = self.strip.insert(
+                "", "end", values=(name, legs, cost, limit, gap, rolled, state),
+                tags=tuple(tags))
+            self._strip_keys[item] = view.key
 
         # Keep the selection on the focused section without re-entering.
         children = self.strip.get_children()
         if focused is not None:
-            for index, view in enumerate(views):
+            for index, view in enumerate(ordered):
                 if view.key == focused.key and index < len(children):
                     if self.strip.selection() != (children[index],):
                         self.strip.selection_set(children[index])
                     break
 
         if len(views) > 1:
-            note = (f"click a row to work on it -- showing {focused.name} below"
-                    if focused else "")
+            how = "click a row to work on it, double-click to switch it on or off"
+            if next_key:
+                how = "> is ready and would roll first.  " + how
+            if self._sort_by:
+                how += (f"   sorted by {self._sort_by}"
+                        + (", reversed" if self._sort_down else ""))
+            note = f"{how} -- showing {focused.name} below" if focused else how
         else:
             # With one roll there is nothing to choose between, so the note
             # says what the card is for instead.
@@ -695,6 +818,13 @@ class RollWindow(tk.Toplevel):
         view = self._focused()
         if view is None:
             return
+        if not view.enabled:
+            # Asked in operator's words before the config layer refuses in
+            # the file's words. Same rule, a sentence you can act on.
+            why = editing.why_not_enable(self.cfg, view.key)
+            if why:
+                self._section_note(why, T.DANGER)
+                return
         try:
             sections = editing.enable(self.cfg, view.key, not view.enabled)
         except editing.EditError as exc:

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Optional, Tuple
 
-from .money import D, money, q4
+from .money import D, floor4, money, q4
 
 BPS = Decimal("10000")
 
@@ -66,8 +66,16 @@ def from_bps(bps: Decimal, reference: Decimal) -> Decimal:
     Quantized to four places, the same resolution prices are held at, so the
     comparison against the roll cost is between two numbers on the same grid
     and a decision can be reproduced exactly from the log.
+
+    Rounded DOWN, never to nearest. A roll cost is the difference of two
+    tick-grid prices, so it always lands exactly on that four-place grid --
+    and a limit that rounded up onto it would accept a cost fractionally
+    above the client's instruction. Measured at up to 0.0000477 rupees a
+    unit, about five paise on a thousand: nothing in money, and the wrong
+    direction. Rounding down can only ever make the app stricter than the
+    instruction, never looser.
     """
-    return q4(D(bps) / BPS * D(reference))
+    return floor4(D(bps) / BPS * D(reference))
 
 
 def tenor_days(near_expiry, far_expiry) -> Optional[int]:

@@ -225,3 +225,48 @@ class TestConfigValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheLimitIsNeverLooserThanAsked(unittest.TestCase):
+    """A limit rounds DOWN onto the price grid, never to nearest.
+
+    A roll cost is the difference of two tick-grid prices, so it always lands
+    exactly on the four-place grid. A limit rounded to nearest can land on
+    that grid from below -- and then a cost sitting exactly on it is accepted
+    although it is above what the client asked for. Found by recomputing the
+    limit in full precision and comparing: up to 0.0000477 rupees a unit,
+    about five paise on a thousand. Nothing in money, the wrong direction in
+    principle, and free to fix.
+    """
+
+    def exact(self, bps, reference):
+        return D(bps) / D(10000) * D(reference)
+
+    def test_it_never_exceeds_the_exact_figure(self):
+        over = []
+        for bps in ("25", "30", "50", "57"):
+            for cents in range(9300000, 9900000, 911):
+                reference = D(cents).scaleb(-5)
+                used = limits.from_bps(D(bps), reference)
+                if used > self.exact(bps, reference):
+                    over.append((bps, reference))
+        self.assertEqual(over, [])
+
+    def test_the_known_case_rounds_down_now(self):
+        """25 bps of 95.98092 is 0.2399523, which used to become 0.2400."""
+        self.assertEqual(limits.from_bps(D("25"), D("95.98092")), D("0.2399"))
+
+    def test_it_stays_on_the_four_place_grid(self):
+        got = limits.from_bps(D("30"), D("95.9562"))
+        self.assertEqual(got.as_tuple().exponent, -4)
+
+    def test_an_exact_figure_is_not_moved(self):
+        """0.2500 is already on the grid; rounding down must not shave it."""
+        self.assertEqual(limits.from_bps(D("25"), D("100")), D("0.2500"))
+
+    def test_the_loss_is_never_more_than_one_grid_step(self):
+        for cents in range(9500000, 9600000, 137):
+            reference = D(cents).scaleb(-5)
+            gap = self.exact("30", reference) - limits.from_bps(D("30"), reference)
+            self.assertGreaterEqual(gap, 0)
+            self.assertLess(gap, D("0.0001"))

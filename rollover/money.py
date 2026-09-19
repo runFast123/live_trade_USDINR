@@ -45,6 +45,16 @@ def q4(value) -> Decimal:
     return D(value).quantize(Q4)
 
 
+def floor4(value) -> Decimal:
+    """Quantize to 4 decimal places, always downwards.
+
+    For a limit rather than a price: rounding a limit to nearest can push it
+    up onto the grid a roll cost lands on, and accept a cost fractionally
+    above what was asked for. Down is the direction that can only be stricter.
+    """
+    return D(value).quantize(Q4, rounding=ROUND_FLOOR)
+
+
 def floor_tick(value, tick: Decimal) -> Decimal:
     """Round down to the nearest tick multiple."""
     value, tick = D(value), D(tick)

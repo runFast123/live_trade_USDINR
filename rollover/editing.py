@@ -188,6 +188,41 @@ def enable(cfg: RollConfig, key: str, on: bool = True) -> List[Dict[str, Any]]:
     return out
 
 
+def why_not_enable(cfg: RollConfig, key: str) -> Optional[str]:
+    """Why this section cannot be switched on, in words for an operator.
+
+    config.validate() refuses in the language of the file -- "has no
+    limit_ladder" -- which is right where the file is what you are looking
+    at, and no use at all on a screen with no file on it. The rule is the
+    same; only the sentence is different. None means it can be switched on.
+    """
+    from dataclasses import replace
+
+    out = []
+    for other in as_sections(cfg):
+        merged = {**{k: getattr(cfg, k) for k in SECTION_OVERRIDES}, **other}
+        if section_key(merged["near_token"], merged["far_token"]) == key:
+            out.append({**other, "enabled": True})
+        else:
+            out.append(other)
+
+    live = [s for s in replace(cfg, sections=out).section_specs() if s.enabled]
+    if len(live) < 2:
+        return None
+    bare = [s.name for s in live if not s.cfg.limit_ladder]
+    if not bare:
+        return None
+
+    names = " and ".join(bare)
+    is_are = "has" if len(bare) == 1 else "have"
+    return (f"{names} {is_are} no limits yet. These sections sell the same "
+            f"near month out of one position, so each needs its own limits "
+            f"before a second one can be switched on -- otherwise the one "
+            f"without any could roll the whole position and leave the other "
+            f"nothing. Select {bare[0]} in the list above, add a limit in "
+            f"ROLL COST AT EACH LIMIT below, press Set limits, then Enable.")
+
+
 def set_limits(cfg: RollConfig, key: str, ladder: List[Dict[str, Any]],
                watch: List[Any]) -> Optional[List[Dict[str, Any]]]:
     """Give one section a new set of limits.

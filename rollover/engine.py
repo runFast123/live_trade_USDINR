@@ -94,6 +94,10 @@ class Snapshot:
     sections: List[SectionView] = field(default_factory=list)
     allocation: str = ""
     allocation_refusal: Optional[str] = None
+    # The section that would roll next if one fired now. Decided by book.pick
+    # in the engine, not worked out again in the window, so the row marked as
+    # next and the section actually chosen cannot drift apart.
+    next_key: Optional[str] = None
 
 
 class _Leg:
@@ -156,6 +160,8 @@ class RollEngine:
         self._last_complaint = ("", 0.0)
         self.near_positions: dict = {}
         self.pools: dict = {}
+        # Which section would roll next, for the window. Never a decision.
+        self._next_key: Optional[str] = None
 
         # The day's budget and any halt have to outlive the process: the
         # updater restarts it, and so does a crash. Loaded last, so it can
@@ -235,6 +241,9 @@ class RollEngine:
         so does progress: a roll that has done 6,000 has still done 6,000.
         """
         before = {section.key: section for section in self.sections}
+        # Whatever was about to roll belonged to the old list. Left alone it
+        # could mark a row that is no longer there, or the wrong one.
+        self._next_key = None
         with self._lock:
             self.sections = [sectionlib.Section(spec, self.account, self.cfg)
                              for spec in self.cfg.section_specs()]
@@ -966,11 +975,8 @@ class RollEngine:
         expiry_day = self._expiry_day()
         candidates = []
         for section in self.sections:
-            if not section.enabled:
-                section.decision, section.report = None, None
-                section.note = "disabled"
-                continue
             if section.near is None or section.far is None:
+                section.decision, section.report = None, None
                 section.note = "contracts not resolved"
                 continue
 
@@ -982,11 +988,28 @@ class RollEngine:
                 continue
 
             cfg = section.cfg
+            # Priced whether or not it is switched on. A section is added to
+            # find out what a roll would cost, and a switched-off one that
+            # showed nothing could not answer that -- so the operator had to
+            # enable it, which is the one thing that lets it sell, to see a
+            # number. Switched off now means it is never a candidate, which is
+            # where the safety actually is, not that it is never priced.
             decision = rule.compute(near_q, far_q, cfg,
                                     days=self.tenor_days(section),
                                     ladder=section.ladder,
                                     progress=section.ladder_progress,
                                     watch=section.watch_limits)
+            section.decision = decision
+            section.quotes = (near_q, far_q)
+
+            if not section.enabled:
+                # No gates: they are about whether this may trade, and it may
+                # not. Running them would fill the row with reasons that are
+                # beside the point.
+                section.report, section.sequence = None, None
+                section.note = "disabled"
+                continue
+
             # The leg order is decided BEFORE the gates, and the same object
             # is handed to both, so the gate and the order that follows cannot
             # disagree. Without that the far touch-size gate would refuse
@@ -995,9 +1018,8 @@ class RollEngine:
             sequence = self._choose_sequence(decision, near_q, far_q, section)
             report = gatelib.evaluate(cfg, section, quotes, decision,
                                       sequence=sequence)
-            section.decision, section.report = decision, report
+            section.report = report
             section.sequence = sequence
-            section.quotes = (near_q, far_q)
 
             candidates.append(book.Candidate(
                 name=section.label(),
@@ -1008,6 +1030,14 @@ class RollEngine:
                 outstanding=section.claim().outstanding))
 
         self._set_account_state()
+        # Who would go first if a roll fired right now. Worked out whether or
+        # not anything is armed, so the window can say which section is next
+        # instead of leaving the operator to work it out from the numbers --
+        # and worked out HERE rather than in the window, so the row marked as
+        # next and the section actually chosen cannot disagree.
+        chosen = book.pick(candidates, expiry_day=expiry_day)
+        self._next_key = getattr(getattr(chosen, "payload", None), "key", None)
+
         first = self.sections[0] if self.sections else None
         near_q = far_q = None
         if first is not None and getattr(first, "quotes", None):
@@ -1017,17 +1047,15 @@ class RollEngine:
                       first.report if first else None)
 
         for section in self.sections:
-            quotes = getattr(section, "quotes", None)
-            if section.recorder is not None and quotes:
-                section.recorder.sample(quotes[0], quotes[1], section.decision,
+            pair = getattr(section, "quotes", None)
+            if section.recorder is not None and pair:
+                section.recorder.sample(pair[0], pair[1], section.decision,
                                         section.report, self.quote_source)
             if section.decision is not None:
                 self._announce_crossing(section.decision, section)
 
         if not self.armed:
             return
-
-        chosen = book.pick(candidates, expiry_day=expiry_day)
         if chosen is None:
             return
 
@@ -1389,6 +1417,7 @@ class RollEngine:
             halted_reason=self.halted_reason,
             quote_source=self.quote_source,
             sections=[self._view(s) for s in self.sections],
+            next_key=self._next_key,
             allocation=self._allocation_line(),
             allocation_refusal=self.allocation_refusal(),
         )

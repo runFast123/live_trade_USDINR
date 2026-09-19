@@ -365,7 +365,13 @@ class TestAddingAndRemovingFromTheWindow(SectionsUICase):
         self.assertFalse(case.window._focused().enabled)
 
         case.window._toggle_section()
-        self.assertIn("no limit_ladder", case.window.section_note.cget("text"))
+        note = case.window.section_note.cget("text")
+        # In the operator's words, not the config file's. There is no file on
+        # this screen, so "limit_ladder" names nothing they can see.
+        self.assertNotIn("limit_ladder", note)
+        self.assertIn("no limits yet", note)
+        self.assertIn("Sep into Oct", note)
+        self.assertIn("Set limits", note)          # what to do about it
         self.assertFalse(case.cfg.sections[0].get("enabled", True))
 
     def test_the_button_says_what_it_would_do(self):
