@@ -245,6 +245,9 @@ class RollConfig:
     # reported rather than ignored, and excluded from save() so they are never
     # written back by a build that does not understand them.
     unknown_keys: list = field(default_factory=list, compare=False, repr=False)
+    # True when the file on disk asked for live orders. The session still
+    # starts in dry run; this only lets the window say why.
+    live_in_file: bool = field(default=False, compare=False, repr=False)
 
     # ---------------------------------------------------------------- loaders
     @classmethod
@@ -273,13 +276,38 @@ class RollConfig:
         # know is not a reason to refuse to trade; it is a reason to say so.
         cfg = cls(**{k: v for k, v in raw.items() if k in known})
         cfg.unknown_keys = unknown
+
+        # Live is a decision about THIS session, made by a person who was
+        # shown what it commits and typed a confirmation. A file cannot make
+        # it. So a file saying live starts in dry run and says so, rather
+        # than sending real orders because of something written on disk
+        # possibly days earlier by a different person for a different reason.
+        if raw.get("dry_run") is False:
+            cfg.dry_run = True
+            cfg.live_in_file = True
+
         cfg.validate()
         return cfg
 
+    # Never written to the file. `unknown_keys` because this build does not
+    # know what they mean; `live_in_file` because it describes the file
+    # rather than the configuration; `dry_run` because it is a decision about
+    # one session and writing it down turns it into a standing instruction.
+    #
+    # That last one was live: Go live sets dry_run False in memory, and the
+    # window saves config.json whenever a limit is edited. So pressing Go
+    # live and then touching any box put "dry_run": false on disk, and the
+    # NEXT launch sent real orders with nobody confirming anything.
+    # Not settings at all: derived from the file or from this build, and
+    # meaningless to write into it. Nothing may put these in config.json.
+    DERIVED = ("unknown_keys", "live_in_file")
+
+    # Not written back. The derived ones above, plus dry_run -- see the note.
+    NOT_SAVED = DERIVED + ("dry_run",)
+
     def save(self, path: str) -> None:
-        # Keys this build did not recognise are deliberately not written back:
-        # it does not know what they mean, so it must not claim to.
-        body = {k: v for k, v in asdict(self).items() if k != "unknown_keys"}
+        body = {k: v for k, v in asdict(self).items()
+                if k not in self.NOT_SAVED}
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(body, fh, indent=2)
 

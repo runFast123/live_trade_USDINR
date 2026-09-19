@@ -234,7 +234,7 @@ class RollWindow(tk.Toplevel):
         T.apply_ttk_theme(self, self.fonts)
 
         self._refresh_id = None
-        self._last_log_count = -1
+        self._last_log_seq = -1
         self._alerts_seen = 0          # so a new ALERT can be heard, not just seen
         self._updates: "queue.Queue[tuple]" = queue.Queue()
         # Last seen price per cell, so a change can be shown rather than just
@@ -1394,7 +1394,17 @@ class RollWindow(tk.Toplevel):
         self._mode_shown = dry
 
         if dry:
-            self.mode_pill.set("DRY RUN, nothing sent", T.WARN, "#2a2008")
+            # A file asking for live is not a confirmation, so the session
+            # starts dry -- but silently overriding what the file says would
+            # be its own kind of lie.
+            if getattr(self.cfg, "live_in_file", False):
+                self.mode_pill.set("DRY RUN (file said live)", T.WARN, "#2a2008")
+                self.log.warn(
+                    "config.json asks for live orders. This session started in "
+                    "DRY RUN because live was not confirmed for it. Press "
+                    "Go live... to send real orders.")
+            else:
+                self.mode_pill.set("DRY RUN, nothing sent", T.WARN, "#2a2008")
         else:
             self.mode_pill.set("LIVE ORDERS", T.DANGER, "#2a0d0b")
 
@@ -2026,16 +2036,25 @@ class RollWindow(tk.Toplevel):
                                       gate.name, gate.detail))
 
     def _draw_log(self) -> None:
-        entries = self.log.recent(300)
-        if len(entries) == self._last_log_count:
+        # Against a count that only ever goes UP, not against how many lines
+        # the buffer is holding. recent() is capped at 300 and the buffer
+        # keeps 500, so "how many are there" stops changing at 300 -- and
+        # from the 300th line of a session this returned early every time:
+        # the pane froze and no alert sounded again for the rest of the run.
+        # Both counters come from the Logbook under its own lock.
+        seq = self.log.sequence
+        if seq == self._last_log_seq:
             return
-        self._last_log_count = len(entries)
+        self._last_log_seq = seq
+        entries = self.log.recent(300)
 
         # Anything that halts, or the cost finally clearing, is worth hearing.
         # The operator is not necessarily looking at the screen.
-        alerts = sum(1 for _, level, _ in entries if level == "ALERT")
+        alerts = self.log.alert_sequence
         if alerts > self._alerts_seen:
-            newest = next((m for _, lvl, m in reversed(entries) if lvl == "ALERT"), "")
+            # From the Logbook, so it is still right after the alert has
+            # scrolled out of the 300 lines on screen.
+            newest = self.log.last_alert
             if "come below the limit" in newest:
                 notify.chime()
             else:

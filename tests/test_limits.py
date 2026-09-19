@@ -452,8 +452,12 @@ class TestTheExampleConfigStaysHonest(unittest.TestCase):
             self.raw = json.load(fh)
 
     def names(self):
+        """Every real setting. RollConfig.DERIVED are not settings -- they
+        are worked out from the file or from this build, and writing them
+        into it would be inventing a control that does not exist."""
         from dataclasses import fields
-        return {f.name for f in fields(RollConfig)} - {"unknown_keys"}
+        return ({f.name for f in fields(RollConfig)}
+                - set(RollConfig.DERIVED))
 
     def test_it_loads(self):
         RollConfig.load(self.path)
@@ -467,6 +471,9 @@ class TestTheExampleConfigStaysHonest(unittest.TestCase):
 
     def test_a_new_install_starts_in_dry_run(self):
         self.assertTrue(RollConfig.load(self.path).dry_run)
+
+    def test_no_derived_field_appears_in_it(self):
+        self.assertEqual(sorted(set(self.raw) & set(RollConfig.DERIVED)), [])
 
     def test_a_new_install_has_not_confirmed_the_quantity_unit(self):
         """It is confirmed per account, not per build."""
