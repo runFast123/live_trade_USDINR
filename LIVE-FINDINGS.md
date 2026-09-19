@@ -280,3 +280,58 @@ Also worth noting: `PENDING` means "order confirmed from exchange", i.e. working
 The evidence recorder can keep running throughout. It needs no order permissions
 and the question it answers — whether the cost ever reaches the client's limit —
 is independent of all of this.
+
+---
+
+## 19 September 2026: a second blocker, found without placing anything
+
+Checked read-only against the live session, on a Saturday with the market
+closed. `get_margin` and `get_funds_view` ask questions; neither sends an
+order, so none of this cost an order attempt.
+
+```
+get_funds_view -> Status: Success
+    CashAvailable   0.0      MarginAvailable  0.0
+    Collateral      0.0      Deposit          0.0
+    MarginUsed      0.0      ODLimit          0.0
+```
+
+**The account is empty.** Every figure is zero.
+
+This is a *second* blocker, independent of the entitlement one above, and it
+was not visible from the probe: the order was rejected on entitlement before
+margin was ever assessed. Enabling segment 13 would not by itself make phase
+3.2 possible — a one lot USDINR roll still has to be funded.
+
+`get_margin` for the two legs returned `{"Status": "Fail", "Reason": "No data
+found"}`. On a closed market that is ambiguous: it may be the segment, or it
+may be that there is nothing to price against out of hours. It should be asked
+again during a session before anything is concluded from it.
+
+### What this did confirm
+
+The margin gate works against the real account, which had never been
+exercised before:
+
+```
+required   None          (the call could not be answered)
+available  0.0
+affordable None          -- "could not be established"
+would a live order be let through?   False
+```
+
+The gate treats unknown as unaffordable and refuses, which is the behaviour
+the design asks for: guessing in the optimistic direction here is how a naked
+short happens. It is the first time that path has been run against live data
+rather than a fixture.
+
+### Where this leaves phase 3
+
+Two things must be true before 3.1 can even be attempted, and neither is code:
+
+1. Choice enables segment 13 on the account.
+2. The account is funded.
+
+Plus a trading day. September stops trading at 12:30 on **28 September**, which
+is six sessions away, so the recommendation in the plan stands and has become
+urgent: roll September by hand this cycle.
