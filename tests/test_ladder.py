@@ -493,7 +493,7 @@ class TestTheEngineRefusesABadLadder(unittest.TestCase):
     def test_a_good_ladder_is_announced(self):
         engine, said = self.build([{"bps": "30", "qty": 10000}])
         self.assertTrue(engine.ladder)
-        self.assertTrue(any("Ladder:" in m for m in said))
+        self.assertTrue(any("ladder:" in m for m in said))
 
 
 class TestConfigValidation(unittest.TestCase):

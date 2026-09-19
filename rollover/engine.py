@@ -18,6 +18,7 @@ from . import ladder as ladderlib
 from . import journal as journallib
 from . import margin as marginlib
 from . import reconcile
+from . import sections as sectionlib
 from . import limits as limitlib
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo, OrderOutcome
@@ -36,23 +37,6 @@ ARMED = "ARMED"
 WORKING = "WORKING"
 DONE = "DONE"
 HALTED = "HALTED"
-
-
-@dataclass
-class SessionState:
-    """What the gates read. Updated only by the engine thread."""
-    logged_in: bool = False
-    near: Optional[InstrumentInfo] = None
-    far: Optional[InstrumentInfo] = None
-    market_open: Optional[bool] = None
-    near_position_qty: Optional[int] = None
-    margin: Optional[object] = None   # margin.Estimate, refreshed on the slow beat
-    clips_done_today: int = 0
-    lots_rolled: int = 0
-    in_flight: bool = False
-    halted_reason: Optional[str] = None
-    scrip_file_date = None          # which day's scrip master is loaded
-    quote_source: str = "starting"  # "live feed" or "polled"
 
 
 @dataclass
@@ -102,7 +86,12 @@ class RollEngine:
         # so the crossing can be announced once rather than every tick.
         self._was_qualifying = False
 
-        self.session = SessionState()
+        # What every section shares, and one Section per configured roll. The
+        # gates read a Section exactly as they read the old session object, so
+        # not a line of gate code changed.
+        self.account = sectionlib.AccountState()
+        self.sections = [sectionlib.Section(spec, self.account, cfg)
+                         for spec in cfg.section_specs()]
 
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -120,18 +109,88 @@ class RollEngine:
         self.store = StateStore(base_dir)
         saved = self.store.load()
         saved = self.store.for_campaign(saved, self.campaign_key())
-        self.ladder = self._build_ladder()
-        self.watch_limits = self._build_watch()
-        self.ladder_progress = dict(saved.ladder_done or {})
-        self.session.clips_done_today = saved.clips_done
-        self.session.lots_rolled = saved.lots_rolled
-        self.session.halted_reason = saved.halted_reason
-        if saved.halted:
+        self.saved = saved
+
+        for section in self.sections:
+            section.ladder = self._build_ladder(section)
+            section.watch_limits = self._build_watch(section)
+            section.load_from(saved.section(section.key))
+
+        # A version 1 file had no sections, so its figures were migrated under
+        # the campaign key. Where that key is not one of ours -- the operator
+        # changed contracts between runs -- the flat figures are still the only
+        # record of today, and the first section adopts them rather than
+        # starting the day again from nothing.
+        if self.sections and not saved.sections and saved.clips_done:
+            self.sections[0].clips_done_today = saved.clips_done
+            self.sections[0].lots_rolled = saved.lots_rolled
+        if saved.halted_reason and not any(s.own_halt for s in self.sections):
+            self.account.halted_reason = saved.halted_reason
+            self.account.halted_at = saved.halted_at
+
+        if len(self.sections) > 1:
+            # Reached only while multi-section execution is being built. The
+            # alternative -- running the first section and ignoring the rest --
+            # would look like it was working.
+            self.account.halted_reason = (
+                f"{len(self.sections)} sections are configured, but this build "
+                "only trades one. Nothing will be sent. Leave a single section "
+                "enabled, or update the app.")
+
+        if self.halted_reason:
             self._state = HALTED
-            self._note = saved.halted_reason
-            log.alert(f"Resumed with a halt still in force: {saved.halted_reason}")
-        elif saved.clips_done:
-            log.info(f"Resumed: {saved.clips_done} clip(s) already done today.")
+            self._note = self.halted_reason
+            log.alert(f"Resumed with a halt still in force: {self.halted_reason}")
+        elif self.sections and self.sections[0].clips_done_today:
+            log.info(f"Resumed: {self.sections[0].clips_done_today} "
+                     "clip(s) already done today.")
+
+    # ------------------------------------------------- the single-roll view
+    # Everything that predates sections reads `engine.session`, `engine.ladder`
+    # and `engine.ladder_progress`. While there is one section those mean the
+    # first section, so the whole existing surface keeps working unchanged and
+    # the refactor can be proved before any new behaviour exists.
+    @property
+    def section(self) -> "sectionlib.Section":
+        return self.sections[0]
+
+    @property
+    def halted_reason(self) -> Optional[str]:
+        """The account halt, or the first section's, whichever is in force."""
+        if self.account.halted_reason:
+            return self.account.halted_reason
+        for section in self.sections:
+            if section.own_halt:
+                return section.own_halt
+        return None
+
+    @property
+    def session(self) -> "sectionlib.Section":
+        return self.sections[0]
+
+    @property
+    def ladder(self):
+        return self.sections[0].ladder
+
+    @ladder.setter
+    def ladder(self, value) -> None:
+        self.sections[0].ladder = value
+
+    @property
+    def ladder_progress(self) -> dict:
+        return self.sections[0].ladder_progress
+
+    @ladder_progress.setter
+    def ladder_progress(self, value: dict) -> None:
+        self.sections[0].ladder_progress = dict(value or {})
+
+    @property
+    def watch_limits(self) -> list:
+        return self.sections[0].watch_limits
+
+    @watch_limits.setter
+    def watch_limits(self, value: list) -> None:
+        self.sections[0].watch_limits = list(value or [])
 
     # --------------------------------------------------------------- controls
     def start(self) -> None:
@@ -198,8 +257,16 @@ class RollEngine:
             self.log.info(f"Disarmed ({reason}).")
 
     def halt(self, reason: str) -> None:
+        """Stop everything. A half rolled position is an account-level fact.
+
+        It is not a property of one campaign: every section sells the same near
+        month into the same uncertainty, so none of them may carry on while the
+        exposure is unknown.
+        """
         with self._lock:
-            self.session.halted_reason = reason
+            self.account.halted_reason = reason
+            self.account.halted_at = (
+                datetime.now().astimezone().isoformat(timespec="seconds"))
             self._armed_until = None
             self._state = HALTED
             self._note = reason
@@ -209,7 +276,10 @@ class RollEngine:
 
     def clear_halt(self) -> None:
         with self._lock:
-            self.session.halted_reason = None
+            self.account.halted_reason = None
+            self.account.halted_at = None
+            for section in self.sections:
+                section.own_halt = None
             self._state = STARTING
             self._note = "halt cleared"
         self.log.info("Halt cleared by operator.")
@@ -342,14 +412,13 @@ class RollEngine:
         try:
             state = DayState(
                 trading_date=date.today().isoformat(),
-                clips_done=self.session.clips_done_today,
-                lots_rolled=self.session.lots_rolled,
-                halted_reason=self.session.halted_reason,
-                halted_at=(datetime.now().astimezone().isoformat(timespec="seconds")
-                           if self.session.halted_reason else None),
+                halted_reason=self.account.halted_reason,
+                halted_at=self.account.halted_at,
                 ladder_campaign=self.campaign_key(),
                 ladder_done=dict(getattr(self, "ladder_progress", {}) or {}),
             )
+            for section in self.sections:
+                section.save_into(state.section(section.key))
             if not self.store.save(state):
                 self.log.warn("Could not write the state file; a restart would "
                               "forget today's clips and any halt.")
@@ -399,42 +468,46 @@ class RollEngine:
     def campaign_key(self) -> str:
         return ladderlib.campaign_key(self.cfg.near_token, self.cfg.far_token)
 
-    def _build_ladder(self) -> "ladderlib.Ladder":
+    def _build_ladder(self, section=None) -> "ladderlib.Ladder":
         """Parse the configured ladder, capped at the limit for this tenor.
 
         A rung looser than the tenor limit would quietly spend more than the
         client's instruction allows, so it is refused. Refusing means running
         without a ladder, on the single limit, which is the safe direction.
         """
-        raw = getattr(self.cfg, "limit_ladder", None)
+        cfg = section.cfg if section is not None else self.cfg
+        where = f"{section.label()}: " if section is not None else ""
+        raw = getattr(cfg, "limit_ladder", None)
         if not raw:
             return ladderlib.Ladder([])
         try:
-            ceiling = self._tenor_ceiling_bps()
-            built = ladderlib.parse(raw, lot_size=self.cfg.expected_lot_size,
+            ceiling = self._tenor_ceiling_bps(cfg, section)
+            built = ladderlib.parse(raw, lot_size=cfg.expected_lot_size,
                                     ceiling_bps=ceiling)
         except Exception as exc:
             self.log.error(
-                f"The ladder in config.json cannot be used ({exc}). Running on "
-                "the single tenor limit instead.")
+                f"{where}the ladder in config.json cannot be used ({exc}). "
+                "Running on the single tenor limit instead.")
             return ladderlib.Ladder([])
 
         if built:
             self.log.info(
-                f"Ladder: {', '.join(r.describe(self.cfg.expected_lot_size) for r in built.rungs)}"
+                f"{where}ladder: "
+                f"{', '.join(r.describe(cfg.expected_lot_size) for r in built.rungs)}"
                 f"  (total {built.total_qty:,})")
         return built
 
-    def _build_watch(self):
+    def _build_watch(self, section=None):
         """Limits priced for comparison only. Never traded, never a ceiling."""
+        cfg = section.cfg if section is not None else self.cfg
         try:
-            return ladderlib.parse_watch(getattr(self.cfg, "watch_limits", None))
+            return ladderlib.parse_watch(getattr(cfg, "watch_limits", None))
         except Exception as exc:
             self.log.warn(f"watch_limits in config.json is unusable ({exc}); "
                           "ignoring it.")
             return []
 
-    def _tenor_ceiling_bps(self, cfg=None):
+    def _tenor_ceiling_bps(self, cfg=None, section=None):
         """The bps limit for this pair of contracts, if it can be determined.
 
         `cfg` lets a caller ask what the ceiling *would* be under a proposed
@@ -446,7 +519,7 @@ class RollEngine:
             return None
         try:
             from .limits import match_tenor, parse_schedule
-            days = self.tenor_days()
+            days = self.tenor_days(section)
             if days is None:
                 return None
             _, bps = match_tenor(days, parse_schedule(cfg.limit_bps_schedule),
@@ -585,14 +658,15 @@ class RollEngine:
         self._persist()
         self.log.warn("Ladder progress reset. The whole campaign is outstanding again.")
 
-    def tenor_days(self) -> Optional[int]:
+    def tenor_days(self, section=None) -> Optional[int]:
         """How far apart the two contracts expire.
 
         The limit depends on this, so changing contracts changes the limit.
         That is the point: a one month roll and a two month roll are not the
         same trade and must not share a number.
         """
-        near, far = self.session.near, self.session.far
+        section = section if section is not None else self.sections[0]
+        near, far = section.near, section.far
         if near is not None and far is not None:
             return limitlib.tenor_days(near.expiry, far.expiry)
 
@@ -601,8 +675,9 @@ class RollEngine:
         # gate, so they are not authoritative -- but they are good enough to
         # know whether a ladder rung is inside the limit for this tenor, and
         # the alternative is no ceiling at all.
-        return limitlib.tenor_days(_expiry(self.cfg.near_expiry),
-                                   _expiry(self.cfg.far_expiry))
+        cfg = section.cfg
+        return limitlib.tenor_days(_expiry(cfg.near_expiry),
+                                   _expiry(cfg.far_expiry))
 
     def _set_source(self, source: str) -> None:
         if source != self.quote_source:
