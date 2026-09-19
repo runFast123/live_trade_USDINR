@@ -33,14 +33,26 @@ COLUMNS = (
 class ContractWindow(tk.Toplevel):
     """`self.ok` is True once both legs are chosen and written to config.json."""
 
-    def __init__(self, master, cfg, log, broker, config_path: str):
+    def __init__(self, master, cfg, log, broker, config_path: str,
+                 apply=None, title=None):
+        """`apply` receives the two chosen contract rows instead of the config
+        being written directly.
+
+        Without it the window does what it always did: set the near and far
+        legs at the top level and save. With it, the caller decides what the
+        choice means -- adding a section, or changing one section's legs
+        without touching the others.
+        """
         super().__init__(master)
         self.cfg = cfg
         self.log = log
         self.broker = broker
         self.config_path = config_path
+        self.apply = apply
+        self._title_override = title
 
         self.ok = False
+        self.chosen = None
         self.rows: List[Dict] = []
         self.by_token: Dict[str, Dict] = {}
         self.near: Optional[Dict] = None
@@ -48,7 +60,7 @@ class ContractWindow(tk.Toplevel):
         self._sort_key = "expiry"
         self._sort_reverse = False
 
-        self.title("Choose the two contracts")
+        self.title(self._title_override or "Choose the two contracts")
         self.configure(bg=T.BG)
         width, height = T.fit(self, 1060, 780)
         self.geometry(f"{width}x{height}+30+24")
@@ -384,6 +396,20 @@ class ContractWindow(tk.Toplevel):
     def _save(self) -> None:
         if not self._validate():
             return
+
+        if self.apply is not None:
+            # The caller decides what this choice means. It raises to refuse,
+            # with a sentence worth showing.
+            try:
+                self.apply(self.near, self.far)
+            except Exception as exc:
+                self._say(str(exc), T.DANGER)
+                return
+            self.chosen = (self.near, self.far)
+            self.ok = True
+            self.destroy()
+            return
+
         self.cfg.near_token = self.near["Token"]
         self.cfg.far_token = self.far["Token"]
         self.cfg.near_expiry = self.near["Expiry"]

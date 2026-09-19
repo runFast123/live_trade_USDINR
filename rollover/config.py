@@ -45,6 +45,15 @@ SECTION_OVERRIDES = ("near_token", "far_token", "near_expiry", "far_expiry",
 SECTION_META = ("name", "enabled")
 
 
+def _as_date(text):
+    """A YYYY-MM-DD string as a date, or None if it is not one."""
+    try:
+        from datetime import datetime
+        return datetime.strptime(str(text).strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def section_key(near_token, far_token) -> str:
     """Stable identity for a section, so its progress survives a restart."""
     return f"{str(near_token or '').strip()}>{str(far_token or '').strip()}"
@@ -502,6 +511,18 @@ class RollConfig:
                         "sections cannot be shown to fit inside the position.")
 
         for spec in specs:
+            # A far leg expiring before the near one is not a roll forward. The
+            # runtime gate catches it from the scrip master, which is
+            # authoritative, but by then the contracts have been chosen and the
+            # app has started; saying so here is saying so while it can still
+            # be corrected.
+            near, far = _as_date(spec.cfg.near_expiry), _as_date(spec.cfg.far_expiry)
+            if near and far and far <= near:
+                errors.append(
+                    f"{spec.name}: the far leg expires {far}, on or before the "
+                    f"near leg's {near}. A roll moves a position forward, so "
+                    "the far contract has to be the later one.")
+
             try:
                 spec.cfg.validate()
             except ConfigError as exc:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import List, Optional, Tuple
 
@@ -42,6 +42,35 @@ HALTED = "HALTED"
 
 
 @dataclass
+class SectionView:
+    """One section, as the screen needs it. Never mutated in place."""
+    key: str
+    name: str
+    index: int
+    enabled: bool
+    near: Optional[InstrumentInfo]
+    far: Optional[InstrumentInfo]
+    near_quote: Optional[Quote]
+    far_quote: Optional[Quote]
+    decision: Optional[rule.RollDecision]
+    report: Optional[gatelib.GateReport]
+    sequence: Optional[object] = None
+    clips_done: int = 0
+    max_clips: int = 1
+    allocated: Optional[int] = None
+    done: int = 0
+    may_sell: Optional[int] = None
+    halted_reason: Optional[str] = None
+    note: str = ""
+
+    @property
+    def outstanding(self) -> Optional[int]:
+        if self.allocated is None:
+            return None
+        return max(0, self.allocated - self.done)
+
+
+@dataclass
 class Snapshot:
     """An immutable view of the world for the screen. Never mutated in place."""
     at: datetime
@@ -58,6 +87,13 @@ class Snapshot:
     clips_done: int = 0
     halted_reason: Optional[str] = None
     quote_source: str = ""
+
+    # Every section, in configured order. The five fields above describe the
+    # first of them and are kept so that everything written before sections
+    # existed goes on working.
+    sections: List[SectionView] = field(default_factory=list)
+    allocation: str = ""
+    allocation_refusal: Optional[str] = None
 
 
 class _Leg:
@@ -1177,6 +1213,33 @@ class RollEngine:
                                 "Go to the terminal immediately.")
 
     # ------------------------------------------------------------- publishing
+    def _view(self, section) -> SectionView:
+        """One section, flattened for the screen."""
+        near_q = far_q = None
+        if getattr(section, "quotes", None):
+            near_q, far_q = section.quotes
+        return SectionView(
+            key=section.key, name=section.label(), index=section.index,
+            enabled=section.enabled,
+            near=section.near, far=section.far,
+            near_quote=near_q, far_quote=far_q,
+            decision=section.decision, report=section.report,
+            sequence=section.sequence,
+            clips_done=section.clips_done_today,
+            max_clips=section.cfg.max_clips_per_day,
+            allocated=section.allocated(), done=section.done(),
+            may_sell=section.near_position_qty,
+            halted_reason=section.halted_reason,
+            note=section.note)
+
+    def _allocation_line(self) -> str:
+        """One line per contended contract, or nothing when none is."""
+        parts = []
+        for token, pool in (self.pools or {}).items():
+            if len(pool.claims) > 1:
+                parts.append(f"{token}: {pool.describe()}")
+        return "   ".join(parts)
+
     def _set_state(self, state: str, note: str) -> None:
         self._state = state
         self._note = note
@@ -1196,8 +1259,11 @@ class RollEngine:
             report=report,
             note=note,
             clips_done=self.session.clips_done_today,
-            halted_reason=self.session.halted_reason,
+            halted_reason=self.halted_reason,
             quote_source=self.quote_source,
+            sections=[self._view(s) for s in self.sections],
+            allocation=self._allocation_line(),
+            allocation_refusal=self.allocation_refusal(),
         )
         with self._lock:
             self._snapshot = snap
