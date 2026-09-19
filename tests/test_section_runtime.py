@@ -271,17 +271,75 @@ class TestTheEngineHoldsExactlyOne(unittest.TestCase):
         engine.halt("HALF ROLLED, short 600")
         self.assertIn("short 600", self.engine().halted_reason)
 
-    def test_two_sections_are_refused_rather_than_half_run(self):
-        """Running the first and ignoring the rest would look like it worked."""
+    def test_two_sections_both_run(self):
         engine = self.engine(sections=[SEP_OCT, SEP_NOV])
         self.assertEqual(len(engine.sections), 2)
-        self.assertIsNotNone(engine.halted_reason)
-        self.assertIn("only trades one", engine.halted_reason)
+        self.assertIsNone(engine.halted_reason)
 
     def test_each_section_still_builds_its_own_ladder(self):
         engine = self.engine(sections=[SEP_OCT, SEP_NOV])
         self.assertEqual([s.ladder.total_qty for s in engine.sections],
                          [10000, 20000])
+
+    def test_arming_is_refused_when_the_sections_do_not_fit(self):
+        """They sell the same September, so the claims must fit inside it."""
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 20000}      # ladders total 30,000
+        engine._share_out()
+        engine.arm()
+
+        self.assertFalse(engine.armed)
+        self.assertTrue(any("Cannot arm" in m for m in self.log.lines))
+        self.assertTrue(any("sold twice" in m for m in self.log.lines))
+
+    def test_arming_is_allowed_when_they_do_fit(self):
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+        engine.arm()
+        self.assertTrue(engine.armed)
+
+    def test_an_unreadable_position_refuses_to_arm(self):
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": None}
+        engine._share_out()
+        engine.arm()
+        self.assertFalse(engine.armed)
+
+    def test_each_section_is_told_what_it_alone_may_sell(self):
+        """The existing position gate then does the rest, unchanged."""
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+
+        # 100,000 held, siblings claiming 20,000 and 10,000 respectively.
+        self.assertEqual(engine.sections[0].near_position_qty, 80000)
+        self.assertEqual(engine.sections[1].near_position_qty, 90000)
+
+    def test_neither_section_may_sell_the_whole_position(self):
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+        for section in engine.sections:
+            self.assertLess(section.near_position_qty, 100000)
+
+    def test_sections_on_different_near_legs_do_not_constrain_each_other(self):
+        other = dict(SEP_NOV, near_token="1800", near_expiry="2026-10-29")
+        engine = self.engine(sections=[SEP_OCT, other])
+        engine.near_positions = {"1769": 10000, "1800": 20000}
+        engine._share_out()
+
+        self.assertEqual(engine.sections[0].near_position_qty, 10000)
+        self.assertEqual(engine.sections[1].near_position_qty, 20000)
+        self.assertIsNone(engine.allocation_refusal())
+
+    def test_the_account_clip_cap_can_stop_both(self):
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV],
+                             max_clips_per_day_account=2)
+        self.assertEqual(engine._account_clips_left(), 2)
+        engine.sections[0].clips_done_today = 1
+        engine.sections[1].clips_done_today = 1
+        self.assertEqual(engine._account_clips_left(), 0)
 
     def test_each_section_claims_its_own_far_leg(self):
         engine = self.engine(sections=[SEP_OCT, SEP_NOV])

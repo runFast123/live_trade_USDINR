@@ -17,6 +17,7 @@ from . import gates as gatelib
 from . import ladder as ladderlib
 from . import journal as journallib
 from . import margin as marginlib
+from . import book
 from . import reconcile
 from . import sections as sectionlib
 from . import limits as limitlib
@@ -102,6 +103,8 @@ class RollEngine:
         self._note = "not started"
         self._last_slow_refresh = 0.0
         self._last_complaint = ("", 0.0)
+        self.near_positions: dict = {}
+        self.pools: dict = {}
 
         # The day's budget and any halt have to outlive the process: the
         # updater restarts it, and so does a crash. Loaded last, so it can
@@ -127,15 +130,6 @@ class RollEngine:
         if saved.halted_reason and not any(s.own_halt for s in self.sections):
             self.account.halted_reason = saved.halted_reason
             self.account.halted_at = saved.halted_at
-
-        if len(self.sections) > 1:
-            # Reached only while multi-section execution is being built. The
-            # alternative -- running the first section and ignoring the rest --
-            # would look like it was working.
-            self.account.halted_reason = (
-                f"{len(self.sections)} sections are configured, but this build "
-                "only trades one. Nothing will be sent. Leave a single section "
-                "enabled, or update the app.")
 
         if self.halted_reason:
             self._state = HALTED
@@ -219,7 +213,7 @@ class RollEngine:
         Used when the operator changes the legs. The day's clip count is kept,
         so switching contracts cannot be used to get around the daily budget.
         """
-        if self.session.halted_reason:
+        if self.halted_reason:
             # Changing contracts is not a way to make a halt go away. Whatever
             # is wrong with the position is still wrong.
             self.log.warn("Not restarting: a halt is in force. Clear it first.")
@@ -238,16 +232,34 @@ class RollEngine:
         self.start()
 
     def arm(self) -> None:
-        """Allow the next qualifying quote to trade. Expires on its own."""
+        """Allow the next qualifying quote to trade. Expires on its own.
+
+        With more than one section this is also where the allocation is
+        settled. The sections sell the same near month, so what each may roll
+        has to fit inside what is actually held -- and that is established
+        before anything is armed rather than discovered when the second order
+        is rejected.
+        """
+        refusal = self.allocation_refusal()
+        if refusal:
+            self.log.alert("Cannot arm: " + refusal)
+            return
+
         with self._lock:
-            if self.session.halted_reason:
+            if self.halted_reason:
                 self.log.warn("Cannot arm while halted.")
                 return
             self._armed_until = time.monotonic() + self.cfg.arm_timeout_sec
+
+        working = [s for s in self.sections if s.enabled]
         self.log.info(
-            f"ARMED for {self.cfg.arm_timeout_sec}s "
+            f"ARMED for {self.cfg.arm_timeout_sec}s across {len(working)} "
+            f"section(s) "
             f"({'dry run, nothing will be sent' if self.cfg.dry_run else 'LIVE ORDERS'})"
         )
+        for token, pool in (self.pools or {}).items():
+            if len(pool.claims) > 1:
+                self.log.info(f"  near {token}: {pool.describe()}")
 
     def disarm(self, reason: str = "operator") -> None:
         with self._lock:
@@ -316,18 +328,20 @@ class RollEngine:
                 "Run the app with --find USDINR to list the contracts and their tokens."
             )
 
-        self.session.near = self.broker.instrument(self.cfg.near_token)
-        self.session.far = self.broker.instrument(self.cfg.far_token)
+        known = {}
+        for section in self.sections:
+            cfg = section.cfg
+            section.near = self.broker.instrument(cfg.near_token)
+            section.far = self.broker.instrument(cfg.far_token)
+            known[section.near.token] = section.near
+            known[section.far.token] = section.far
 
         # The scrip master states the price scale and the tick for each
         # contract, so the quote reader checks a declared scale instead of
-        # guessing one.
-        self.reader.set_instruments({
-            self.session.near.token: self.session.near,
-            self.session.far.token: self.session.far,
-        })
+        # guessing one. Sections that share a leg share one entry.
+        self.reader.set_instruments(known)
 
-        self.session.scrip_file_date = self.broker.scrip_file_date
+        self.account.scrip_file_date = self.broker.scrip_file_date
 
         if self.cfg.use_live_feed:
             self.feed.start(self.broker.client,
@@ -346,20 +360,21 @@ class RollEngine:
             if self.broker.refresh_scrip_master_if_stale():
                 # New day, new file: the contracts must be read again, since
                 # their expiries and circuit limits have all moved.
-                self.session.near = self.broker.instrument(self.cfg.near_token)
-                self.session.far = self.broker.instrument(self.cfg.far_token)
-                self.reader.set_instruments({
-                    self.session.near.token: self.session.near,
-                    self.session.far.token: self.session.far,
-                })
-                self.session.scrip_file_date = self.broker.scrip_file_date
+                known = {}
+                for section in self.sections:
+                    cfg = section.cfg
+                    section.near = self.broker.instrument(cfg.near_token)
+                    section.far = self.broker.instrument(cfg.far_token)
+                    known[section.near.token] = section.near
+                    known[section.far.token] = section.far
+                self.reader.set_instruments(known)
+                self.account.scrip_file_date = self.broker.scrip_file_date
                 self.log.info("Contracts re-read from the new scrip master.")
         except Exception as exc:
             self.log.error(f"Could not refresh the scrip master: {exc}")
 
-        self.session.market_open = self.broker.market_open()
-        if self.cfg.require_position and self.session.near:
-            self.session.near_position_qty = self.broker.long_qty(self.session.near.token)
+        self.account.market_open = self.broker.market_open()
+        self._read_positions()
 
         # Margin moves with the market, so it is refreshed on the slow beat
         # rather than every tick. This is the screen's copy; the one that
@@ -399,10 +414,11 @@ class RollEngine:
             elapsed = time.monotonic() - cycle_started
             self._stop.wait(max(0.1, self.cfg.poll_interval_sec - elapsed))
 
-    def _count_clip(self, qty: int) -> None:
+    def _count_clip(self, qty: int, section=None) -> None:
         """Record a completed clip, on disk as well as in memory."""
-        self.session.clips_done_today += 1
-        self.session.lots_rolled += int(qty or 0)
+        section = section if section is not None else self.sections[0]
+        section.clips_done_today += 1
+        section.lots_rolled += int(qty or 0)
         self._persist()
 
     def _persist(self) -> None:
@@ -425,7 +441,7 @@ class RollEngine:
         except Exception as exc:
             self.log.warn(f"Could not write the state file: {exc}")
 
-    def _announce_crossing(self, decision) -> None:
+    def _announce_crossing(self, decision, section=None) -> None:
         """Say something the first time the cost clears the limit.
 
         With a tight limit the qualifying windows are rare and brief, and the
@@ -466,6 +482,7 @@ class RollEngine:
 
     # ---- the ladder -------------------------------------------------------
     def campaign_key(self) -> str:
+        """The first section's pair, for the version 1 state file only."""
         return ladderlib.campaign_key(self.cfg.near_token, self.cfg.far_token)
 
     def _build_ladder(self, section=None) -> "ladderlib.Ladder":
@@ -556,23 +573,25 @@ class RollEngine:
             else:
                 self.log.info(f"Trade book confirms the {leg} leg: {traded}.")
 
-    def _credit_rung(self, decision, qty: int) -> None:
+    def _credit_rung(self, decision, qty: int, section=None) -> None:
         """Record a fill against the rung that was being worked."""
+        section = section if section is not None else self.sections[0]
         rung = getattr(decision, "active_rung", None)
-        if rung is None or not self.ladder or qty <= 0:
+        if rung is None or not section.ladder or qty <= 0:
             return
-        self.ladder_progress = self.ladder.credit(
-            self.ladder_progress, rung.rung, qty)
+        section.ladder_progress = section.ladder.credit(
+            section.ladder_progress, rung.rung, qty)
         # Write it now. _count_clip persists just before this runs, so without
         # a save here a credit only reached disk on the *next* clip -- and a
         # restart forgot the last one completed, which means rolling that
         # quantity a second time.
         self._persist()
-        done = self.ladder.done_total(self.ladder_progress)
+        done = section.ladder.done_total(section.ladder_progress)
         self.log.info(
-            f"Ladder: {qty:,} credited to the {money(rung.rung.bps, 0)} bps rung; "
-            f"{done:,} of {self.ladder.total_qty:,} rolled, "
-            f"{self.ladder.remaining_total(self.ladder_progress):,} left.")
+            f"{section.label()}: {qty:,} credited to the "
+            f"{money(rung.rung.bps, 0)} bps rung; {done:,} of "
+            f"{section.ladder.total_qty:,} rolled, "
+            f"{section.ladder.remaining_total(section.ladder_progress):,} left.")
 
     def cancel_all(self) -> Tuple[int, int, Optional[str]]:
         """Cancel every order still live on either leg.
@@ -584,7 +603,9 @@ class RollEngine:
         if self.cfg.dry_run:
             return 0, 0, None
 
-        tokens = [t for t in (self.cfg.near_token, self.cfg.far_token) if t]
+        # Every contract any section trades, because cancel-all means all.
+        tokens = sorted({t for section in self.sections
+                         for t in section.tokens()})
         live = self.broker.working_orders(tokens)
         if live is None:
             return 0, 0, ("the order book could not be read, so it is not known "
@@ -699,6 +720,65 @@ class RollEngine:
         self._last_complaint = (message, now)
         getattr(self.log, level)(message)
 
+    def _read_positions(self) -> None:
+        """The near-leg position, once per distinct contract.
+
+        Sections that sell the same month share one reading. Asking twice
+        would cost two calls and, worse, could return two different numbers a
+        moment apart -- and the allocation arithmetic is only sound if every
+        section is dividing up the same figure.
+        """
+        self.near_positions = {}
+        if not self.cfg.require_position:
+            return
+        for token in {s.cfg.near_token for s in self.sections if s.cfg.near_token}:
+            try:
+                self.near_positions[token] = self.broker.long_qty(token)
+            except Exception as exc:
+                self.log.warn(f"Could not read the position in {token}: {exc}")
+                self.near_positions[token] = None
+
+    def _share_out(self) -> None:
+        """Give each section what it may sell, after its siblings' claims.
+
+        This is what makes the existing position gate do the right thing. It
+        already refuses a clip larger than the position it is handed; hand it
+        what is left once the other sections' allocations are set aside, and it
+        refuses to sell into those too -- without the gate knowing sections
+        exist.
+        """
+        claims = [s.claim() for s in self.sections]
+        self.pools = book.pools(claims, self.near_positions)
+        for section, claim in zip(self.sections, claims):
+            if not self.cfg.require_position:
+                section.near_position_qty = None
+                continue
+            section.near_position_qty = book.sellable(
+                claims, claim, self.near_positions.get(claim.near_token))
+
+    def allocation_refusal(self) -> Optional[str]:
+        """Why the sections cannot be armed together, or None."""
+        for token, pool in (self.pools or {}).items():
+            why = pool.refusal()
+            if why:
+                return f"near contract {token}: {why}"
+        return None
+
+    def _expiry_day(self, section=None) -> bool:
+        """True when the near contract of any section expires today.
+
+        Asked of the account rather than one section, because the sections in
+        contention are the ones selling the same near month, and it is that
+        month running out that changes what matters.
+        """
+        today = date.today()
+        wanted = self.sections if section is None else [section]
+        for candidate in wanted:
+            near = candidate.near
+            if near is not None and near.expiry == today:
+                return True
+        return False
+
     def _tick(self, tokens: List[str]) -> None:
         now = time.monotonic()
         if now - self._last_slow_refresh > 15:
@@ -707,39 +787,114 @@ class RollEngine:
 
         quotes = self._read_quotes(tokens)
         self._last_complaint = ("", 0.0)
-        near_q = quotes[self.session.near.token]
-        far_q = quotes[self.session.far.token]
-        decision = rule.compute(near_q, far_q, self.cfg, days=self.tenor_days(),
-                                ladder=self.ladder,
-                                progress=self.ladder_progress,
-                                watch=self.watch_limits)
-        report = gatelib.evaluate(self.cfg, self.session, quotes, decision)
+        self._share_out()
 
-        if self.session.halted_reason:
-            self._set_state(HALTED, self.session.halted_reason)
-        elif self.armed:
-            self._set_state(ARMED, "armed, waiting for a qualifying quote")
-        elif self.session.clips_done_today >= self.cfg.max_clips_per_day:
-            self._set_state(DONE, "the day's clips are done")
-        else:
-            self._set_state(WATCHING, "watching both legs")
+        expiry_day = self._expiry_day()
+        candidates = []
+        for section in self.sections:
+            if not section.enabled:
+                section.decision, section.report = None, None
+                section.note = "disabled"
+                continue
+            if section.near is None or section.far is None:
+                section.note = "contracts not resolved"
+                continue
 
-        self._publish(near_q, far_q, decision, self._note, report)
+            near_q = quotes.get(section.near.token)
+            far_q = quotes.get(section.far.token)
+            if near_q is None or far_q is None:
+                section.decision, section.report = None, None
+                section.note = "no quote"
+                continue
 
-        if self.recorder is not None:
-            self.recorder.sample(near_q, far_q, decision, report, self.quote_source)
-        self._announce_crossing(decision)
+            cfg = section.cfg
+            decision = rule.compute(near_q, far_q, cfg,
+                                    days=self.tenor_days(section),
+                                    ladder=section.ladder,
+                                    progress=section.ladder_progress,
+                                    watch=section.watch_limits)
+            report = gatelib.evaluate(cfg, section, quotes, decision)
+            section.decision, section.report = decision, report
+            section.quotes = (near_q, far_q)
+
+            candidates.append(book.Candidate(
+                name=section.label(),
+                cost_bps=decision.cost_bps,
+                limit_bps=decision.limit_bps,
+                qualifies=bool(decision.qualifies and report.ok),
+                payload=section,
+                outstanding=section.claim().outstanding))
+
+        self._set_account_state()
+        first = self.sections[0] if self.sections else None
+        near_q = far_q = None
+        if first is not None and getattr(first, "quotes", None):
+            near_q, far_q = first.quotes
+        self._publish(near_q, far_q,
+                      first.decision if first else None, self._note,
+                      first.report if first else None)
+
+        if self.recorder is not None and near_q is not None and far_q is not None:
+            self.recorder.sample(near_q, far_q, first.decision, first.report,
+                                 self.quote_source)
+        for section in self.sections:
+            if section.decision is not None:
+                self._announce_crossing(section.decision, section)
 
         if not self.armed:
             return
-        if not report.ok:
+
+        chosen = book.pick(candidates, expiry_day=expiry_day)
+        if chosen is None:
             return
 
+        if len(candidates) > 1:
+            self.log.info("Sections:")
+            for line in book.explain(candidates, chosen,
+                                     expiry_day=expiry_day).splitlines():
+                self.log.info(line)
+
+        section = chosen.payload
         self.disarm("condition met, firing")
-        self._execute(decision, near_q, far_q)
+        near_q, far_q = section.quotes
+        self._execute(section.decision, near_q, far_q, section=section)
+
+    def _set_account_state(self) -> None:
+        """One state for the window, from however many sections there are."""
+        if self.halted_reason:
+            self._set_state(HALTED, self.halted_reason)
+            return
+        if self.armed:
+            self._set_state(ARMED, "armed, waiting for a qualifying quote")
+            return
+
+        working = [s for s in self.sections if s.enabled]
+        if working and all(s.clips_done_today >= s.cfg.max_clips_per_day
+                           for s in working):
+            self._set_state(DONE, "the day's clips are done")
+            return
+        if self._account_clips_left() <= 0:
+            self._set_state(DONE, "the account's clips for the day are done")
+            return
+        self._set_state(WATCHING, "watching both legs" if len(working) < 2
+                        else f"watching {len(working)} sections")
+
+    def _account_clips_left(self) -> int:
+        """How many clips the account may still do today, across all sections.
+
+        Two sections each allowed one clip a day means the ACCOUNT does two
+        where it used to do one. That follows from asking for two sections that
+        both trade, but it does not leap off the page, so it can be capped.
+        """
+        cap = self.cfg.max_clips_per_day_account
+        if cap is None:
+            return 1 if any(s.enabled for s in self.sections) else 0
+        done = sum(s.clips_done_today for s in self.sections)
+        return max(0, int(cap) - done)
 
     # -------------------------------------------------------------- execution
-    def _execute(self, decision: rule.RollDecision, near_q: Quote, far_q: Quote) -> None:
+    def _execute(self, decision: rule.RollDecision, near_q: Quote, far_q: Quote,
+                 section=None) -> None:
         """Sell the near leg, confirm, then buy the far leg for exactly what filled.
 
         The near leg goes first on purpose. If the second leg fails after the
@@ -747,11 +902,13 @@ class RollEngine:
         which can be corrected. Buying the far leg first would leave it long
         two contracts with one of them about to expire.
         """
-        self.session.in_flight = True
-        self._set_state(WORKING, "sending the near leg")
-        self.log.info("--- ROLL ---")
+        section = section if section is not None else self.sections[0]
+        cfg = section.cfg
+        self.account.in_flight = True
+        self._set_state(WORKING, f"{section.label()}: sending the near leg")
+        self.log.info(f"--- ROLL: {section.label()} ---")
         self.log.info(decision.describe().replace("\n", " | "))
-        self.journal.decision(decision, dry_run=self.cfg.dry_run, armed=True)
+        self.journal.decision(decision, dry_run=cfg.dry_run, armed=True)
 
         # Read before anything is sent. Both are the baseline for afterwards:
         # the position book says what the account held, the trade book says
@@ -759,9 +916,9 @@ class RollEngine:
         # can tell our fills apart from everyone else's.
         before_positions = None
         before_trades = None
-        if not self.cfg.dry_run:
+        if not cfg.dry_run:
             before_positions = reconcile.capture(
-                self.broker, self.cfg.near_token, self.cfg.far_token)
+                self.broker, cfg.near_token, cfg.far_token)
             before_trades = self.broker._trade_snapshot()
             self.log.info(f"Before the roll: {before_positions.describe()}")
 
@@ -772,10 +929,10 @@ class RollEngine:
             estimate = marginlib.estimate(
                 self.broker, self.cfg.near_token, self.cfg.far_token,
                 decision.qty)
-            self.session.margin = estimate
+            self.account.margin = estimate
             self.journal.margin(estimate, decision.qty)
             if estimate.affordable is not True:
-                self.session.in_flight = False
+                self.account.in_flight = False
                 self.disarm("margin")
                 self.log.alert(
                     "NOT SENDING: " + (estimate.describe() if estimate.known
@@ -786,20 +943,20 @@ class RollEngine:
 
         try:
             leg1 = self.broker.place_leg(
-                self.session.near, SELL, decision.qty, decision.sell_limit,
+                section.near, SELL, decision.qty, decision.sell_limit,
                 "leg 1 near SELL")
             self.log.info(f"leg 1 result: {leg1.detail}")
-            self.journal.order("near", SELL, self.cfg.near_token, decision.qty,
+            self.journal.order("near", SELL, cfg.near_token, decision.qty,
                                decision.sell_limit, leg1)
 
-            if self.cfg.dry_run:
+            if cfg.dry_run:
                 leg2_price = decision.buy_limit
                 self.log.info(
                     f"DRY RUN, not sent -- leg 2 far BUY {decision.qty} of "
-                    f"{self.session.far.token} at {money(leg2_price)}")
+                    f"{section.far.token} at {money(leg2_price)}")
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
-                self._count_clip(decision.qty)
-                self._credit_rung(decision, decision.qty)
+                self._count_clip(decision.qty, section)
+                self._credit_rung(decision, decision.qty, section)
                 return
 
             if not leg1.certain:
@@ -814,10 +971,10 @@ class RollEngine:
 
             self._set_state(WORKING, "sending the far leg")
             leg2 = self.broker.place_leg(
-                self.session.far, BUY, leg1.filled_qty, decision.buy_limit,
+                section.far, BUY, leg1.filled_qty, decision.buy_limit,
                 "leg 2 far BUY")
             self.log.info(f"leg 2 result: {leg2.detail}")
-            self.journal.order("far", BUY, self.cfg.far_token, leg1.filled_qty,
+            self.journal.order("far", BUY, cfg.far_token, leg1.filled_qty,
                                decision.buy_limit, leg2)
 
             if leg2.fully_filled:
@@ -834,7 +991,7 @@ class RollEngine:
                 if verdict.contradicted:
                     # Count the clip before halting: whatever else is wrong,
                     # this much was sent, and the daily budget must reflect it.
-                    self._count_clip(leg2.filled_qty)
+                    self._count_clip(leg2.filled_qty, section)
                     self.halt("BOTH LEGS REPORTED FILLED, BUT " + verdict.detail)
                     return
                 if verdict.checked:
@@ -842,8 +999,8 @@ class RollEngine:
                 else:
                     self.log.warn(verdict.detail)
 
-                self._count_clip(leg2.filled_qty)
-                self._credit_rung(decision, leg2.filled_qty)
+                self._count_clip(leg2.filled_qty, section)
+                self._credit_rung(decision, leg2.filled_qty, section)
                 self.log.info(
                     f"ROLL COMPLETE: sold {leg1.filled_qty} near, bought {leg2.filled_qty} far, "
                     f"at a booked cost near {money(decision.roll_cost)} per unit.")
@@ -858,7 +1015,7 @@ class RollEngine:
                 return
 
             short_by = leg1.filled_qty - leg2.filled_qty
-            self._handle_leg2_failure(leg1, leg2, short_by, near_q)
+            self._handle_leg2_failure(leg1, leg2, short_by, near_q, section)
 
         except Exception as exc:
             # Anything unexpected in here can have left a leg filled. Without
@@ -872,16 +1029,18 @@ class RollEngine:
             self.log.error(f"Execution failed after the roll had started: {exc!r}")
 
         finally:
-            self.session.in_flight = False
+            self.account.in_flight = False
 
     def _handle_leg2_failure(self, leg1: OrderOutcome, leg2: OrderOutcome,
-                             short_by: int, near_q: Quote) -> None:
+                             short_by: int, near_q: Quote, section=None) -> None:
+        section = section if section is not None else self.sections[0]
         message = (
-            f"HALF ROLLED. The near leg sold {leg1.filled_qty} units but the far leg "
+            f"{section.label()}: HALF ROLLED. The near leg sold "
+            f"{leg1.filled_qty} units but the far leg "
             f"only bought {leg2.filled_qty}. You are short {short_by} units of the "
             f"intended position. Far leg detail: {leg2.detail}"
         )
-        if self.ladder:
+        if section.ladder:
             # Crediting a rung from a half-rolled clip would be a guess in one
             # direction or the other, and the position has to be reconciled by
             # hand regardless. Say so rather than quietly picking a number.
@@ -900,7 +1059,7 @@ class RollEngine:
         self.log.alert(f"Auto unwind: buying back {short_by} of the near contract "
                        f"at {money(unwind_price)}")
         undo = self.broker.place_leg(
-            self.session.near, BUY, short_by, unwind_price, "unwind near BUY")
+            section.near, BUY, short_by, unwind_price, "unwind near BUY")
         if undo.fully_filled:
             self.halt(message + " The near leg was bought back, so the position is "
                                 "roughly where it started. No roll happened.")
