@@ -10,7 +10,8 @@ from __future__ import annotations
 import unittest
 
 from rollover.book import (Candidate, Claim, allocation,
-                           claims_from, explain, pick)
+                           claims_from, explain, pick, pools,
+                           sellable)
 from rollover.money import D
 
 
@@ -175,6 +176,96 @@ class TestAnUnreadablePosition(unittest.TestCase):
         text = allocation([claim("a", 30000)], held=None).describe()
         self.assertIn("not known", text)
         self.assertNotIn("fits", text.replace("not known whether that fits", ""))
+
+
+class TestSectionsOnlyCompeteOverTheSameContract(unittest.TestCase):
+    """Rolling September and rolling October are independent campaigns."""
+
+    def setUp(self):
+        self.sep_oct = Claim("Sep->Oct", "1769", "OCT", total=30000, done=0)
+        self.sep_nov = Claim("Sep->Nov", "1769", "NOV", total=40000, done=0)
+        self.oct_dec = Claim("Oct->Dec", "1800", "DEC", total=50000, done=0)
+        self.all = [self.sep_oct, self.sep_nov, self.oct_dec]
+        self.held = {"1769": 100000, "1800": 60000}
+
+    def test_one_pool_per_near_contract(self):
+        got = pools(self.all, self.held)
+        self.assertEqual(sorted(got), ["1769", "1800"])
+
+    def test_only_the_same_near_leg_is_summed(self):
+        got = pools(self.all, self.held)
+        self.assertEqual(got["1769"].outstanding, 70000)
+        self.assertEqual(got["1800"].outstanding, 50000)
+
+    def test_an_overdrawn_pool_does_not_condemn_a_healthy_one(self):
+        got = pools(self.all, {"1769": 10000, "1800": 60000})
+        self.assertFalse(got["1769"].fits)
+        self.assertTrue(got["1800"].fits)
+
+    def test_a_contract_with_no_position_reading_is_unknown(self):
+        got = pools(self.all, {"1769": 100000})
+        self.assertIsNone(got["1800"].fits)
+
+    def test_nothing_in_gives_nothing_out(self):
+        self.assertEqual(pools([], {}), {})
+        self.assertEqual(pools(None, None), {})
+
+
+class TestWhatThisSectionMaySell(unittest.TestCase):
+    """The number that makes the existing position gate do the right thing.
+
+    The gate already refuses to sell a clip larger than the position it is
+    given. Hand it what is left after the other sections' claims and it starts
+    refusing to sell into their allocation too, without the gate knowing
+    sections exist at all.
+    """
+
+    def setUp(self):
+        self.sep_oct = Claim("Sep->Oct", "1769", "OCT", total=30000, done=0)
+        self.sep_nov = Claim("Sep->Nov", "1769", "NOV", total=40000, done=0)
+        self.all = [self.sep_oct, self.sep_nov]
+
+    def test_a_section_may_not_sell_its_siblings_allocation(self):
+        self.assertEqual(sellable(self.all, self.sep_oct, 100000), 60000)
+        self.assertEqual(sellable(self.all, self.sep_nov, 100000), 70000)
+
+    def test_the_two_together_exceed_the_position_which_is_the_point(self):
+        """Neither may sell it all, and no order can consume both shares."""
+        a = sellable(self.all, self.sep_oct, 100000)
+        b = sellable(self.all, self.sep_nov, 100000)
+        self.assertGreater(a + b, 100000)
+        self.assertLess(a, 100000)
+        self.assertLess(b, 100000)
+
+    def test_a_sibling_that_has_finished_reserves_nothing(self):
+        done = Claim("Sep->Nov", "1769", "NOV", total=40000, done=40000)
+        self.assertEqual(sellable([self.sep_oct, done], self.sep_oct, 100000),
+                         100000)
+
+    def test_a_lone_section_may_sell_the_whole_position(self):
+        self.assertEqual(sellable([self.sep_oct], self.sep_oct, 100000), 100000)
+
+    def test_a_section_selling_a_different_contract_reserves_nothing(self):
+        other = Claim("Oct->Dec", "1800", "DEC", total=90000, done=0)
+        self.assertEqual(sellable([self.sep_oct, other], self.sep_oct, 100000),
+                         100000)
+
+    def test_an_uncapped_sibling_leaves_nothing_guaranteed(self):
+        """It could take all of it, so none of it is spoken for by this one."""
+        greedy = Claim("Sep->Nov", "1769", "NOV", total=None, done=0)
+        self.assertEqual(sellable([self.sep_oct, greedy], self.sep_oct, 100000), 0)
+
+    def test_an_unreadable_position_stays_unreadable(self):
+        """The gate already treats unknown as a failure, not as permission."""
+        self.assertIsNone(sellable(self.all, self.sep_oct, None))
+
+    def test_siblings_claiming_more_than_is_held_leave_nothing(self):
+        big = Claim("Sep->Nov", "1769", "NOV", total=200000, done=0)
+        self.assertEqual(sellable([self.sep_oct, big], self.sep_oct, 100000), 0)
+
+    def test_it_never_returns_a_negative(self):
+        big = Claim("Sep->Nov", "1769", "NOV", total=999999, done=0)
+        self.assertGreaterEqual(sellable([self.sep_oct, big], self.sep_oct, 1), 0)
 
 
 class TestWhichSectionTrades(unittest.TestCase):

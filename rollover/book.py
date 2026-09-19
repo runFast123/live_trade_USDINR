@@ -156,6 +156,50 @@ def allocation(claims: List[Claim], held: Optional[int]) -> Allocation:
     return Allocation(claims=list(claims or []), held=held)
 
 
+def pools(claims: List[Claim],
+          positions: Dict[str, Optional[int]]) -> Dict[str, Allocation]:
+    """One allocation per near contract.
+
+    Sections only compete when they sell the same thing. Rolling September and
+    rolling October are two independent campaigns and neither constrains the
+    other, so the arithmetic is done per near token rather than across the
+    whole book.
+    """
+    grouped: Dict[str, List[Claim]] = {}
+    for claim in (claims or []):
+        grouped.setdefault(claim.near_token, []).append(claim)
+    return {token: allocation(group, (positions or {}).get(token))
+            for token, group in grouped.items()}
+
+
+def sellable(claims: List[Claim], me: Claim,
+             position: Optional[int]) -> Optional[int]:
+    """How much of the position this section may sell, after its siblings.
+
+    This is the number that makes the existing position gate ask the right
+    question without the gate changing at all. It already refuses to sell a
+    clip larger than the position it is given; give it what is left after the
+    other sections' claims, and it refuses to sell into their allocation too.
+
+    None means it could not be established, which the gate already treats as a
+    failure rather than as permission.
+    """
+    siblings = [c for c in (claims or [])
+                if c.near_token == me.near_token and c is not me]
+
+    # A sibling with no cap could take all of it, so nothing is reserved for
+    # this one. Zero rather than None: the position is known, and the honest
+    # answer is that none of it is spoken for by this section.
+    if any(s.uncapped for s in siblings):
+        return 0
+
+    if position is None:
+        return None
+
+    reserved = sum(s.outstanding for s in siblings)
+    return max(0, position - reserved)
+
+
 @dataclass
 class Candidate:
     """A section that could trade on this tick, and how well it is doing."""
