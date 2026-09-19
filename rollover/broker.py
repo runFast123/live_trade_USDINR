@@ -8,6 +8,8 @@ gates as a failure. Nothing here guesses.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 import urllib.error
@@ -328,10 +330,55 @@ class Broker:
             base_url=self.cfg.base_url.strip(),
         )
 
+    def account_fingerprint(self) -> str:
+        """Which account a session belongs to, without storing the secrets.
+
+        A hash, so nothing identifying is written to a file that sits beside
+        the app. It covers everything that decides WHICH account the broker
+        will act on: the host, the vendor, the login and the key.
+        """
+        import hashlib
+
+        parts = "|".join(str(getattr(self.cfg, name, "") or "").strip()
+                         for name in ("base_url", "vendor_id", "mobile_no",
+                                      "api_key"))
+        return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:32]
+
     def resume(self, session_path: str) -> bool:
-        """Reuse a session saved earlier today. False means a fresh login is needed."""
+        """Reuse a session saved earlier today. False means a fresh login is needed.
+
+        The saved session is checked against the credentials in force now, not
+        only against the date. The vendor's loader looks at the date alone, so
+        changing the account and restarting on the same day silently reused
+        the PREVIOUS account's token: the app would say it was logged in, read
+        that account's funds and positions, and send that account's orders,
+        while the operator believed they were on the new one. Observed when
+        the credentials and the host were both changed mid-afternoon.
+        """
         if self.client is None:
             self.build_client()
+
+        mine = self.account_fingerprint()
+        try:
+            with open(session_path, encoding="utf-8") as handle:
+                saved = json.load(handle).get("account")
+        except (OSError, ValueError):
+            saved = None
+
+        if saved != mine:
+            # Unstamped sessions are from a build before this existed. Refuse
+            # them too: a fresh login costs one OTP, and being wrong here
+            # means trading the wrong account.
+            self.log.warn(
+                "The saved session does not belong to the account configured "
+                "now" + ("" if saved else " (it predates this check)")
+                + ". Logging in again rather than reusing it.")
+            try:
+                os.remove(session_path)
+            except OSError:
+                pass
+            return False
+
         if self.client.load_session(session_path):
             self.log.info("Reused today's saved session.")
             return True
@@ -402,8 +449,23 @@ class Broker:
 
     def _after_login(self, session_path: str) -> None:
         self.client.save_session(session_path)
+        self._stamp_session(session_path)
         self.log.info("Login complete.")
         self.load_scrip_master()
+
+    def _stamp_session(self, session_path: str) -> None:
+        """Record which account this session is for, so resume can check."""
+        try:
+            with open(session_path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            saved["account"] = self.account_fingerprint()
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(saved, handle, indent=2)
+        except (OSError, ValueError) as exc:
+            # Not fatal: an unstamped session is refused on the next resume,
+            # which costs a login and never the wrong account.
+            self.log.warn(f"Could not stamp the session file ({exc}). "
+                          "The next start will log in again.")
 
     def published_scrip_date(self) -> Optional[date]:
         """Which day's scrip master is actually published right now.
