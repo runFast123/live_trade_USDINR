@@ -167,6 +167,11 @@ def cmd_check(cfg: RollConfig) -> int:
     if several:
         live = sum(1 for s in specs if s.enabled)
         print(f"  sections     {len(specs)} configured, {live} enabled")
+        if not live:
+            print("               NOTHING WILL TRADE: every section is "
+                  "switched off.")
+            print("               Enable one in the window, or set "
+                  '"enabled": true on it.')
         if cfg.max_clips_per_day_account:
             print("  day budget   "
                   f"{cfg.max_clips_per_day_account} clip(s) across all sections")

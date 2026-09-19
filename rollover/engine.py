@@ -165,24 +165,7 @@ class RollEngine:
         saved = self.store.for_campaign(saved, self.campaign_key())
         self.saved = saved
 
-        solo = len(self.sections) < 2 and not cfg.sections
-        for section in self.sections:
-            section.ladder = self._build_ladder(section)
-            section.watch_limits = self._build_watch(section)
-            section.load_from(saved.section(section.key))
-            # One roll keeps the plain market-<date>.csv it has always had;
-            # several get a file each, named after the section.
-            section.recorder = (
-                Recorder(os.path.join(base_dir, "data"),
-                         cfg.record_interval_sec,
-                         name="" if solo else (section.name or section.key))
-                if self._recording else None)
-            # One file, one lock, but every line from this roll says so. With
-            # one roll there is nothing to distinguish, and the record reads
-            # exactly as it always did.
-            section.journal = (self.journal if solo else
-                               self.journal.for_section(section.key,
-                                                        section.name))
+        self._equip_sections(saved)
 
         # A version 1 file had no sections, so its figures were migrated under
         # the campaign key. Where that key is not one of ours -- the operator
@@ -203,6 +186,107 @@ class RollEngine:
         elif self.sections and self.sections[0].clips_done_today:
             log.info(f"Resumed: {self.sections[0].clips_done_today} "
                      "clip(s) already done today.")
+
+    def _equip_sections(self, saved=None, load_keys=None) -> None:
+        """Give every section its ladder, its counters and its own files.
+
+        `load_keys` limits which sections take their counters off disk. On a
+        reload the sections that were already running carry their own figures
+        across in memory, and the file is a snapshot from earlier -- reading
+        it back over them would throw away the progress made since.
+        """
+        cfg = self.cfg
+        solo = len(self.sections) < 2 and not cfg.sections
+        for section in self.sections:
+            section.ladder = self._build_ladder(section)
+            section.watch_limits = self._build_watch(section)
+            if saved is not None and (load_keys is None
+                                      or section.key in load_keys):
+                section.load_from(saved.section(section.key))
+            # One roll keeps the plain market-<date>.csv it has always had;
+            # several get a file each, named after the section.
+            section.recorder = (
+                Recorder(os.path.join(self.base_dir, "data"),
+                         cfg.record_interval_sec,
+                         name="" if solo else (section.name or section.key))
+                if self._recording else None)
+            # One file, one lock, but every line from this roll says so. With
+            # one roll there is nothing to distinguish, and the record reads
+            # exactly as it always did.
+            section.journal = (self.journal if solo else
+                               self.journal.for_section(section.key,
+                                                        section.name))
+
+    def reload_sections(self) -> None:
+        """Rebuild the sections from the configuration, keeping their progress.
+
+        Adding, removing, re-legging or enabling a section changes
+        config.json. Without this the engine went on running the list it was
+        constructed with, and the window went on showing it -- so every button
+        acted on a section that was no longer there.
+
+        That is not a cosmetic fault. An operator who added a section, saw the
+        old row still alone on screen and pressed Remove deleted the roll they
+        already had, because the row on screen was the stale one. That is
+        exactly what happened.
+
+        Contracts already resolved from the scrip master are carried across by
+        key, so a reload does not blank the screen waiting for a refresh, and
+        so does progress: a roll that has done 6,000 has still done 6,000.
+        """
+        before = {section.key: section for section in self.sections}
+        with self._lock:
+            self.sections = [sectionlib.Section(spec, self.account, self.cfg)
+                             for spec in self.cfg.section_specs()]
+            for section in self.sections:
+                old = before.get(section.key)
+                if old is None:
+                    continue
+                # Everything the scrip master and the day have established.
+                section.near = old.near
+                section.far = old.far
+                section.clips_done_today = old.clips_done_today
+                section.lots_rolled = old.lots_rolled
+                section.ladder_progress = dict(old.ladder_progress)
+                section.own_halt = old.own_halt
+                section.decision = old.decision
+                section.report = old.report
+                section.quotes = old.quotes
+            # Only the sections that were not already running read their
+            # counters off disk; the rest kept theirs above.
+            self._equip_sections(
+                self.saved,
+                load_keys={s.key for s in self.sections} - set(before))
+
+        kept = sorted(set(before) & {s.key for s in self.sections})
+        gone = sorted(set(before) - {s.key for s in self.sections})
+        fresh = sorted({s.key for s in self.sections} - set(before))
+        self.log.info(
+            f"Sections reloaded: {len(self.sections)} configured"
+            + (f", new: {', '.join(fresh)}" if fresh else "")
+            + (f", removed: {', '.join(gone)}" if gone else "")
+            + (f", kept: {', '.join(kept)}" if kept else ""))
+        self._share_out()
+        self._persist()
+        self._republish()
+
+    def _republish(self) -> None:
+        """Re-issue the snapshot from what the sections already hold.
+
+        Without this the window would draw the NEW sections against the OLD
+        snapshot until the next tick, and anything that reads the snapshot to
+        decide which section is on screen -- the limit cards above all -- would
+        edit the wrong one. That is not cosmetic: the cards are what the Set
+        limits button reads, so a stale card wrote one section's limits into
+        another's ladder.
+        """
+        first = self.sections[0] if self.sections else None
+        quotes = getattr(first, "quotes", None) if first else None
+        self._publish(quotes[0] if quotes else None,
+                      quotes[1] if quotes else None,
+                      first.decision if first else None,
+                      self._note,
+                      first.report if first else None)
 
     # ------------------------------------------------- the single-roll view
     # Everything that predates sections reads `engine.session`, `engine.ladder`
@@ -727,24 +811,33 @@ class RollEngine:
         self.stop()
         return problem
 
-    def rebuild_ladder(self) -> None:
-        """Re-read the ladder after the operator has edited it.
+    def rebuild_ladder(self, section=None) -> None:
+        """Re-read a section's ladder after the operator has edited it.
 
         Progress is kept where a rung still exists at the same limit, and
         dropped where it does not: a rung that has been deleted or repriced is
         a different commitment, and carrying its history onto a new number
         would report a fresh rung as already part done.
+
+        `section` matters. This used to take no argument, read the TOP-LEVEL
+        limit_ladder and write the result to sections[0] -- so editing the
+        limits of any section saved them to config.json and then rebuilt a
+        different section from a different source. The limits were written and
+        then vanished off the screen, which is exactly what an operator
+        reported.
         """
-        old = dict(self.ladder_progress)
-        self.ladder = self._build_ladder()
-        self.watch_limits = self._build_watch()
-        keys = {r.key for r in self.ladder.rungs}
-        self.ladder_progress = {k: v for k, v in old.items() if k in keys}
+        section = section if section is not None else self.sections[0]
+        old = dict(section.ladder_progress)
+        section.ladder = self._build_ladder(section)
+        section.watch_limits = self._build_watch(section)
+        keys = {r.key for r in section.ladder.rungs}
+        section.ladder_progress = {k: v for k, v in old.items() if k in keys}
 
         dropped = sorted(set(old) - keys)
         if dropped:
             self.log.warn(
-                "Ladder progress dropped for rung(s) no longer in the ladder: "
+                f"{section.label()}: ladder progress dropped for rung(s) no "
+                "longer in the ladder: "
                 + ", ".join(f"{k} bps ({old[k]:,})" for k in dropped))
         self._persist()
 

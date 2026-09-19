@@ -289,6 +289,10 @@ class TestAddingAndRemovingFromTheWindow(SectionsUICase):
         self.window.on_change_contracts = lambda: self.restarts.append(1)
         self.draw()
 
+    def keys(self):
+        """What the ENGINE is running, which is what the window draws."""
+        return [s.key for s in self.engine.sections]
+
     def test_removing_the_selected_section(self):
         import tkinter.messagebox as mb
         real = mb.askyesno
@@ -299,7 +303,30 @@ class TestAddingAndRemovingFromTheWindow(SectionsUICase):
             mb.askyesno = real
         self.assertEqual([s["name"] for s in self.cfg.sections],
                          ["Sep into Nov"])
-        self.assertEqual(self.restarts, [1])
+
+    def test_the_engine_stops_running_the_removed_section(self):
+        """The whole fault: config.json changed and the engine did not, so
+        the strip kept drawing the section that had just been deleted."""
+        import tkinter.messagebox as mb
+        real = mb.askyesno
+        mb.askyesno = lambda *a, **kw: True
+        try:
+            self.window._remove_section()
+        finally:
+            mb.askyesno = real
+        self.assertEqual(self.keys(), ["1769>1584"])
+
+    def test_the_contract_picker_is_not_reopened(self):
+        """_restart_engine used to call on_change_contracts, which opens the
+        picker -- so adding a section opened a second one straight after."""
+        import tkinter.messagebox as mb
+        real = mb.askyesno
+        mb.askyesno = lambda *a, **kw: True
+        try:
+            self.window._remove_section()
+        finally:
+            mb.askyesno = real
+        self.assertEqual(self.restarts, [])
 
     def test_a_refused_removal_says_why(self):
         import tkinter.messagebox as mb
@@ -319,7 +346,14 @@ class TestAddingAndRemovingFromTheWindow(SectionsUICase):
     def test_disabling_a_section(self):
         self.window._toggle_section()
         self.assertFalse(self.cfg.sections[0]["enabled"])
-        self.assertEqual(self.restarts, [1])
+
+    def test_the_engine_sees_the_section_switched_off(self):
+        self.window._toggle_section()
+        self.assertFalse(self.engine.sections[0].enabled)
+
+    def test_disabling_keeps_the_operator_looking_at_that_section(self):
+        self.window._toggle_section()
+        self.assertEqual(self.window._focused().key, "1769>1500")
 
     def test_enabling_one_with_no_limits_is_refused(self):
         """That is the moment it could start selling."""
@@ -335,7 +369,18 @@ class TestAddingAndRemovingFromTheWindow(SectionsUICase):
         self.assertFalse(case.cfg.sections[0].get("enabled", True))
 
     def test_the_button_says_what_it_would_do(self):
-        self.assertEqual(self.window.enable_button._label, "Disable")
+        self.assertTrue(self.window.enable_button._label.startswith("Disable"))
+
+    def test_the_controls_name_the_section_they_act_on(self):
+        """"Remove section" does not say which, and there are two on screen."""
+        self.assertIn("Sep into Oct", self.window.enable_button._label)
+        self.assertIn("Sep into Oct", self.window.remove_button._label)
+        self.assertIn("SEP INTO OCT", self.window.ladder_heading.cget("text"))
+
+    def test_they_follow_the_selection(self):
+        self.window.focus_key = "1769>1584"
+        self.draw()
+        self.assertIn("Sep into Nov", self.window.remove_button._label)
 
 
 if __name__ == "__main__":

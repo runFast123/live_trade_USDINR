@@ -16,6 +16,7 @@ from typing import Callable, Optional
 
 from . import theme as T
 from . import __version__, editing, livemode, notify, updater
+from .config import section_key
 from .engine import ARMED, DONE, HALTED, RollEngine, WATCHING, WORKING
 from .money import D, money
 
@@ -160,6 +161,19 @@ class LiveModeDialog(tk.Toplevel):
         self.destroy()
         if self.on_done:
             self.on_done()
+
+
+def _why_waiting(gate) -> str:
+    """Why a section is not trading, in words that are not the gate's name.
+
+    The strip used to print the failing gate's NAME. So a market that was
+    shut read as "market open", and a position that was missing read as
+    "position" -- the gate names are labels for a row, not statements, and as
+    statements the first one says the opposite of the truth. Every gate's
+    detail is already written to stand on its own.
+    """
+    detail = (getattr(gate, "detail", "") or "").strip()
+    return detail or (getattr(gate, "name", "") or "waiting")
 
 
 class RollWindow(tk.Toplevel):
@@ -375,8 +389,12 @@ class RollWindow(tk.Toplevel):
         T.Button(row, "Set", self._apply_limit, self.fonts,
                  width=58, height=30).pack(side="left", padx=T.PAD_XS)
 
+        # Wrapped, not widened: this label sits in a row with the worst case
+        # and the buy limit, and letting it grow pushed the buy limit off the
+        # right edge of the card.
         self.limit_note = tk.Label(limit_box, text="", bg=T.SURFACE,
-                                   fg=T.FAINT, font=self.fonts.ui_small, anchor="w")
+                                   fg=T.FAINT, font=self.fonts.ui_small,
+                                   anchor="w", justify="left", wraplength=280)
         self.limit_note.pack(fill="x")
         self._last_decision = None
         self._reset_limit()
@@ -407,7 +425,7 @@ class RollWindow(tk.Toplevel):
         ("limit", "Limit", 90, "e"),
         ("gap", "Distance", 100, "e"),
         ("rolled", "Rolled", 150, "e"),
-        ("state", "", 150, "w"),
+        ("state", "Waiting for", 240, "w"),
     )
 
     def _build_strip(self, parent) -> None:
@@ -449,13 +467,16 @@ class RollWindow(tk.Toplevel):
         T.Button(row, "Add section", self._add_section, self.fonts,
                  width=140, height=30).pack(side="left")
         self.enable_button = T.Button(row, "Enable", self._toggle_section,
-                                      self.fonts, width=110, height=30)
+                                      self.fonts, width=190, height=30)
         self.enable_button.pack(side="left", padx=T.PAD_XS)
-        T.Button(row, "Change contracts", self._change_contracts, self.fonts,
-                 width=170, height=30).pack(side="left")
-        T.Button(row, "Remove section", self._remove_section, self.fonts,
-                 kind="danger", width=150, height=30).pack(side="left",
-                                                           padx=T.PAD_XS)
+        self.relegs_button = T.Button(row, "Change contracts",
+                                      self._change_contracts, self.fonts,
+                                      width=230, height=30)
+        self.relegs_button.pack(side="left")
+        self.remove_button = T.Button(row, "Remove", self._remove_section,
+                                      self.fonts, kind="danger",
+                                      width=190, height=30)
+        self.remove_button.pack(side="left", padx=T.PAD_XS)
         self.section_note = tk.Label(row, text="", bg=T.SURFACE, fg=T.FAINT,
                                      font=self.fonts.ui_small, anchor="w",
                                      justify="left", wraplength=520)
@@ -510,10 +531,26 @@ class RollWindow(tk.Toplevel):
         self._update_enable_button()
 
     def _update_enable_button(self) -> None:
+        """Name the section every control is about to act on.
+
+        With several rolls on screen, "Remove section" does not say which one
+        it removes, and the limits card does not say whose limits it is
+        showing. Both act on the row selected above, and neither said so.
+        """
         view = self._focused()
         if view is None:
             return
-        self.enable_button.set_text("Disable" if view.enabled else "Enable")
+        several = len(self._views()) > 1
+        who = f" {view.name}" if several else ""
+        self.enable_button.set_text(
+            ("Disable" if view.enabled else "Enable") + who)
+        self.remove_button.set_text("Remove" + who)
+        self.relegs_button.set_text(
+            ("Change contracts" + (" of" + who if several else "")))
+        if getattr(self, "ladder_heading", None) is not None:
+            self.ladder_heading.configure(
+                text="ROLL COST AT EACH LIMIT"
+                     + (f"   {view.name.upper()}" if several else ""))
 
     def _draw_strip(self, snap) -> None:
         """The rows, and the controls that change what the rows are.
@@ -556,7 +593,7 @@ class RollWindow(tk.Toplevel):
                     view.report is not None and view.report.ok:
                 tag, state = "ready", "READY"
             elif view.report is not None and view.report.failures:
-                tag, state = "waiting", view.report.failures[0].name
+                tag, state = "waiting", _why_waiting(view.report.failures[0])
             else:
                 tag, state = "waiting", "watching"
 
@@ -580,15 +617,24 @@ class RollWindow(tk.Toplevel):
                     break
 
         if len(views) > 1:
-            note = f"showing {focused.name} below" if focused else ""
+            note = (f"click a row to work on it -- showing {focused.name} below"
+                    if focused else "")
         else:
             # With one roll there is nothing to choose between, so the note
             # says what the card is for instead.
             note = "Add section to watch another pair of contracts alongside"
         self.strip_note.configure(text=note)
-        self.allocation_label.configure(
-            text=(snap.allocation_refusal or snap.allocation or ""),
-            fg=T.DANGER if snap.allocation_refusal else T.MUTED)
+        # Every section switched off is a silent do-nothing: the app watches,
+        # the gates pass, and no roll can ever fire. Say so where the reason
+        # for not trading is read.
+        if views and not any(v.enabled for v in views):
+            self.allocation_label.configure(
+                text="Nothing will trade: every section is switched off. "
+                     "Select one above and press Enable.", fg=T.WARN)
+        else:
+            self.allocation_label.configure(
+                text=(snap.allocation_refusal or snap.allocation or ""),
+                fg=T.DANGER if snap.allocation_refusal else T.MUTED)
         self._update_enable_button()
 
     # ---- changing the sections ---------------------------------------------
@@ -601,18 +647,26 @@ class RollWindow(tk.Toplevel):
         return bool(getattr(window, "ok", False))
 
     def _add_section(self) -> None:
+        made = {}
+
         def accept(near_row, far_row):
             sections = editing.add(self.cfg, near_row, far_row)
             editing.apply(self.cfg, sections, self.config_path)
+            made["key"] = section_key(near_row.get("Token"),
+                                      far_row.get("Token"))
+            made["name"] = sections[-1].get("name", "the new section")
 
         if not self._pick_contracts("Add a section: choose its two contracts",
                                     accept):
             return
+        # Focus it, so the limits card below is editing the thing just made
+        # rather than the section that happened to be selected before.
+        self._restart_engine(focus_key=made.get("key"))
         self._section_note(
-            "added, switched off. Set its limits below, then Enable it.",
-            T.WARN)
-        self.log.info(f"Section added. {len(self.cfg.sections)} configured.")
-        self._restart_engine()
+            f"{made.get('name', 'Added')} added and switched off. Its limits "
+            "are below: set them, then press Enable.", T.WARN)
+        self.log.info(f"Section added: {made.get('name')}. "
+                      f"{len(self.cfg.sections)} configured.")
 
     def _remove_section(self) -> None:
         from tkinter import messagebox
@@ -633,9 +687,9 @@ class RollWindow(tk.Toplevel):
             self._section_note(str(exc), T.DANGER)
             return
         editing.apply(self.cfg, sections, self.config_path)
-        self.focus_key = None
         self.log.warn(f"Section removed: {view.name}")
         self._restart_engine()
+        self._section_note(f"{view.name} removed.", T.MUTED)
 
     def _toggle_section(self) -> None:
         view = self._focused()
@@ -647,21 +701,38 @@ class RollWindow(tk.Toplevel):
             self._section_note(str(exc), T.DANGER)
             return
         editing.apply(self.cfg, sections, self.config_path)
-        self._section_note(
-            f"{view.name} {'disabled' if view.enabled else 'enabled'}", T.MUTED)
         self.log.info(f"{view.name} "
                       f"{'disabled' if view.enabled else 'enabled'}.")
-        self._restart_engine()
+        self._restart_engine(focus_key=view.key)
+        self._section_note(
+            f"{view.name} {'disabled' if view.enabled else 'enabled'}.",
+            T.MUTED)
 
-    def _restart_engine(self) -> None:
+    def _restart_engine(self, focus_key=None) -> None:
         """Put a change to the sections into force.
+
+        This used to call on_change_contracts, which opens the contract
+        picker. So adding a section opened a SECOND picker straight after the
+        first, and the engine was never told anything had changed -- it went
+        on running the list it started with, and the strip went on drawing it.
+        Every button then acted on a section that was no longer there.
 
         Always disarms: the set of things that could trade has changed, and
         whoever armed was authorising the old set.
         """
         self.engine.disarm("sections changed")
-        if self.on_change_contracts:
-            self.on_change_contracts()
+        self.engine.reload_sections()
+        # Show whatever the operator just acted on, or fall back to the first.
+        views = [s.key for s in self.engine.sections]
+        self.focus_key = focus_key if focus_key in views else (
+            self.focus_key if self.focus_key in views else None)
+        # Draw FIRST. The limit cards are rebuilt from whichever section the
+        # snapshot says is on screen, so rebuilding them against the old
+        # snapshot filled them from the old section -- and Set limits then
+        # wrote those limits into the new section's ladder.
+        self._draw(self.engine.snapshot())
+        self._rebuild_rung_rows()
+        self._reset_limit()
 
     LADDER_COLUMNS = 4
 
@@ -684,8 +755,10 @@ class RollWindow(tk.Toplevel):
 
         head = tk.Frame(box, bg=T.SURFACE)
         head.pack(fill="x")
-        tk.Label(head, text="ROLL COST AT EACH LIMIT", bg=T.SURFACE, fg=T.FAINT,
-                 font=self.fonts.label, anchor="w").pack(side="left")
+        self.ladder_heading = tk.Label(
+            head, text="ROLL COST AT EACH LIMIT", bg=T.SURFACE, fg=T.FAINT,
+            font=self.fonts.label, anchor="w")
+        self.ladder_heading.pack(side="left")
         self.ladder_total = tk.Label(head, text="", bg=T.SURFACE, fg=T.MUTED,
                                      font=self.fonts.ui_small, anchor="e")
         self.ladder_total.pack(side="right")
@@ -971,7 +1044,10 @@ class RollWindow(tk.Toplevel):
         else:
             self.cfg.limit_ladder = wanted
             self.cfg.watch_limits = watch
-        self.engine.rebuild_ladder()
+        # The section these limits belong to, not sections[0]. Leaving this
+        # off wrote the limits to config.json and then rebuilt a different
+        # section, so they vanished off the screen.
+        self.engine.rebuild_ladder(section)
         self._rebuild_rung_rows()
 
         self.log.info(
@@ -1073,8 +1149,12 @@ class RollWindow(tk.Toplevel):
             self.ladder_total.configure(
                 text=f"{done:,} of {total:,} rolled, {left:,} left"
                      f"   clip {self.cfg.clip_qty:,}")
-        else:
+        elif self.rung_rows:
             self.ladder_total.configure(text="no quantity set to trade")
+        else:
+            # The invitation below already says there are no limits; saying
+            # it twice in different words reads as two different problems.
+            self.ladder_total.configure(text="")
 
     def _build_actions(self, parent) -> None:
         bar = tk.Frame(parent, bg=T.BG)
@@ -1319,12 +1399,32 @@ class RollWindow(tk.Toplevel):
         self._describe_limit()
 
     def _describe_limit(self) -> None:
-        """Spell out what the limit works out to, in both units."""
+        """Spell out what the limit works out to, in both units.
+
+        Two numbers on this card are both called a limit, and they are not the
+        same thing: the box holds the ceiling for this tenor, while the rule
+        may be working a tighter rung from the limits below. A box reading 30
+        above a line reading "25 bps" looks like a contradiction unless it
+        says which is which.
+        """
         detail = getattr(self._last_decision, "limit_detail", None)
         if detail is None:
             self._limit_note("waiting for a quote", T.FAINT)
-        else:
-            self._limit_note(detail.describe(), T.FAINT)
+            return
+
+        text = detail.describe()
+        active = getattr(self._last_decision, "active_rung", None)
+        typed = (self.limit_var.get() or "").strip()
+        if active is not None and typed:
+            try:
+                differs = D(typed) != active.rung.bps
+            except Exception:
+                differs = False
+            if differs:
+                text += (f"{os.linesep}working the "
+                         f"{active.rung.bps.normalize():f} bps rung below; "
+                         f"{typed} is this tenor's ceiling")
+        self._limit_note(text, T.FAINT)
 
     def _limit_note(self, text: str, colour: str) -> None:
         self.limit_note.configure(text=text, fg=colour)
