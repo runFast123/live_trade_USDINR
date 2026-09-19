@@ -32,6 +32,34 @@ class ConfigError(ValueError):
     pass
 
 
+# What a section may override. Deliberately short. Everything absent from this
+# list is a property of the venue or the account rather than of one roll:
+# dry_run, the tick, the price bands, the trading window, validity,
+# product_type and the margin policy are all shared, and a section carrying its
+# own dry_run would be a way to send live orders from a window saying DRY RUN.
+SECTION_OVERRIDES = ("near_token", "far_token", "near_expiry", "far_expiry",
+                     "limit_ladder", "watch_limits", "lots",
+                     "max_clips_per_day")
+
+# Recognised inside a section but not overrides of a config field.
+SECTION_META = ("name", "enabled")
+
+
+def section_key(near_token, far_token) -> str:
+    """Stable identity for a section, so its progress survives a restart."""
+    return f"{str(near_token or '').strip()}>{str(far_token or '').strip()}"
+
+
+@dataclass
+class SectionSpec:
+    """One section: its identity, and the complete config it trades on."""
+    key: str
+    name: str
+    index: int
+    enabled: bool
+    cfg: "RollConfig"
+
+
 def _parse_hhmm(text: str, label: str) -> dtime:
     try:
         hh, mm = str(text).strip().split(":")
@@ -86,6 +114,22 @@ class RollConfig:
     # are not bound by the tenor ceiling, which is what makes them safe to
     # experiment with -- unlike the single roll limit, which IS the ceiling.
     watch_limits: list = field(default_factory=list)
+
+    # Several rolls at once, each its own section in the window. A section is a
+    # SPARSE OVERRIDE of the settings above: it states only what differs, which
+    # is how "both sections sell the same September" gets expressed without
+    # repeating the near leg.
+    #
+    #   "sections": [
+    #     {"name": "Sep into Oct", "far_token": "...",
+    #      "limit_ladder": [{"bps": "30", "qty": 10000}]},
+    #     {"name": "Sep into Nov", "far_token": "1584",
+    #      "limit_ladder": [{"bps": "50", "qty": 20000}]}
+    #   ]
+    #
+    # Empty means one section built from the settings above, which is exactly
+    # what the app did before sections existed.
+    sections: list = field(default_factory=list)
 
     lots: int = 1                        # one clip
     allowance_ticks: int = 0             # price give on each leg; 0 is strictest
@@ -142,7 +186,20 @@ class RollConfig:
     # short in the month about to expire. Needs kkunal 1.3.0 for get_margin.
     require_margin: bool = True
     require_touch_size: bool = True      # refuse unless both touches can fill the clip
+
+    # A cap across ALL sections, not per section. Two sections each allowed one
+    # clip a day means the ACCOUNT does two a day where it used to do one --
+    # which follows from asking for two sections that both trade, but does not
+    # leap off the page. None means no account cap, only each section's own.
+    max_clips_per_day_account: Optional[int] = None
     auto_unwind_on_leg2_failure: bool = False
+
+    # Which leg goes out first: "auto", "near_first" or "far_first". See
+    # rollover/sequencing.py. Expiry day is far-first whatever this says,
+    # because after the near contract stops trading a sold near leg with no far
+    # leg cannot be corrected at any price.
+    leg_order: str = "auto"
+    far_first_near_depth_multiple: int = 3
     dry_run: bool = True                 # nothing is sent to the exchange while true
 
     # Whether an order quantity reaches the exchange as contracts or as units
@@ -250,6 +307,17 @@ class RollConfig:
                 parse_watch(self.watch_limits)
             except _LadderError as exc:
                 errors.append(str(exc))
+
+        from .sequencing import valid_mode as valid_leg_order
+        if not valid_leg_order(self.leg_order):
+            errors.append("leg_order must be auto, near_first or far_first")
+        if self.far_first_near_depth_multiple < 1:
+            errors.append("far_first_near_depth_multiple must be at least 1")
+        if (self.max_clips_per_day_account is not None
+                and self.max_clips_per_day_account < 1):
+            errors.append("max_clips_per_day_account must be at least 1, or null")
+
+        errors.extend(self._section_errors())
 
         if self.limit_ladder:
             from .ladder import LadderError, parse as parse_ladder
@@ -375,6 +443,124 @@ class RollConfig:
     def clip_qty(self) -> int:
         """Order quantity in units, which is what the API expects, not lots."""
         return self.lots * self.expected_lot_size
+
+    # ------------------------------------------------------------- sections
+    def _section_errors(self) -> list:
+        """Everything wrong with the sections, as sentences."""
+        raw = self.sections
+        if not raw:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            return ["sections must be a list"]
+
+        errors = []
+        allowed = set(SECTION_OVERRIDES) | set(SECTION_META)
+        for index, entry in enumerate(raw, start=1):
+            where = f"section {index}"
+            if not isinstance(entry, dict):
+                errors.append(f"{where} is not an object")
+                continue
+            name = str(entry.get("name") or where)
+            # Strict, unlike the top level. This file is written by the app and
+            # tolerates keys a build does not know; a section is small and
+            # hand-written, so a key that is not an override is a mistake, and
+            # silently ignoring it would leave a setting the operator believes
+            # is applied and is not.
+            unknown = sorted(set(entry) - allowed)
+            if unknown:
+                errors.append(
+                    f"{name}: {', '.join(unknown)} cannot be set per section. "
+                    f"A section may override: {', '.join(sorted(SECTION_OVERRIDES))}.")
+
+        try:
+            specs = self.section_specs()
+        except Exception as exc:
+            return errors + [f"the sections could not be read: {exc}"]
+
+        seen = {}
+        for spec in specs:
+            if spec.key in seen:
+                errors.append(
+                    f"{spec.name} and {seen[spec.key]} are the same pair of "
+                    "contracts. Two sections rolling the same pair would each "
+                    "believe they owned the whole campaign.")
+            seen[spec.key] = spec.name
+
+        # The hole this closes: a section without a ladder has no campaign cap
+        # at all. It rolls a clip at a time for as long as the market allows,
+        # while contributing nothing to the total that is checked against the
+        # position -- so two sections would sum to less than the position while
+        # one of them quietly consumed all of it.
+        if len(specs) > 1:
+            for spec in specs:
+                if not spec.enabled:
+                    continue
+                if not spec.cfg.limit_ladder:
+                    errors.append(
+                        f"{spec.name} has no limit_ladder. With more than one "
+                        "section there is no cap on what it would roll, and the "
+                        "sections cannot be shown to fit inside the position.")
+
+        for spec in specs:
+            try:
+                spec.cfg.validate()
+            except ConfigError as exc:
+                first = str(exc).splitlines()[-1].strip(" -")
+                errors.append(f"{spec.name}: {first}")
+        return errors
+
+    def section_specs(self) -> "list[SectionSpec]":
+        """One spec per section, each carrying a real, complete RollConfig.
+
+        A section states only what differs from the settings above, so the
+        config it trades on is derived here rather than written out. Callers
+        are expected to call this every tick and NOT to hold on to the result:
+        settings above change while the app runs -- dry_run above all, which
+        Go Live flips -- and a section holding a copy made at startup would go
+        on reporting the old value. A section that believed it was still in
+        dry run while the engine sent real orders would report the margin gate
+        as "not checked in dry run", which is to say it would pass.
+
+        Deriving costs about 17 microseconds a section, against a tick of a
+        second. Nothing is cached, so nothing can go stale.
+        """
+        from dataclasses import replace
+
+        raw = list(self.sections or [])
+        if not raw:
+            # No sections: one, from the settings above. Exactly what the app
+            # did before sections existed.
+            return [SectionSpec(key=section_key(self.near_token, self.far_token),
+                                name=self.section_name(self.near_expiry,
+                                                       self.far_expiry),
+                                index=0, enabled=True, cfg=self)]
+
+        specs = []
+        for index, entry in enumerate(raw):
+            overrides = {k: v for k, v in (entry or {}).items()
+                         if k in SECTION_OVERRIDES}
+            cfg = replace(self, sections=[], **overrides)
+            specs.append(SectionSpec(
+                key=section_key(cfg.near_token, cfg.far_token),
+                name=str((entry or {}).get("name")
+                         or self.section_name(cfg.near_expiry, cfg.far_expiry)
+                         or f"section {index + 1}"),
+                index=index,
+                enabled=bool((entry or {}).get("enabled", True)),
+                cfg=cfg))
+        return specs
+
+    @staticmethod
+    def section_name(near_expiry: str, far_expiry: str) -> str:
+        """A readable name from the expiries, when none was given."""
+        def month(text):
+            try:
+                from datetime import datetime
+                return datetime.strptime(str(text).strip(), "%Y-%m-%d").strftime("%b")
+            except Exception:
+                return ""
+        a, b = month(near_expiry), month(far_expiry)
+        return f"{a} into {b}" if a and b else ""
 
     def redacted(self) -> dict:
         """Config as a dict with the secrets masked, safe to write to the log."""
