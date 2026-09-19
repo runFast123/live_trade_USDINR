@@ -295,6 +295,9 @@ class RollWindow(tk.Toplevel):
         self.source_pill.pack(side="right", padx=(0, T.PAD_S))
         self.source_pill.set("connecting", T.MUTED)
 
+        T.Button(right, "?", self._show_help, self.fonts,
+                 width=30, height=30).pack(side="right", padx=(0, T.PAD_S))
+
         self.update_button = T.Button(right, "Update", self._do_update, self.fonts,
                                       kind="primary", width=172, height=30)
         # Packed only once a newer release has actually been found.
@@ -595,6 +598,26 @@ class RollWindow(tk.Toplevel):
         self._toggle_section()
         return "break"
 
+    def _busy(self) -> bool:
+        """True, with a note, when a clip is working and must not be disturbed.
+
+        Changing the sections rebuilds them, and a clip already in flight is
+        holding the OLD section object. Its fill is credited to that object,
+        which is no longer the one the engine runs or the one written to the
+        state file -- so the quantity rolls at the exchange and disappears
+        from the record, and the campaign rolls it again. Measured: 4,000
+        credited to an orphan while the live sections showed nothing.
+
+        The limit editor has always refused for the same reason. These did
+        not.
+        """
+        if not getattr(self.engine.account, "in_flight", False):
+            return False
+        self._section_note(
+            "an order is working; wait for it to finish. Changing the "
+            "sections now would lose what it fills from the record.", T.WARN)
+        return True
+
     def _section_note(self, text: str, colour: str) -> None:
         self.section_note.configure(text=text, fg=colour)
 
@@ -770,6 +793,9 @@ class RollWindow(tk.Toplevel):
         return bool(getattr(window, "ok", False))
 
     def _add_section(self) -> None:
+
+        if self._busy():
+            return
         made = {}
 
         def accept(near_row, far_row):
@@ -792,6 +818,9 @@ class RollWindow(tk.Toplevel):
                       f"{len(self.cfg.sections)} configured.")
 
     def _remove_section(self) -> None:
+
+        if self._busy():
+            return
         from tkinter import messagebox
 
         view = self._focused()
@@ -815,6 +844,9 @@ class RollWindow(tk.Toplevel):
         self._section_note(f"{view.name} removed.", T.MUTED)
 
     def _toggle_section(self) -> None:
+
+        if self._busy():
+            return
         view = self._focused()
         if view is None:
             return
@@ -1637,7 +1669,66 @@ class RollWindow(tk.Toplevel):
 
         self.after(4000, self._describe_limit)
 
+    def _show_help(self) -> None:
+        """What the screen means, in the operator's words.
+
+        Every topic in rollover/help.py comes from a question that was
+        actually asked while using this, not from a guess about what might
+        be unclear.
+        """
+        from . import help as helptext
+
+        if getattr(self, "_help_window", None) is not None:
+            try:
+                if self._help_window.winfo_exists():
+                    self._help_window.lift()
+                    return
+            except Exception:
+                pass
+
+        window = tk.Toplevel(self)
+        self._help_window = window
+        window.title("What am I looking at?")
+        window.configure(bg=T.BG)
+        window.geometry("760x680")
+        window.transient(self)
+
+        def forget():
+            self._help_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", forget)
+        window.bind("<Escape>", lambda _e: forget())
+
+        holder = tk.Frame(window, bg=T.BG)
+        holder.pack(fill="both", expand=True, padx=T.PAD_L, pady=T.PAD_L)
+
+        bar = ttk.Scrollbar(holder, orient="vertical",
+                            style="App.Vertical.TScrollbar")
+        bar.pack(side="right", fill="y")
+        text = tk.Text(holder, bg=T.SURFACE, fg=T.TEXT, bd=0,
+                       highlightthickness=0, wrap="word", padx=T.PAD_L,
+                       pady=T.PAD_L, font=self.fonts.ui,
+                       yscrollcommand=bar.set, spacing1=2, spacing3=8)
+        text.pack(side="left", fill="both", expand=True)
+        bar.configure(command=text.yview)
+
+        text.tag_configure("heading", foreground=T.ACCENT_TEXT,
+                           font=self.fonts.ui_medium, spacing1=14, spacing3=6)
+        text.tag_configure("body", foreground=T.MUTED, lmargin1=0, lmargin2=0)
+
+        for heading, paragraphs in helptext.TOPICS:
+            text.insert("end", heading + os.linesep, "heading")
+            for paragraph in paragraphs:
+                text.insert("end", paragraph + os.linesep, "body")
+        text.configure(state="disabled")
+
+        T.Button(window, "Close", forget, self.fonts, kind="primary",
+                 width=120, height=32).pack(pady=(0, T.PAD_L))
+
     def _change_contracts(self) -> None:
+        if self._busy():
+            return
         self.engine.disarm("changing contracts")
         self.on_change_contracts()
 

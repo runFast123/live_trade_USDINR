@@ -733,3 +733,83 @@ class TestTheWaitingColumnSaysSomethingTrue(WorkflowCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheSectionsCannotChangeUnderAWorkingClip(WorkflowCase):
+    """A clip in flight holds one of the current Section objects.
+
+    Rebuild the sections underneath it and its fill is credited to an orphan:
+    the quantity rolls at the exchange and vanishes from the record, so the
+    campaign rolls it again. Measured before the guard: 4,000 credited to an
+    object the engine no longer ran, with the live sections showing nothing.
+
+    The limit editor always refused for this reason. Add, Remove, Enable and
+    Change contracts did not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.set_limit("30", "10000")
+        self.add_section("1769", "1284")
+        self.engine.account.in_flight = True
+
+    def names(self):
+        return [s["name"] for s in self.cfg.sections]
+
+    def test_adding_is_refused(self):
+        before = self.names()
+        self.add_section("1769", "1584")
+        self.assertEqual(self.names(), before)
+
+    def test_removing_is_refused(self):
+        before = self.names()
+        self.remove_section()
+        self.assertEqual(self.names(), before)
+
+    def test_enabling_is_refused(self):
+        before = [s.get("enabled", True) for s in self.cfg.sections]
+        self.window._toggle_section()
+        self.assertEqual([s.get("enabled", True) for s in self.cfg.sections],
+                         before)
+
+    def test_changing_contracts_is_refused(self):
+        opened = []
+        self.window.on_change_contracts = lambda: opened.append(1)
+        self.window._change_contracts()
+        self.assertEqual(opened, [])
+
+    def test_nothing_is_written_to_the_config_file(self):
+        """Refusing after the write would leave the file and the engine
+        disagreeing, which is the fault this whole area had."""
+        before = self.saved()
+        self.window._toggle_section()
+        self.assertEqual(self.saved(), before)
+
+    def test_the_operator_is_told_why(self):
+        self.window._toggle_section()
+        note = self.window.section_note.cget("text")
+        self.assertIn("an order is working", note)
+        self.assertIn("lose what it fills", note)
+
+    def test_the_engine_refuses_a_reload_on_its_own_account(self):
+        """The backstop, for any caller that is not the window."""
+        keys = [s.key for s in self.engine.sections]
+        self.assertFalse(self.engine.reload_sections())
+        self.assertEqual([s.key for s in self.engine.sections], keys)
+
+    def test_and_allows_it_once_the_clip_is_done(self):
+        self.engine.account.in_flight = False
+        self.assertTrue(self.engine.reload_sections())
+
+    def test_a_fill_still_reaches_the_section_the_engine_runs(self):
+        """The point of all of it: the credit must land on a live section."""
+        section = self.engine.sections[0]
+        rung = section.ladder.rungs[0]
+
+        class Decision:
+            active_rung = type("V", (), {"rung": rung})()
+
+        self.engine._credit_rung(Decision(), 4000, section=section)
+        self.engine.account.in_flight = False
+        live = {s.name: s.ladder_progress for s in self.engine.sections}
+        self.assertEqual(live["Sep into Nov"], {"30": 4000})

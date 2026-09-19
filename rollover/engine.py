@@ -223,7 +223,7 @@ class RollEngine:
                                self.journal.for_section(section.key,
                                                         section.name))
 
-    def reload_sections(self) -> None:
+    def reload_sections(self) -> bool:
         """Rebuild the sections from the configuration, keeping their progress.
 
         Adding, removing, re-legging or enabling a section changes
@@ -240,6 +240,16 @@ class RollEngine:
         key, so a reload does not blank the screen waiting for a refresh, and
         so does progress: a roll that has done 6,000 has still done 6,000.
         """
+        if self.account.in_flight:
+            # A clip in flight holds one of the CURRENT section objects and
+            # credits its fill to it. Rebuild underneath it and that credit
+            # lands on an orphan: rolled at the exchange, absent from the
+            # record, and rolled again later. The window refuses this before
+            # it writes anything; this is the backstop for any other caller.
+            self.log.warn("Not reloading the sections: an order is working. "
+                          "The change will take effect once it finishes.")
+            return False
+
         before = {section.key: section for section in self.sections}
         # Whatever was about to roll belonged to the old list. Left alone it
         # could mark a row that is no longer there, or the wrong one.
@@ -278,6 +288,7 @@ class RollEngine:
         self._share_out()
         self._persist()
         self._republish()
+        return True
 
     def _republish(self) -> None:
         """Re-issue the snapshot from what the sections already hold.
@@ -928,14 +939,22 @@ class RollEngine:
         # one sells nothing, so claiming for it took the position away from
         # the section that was still working -- and an uncapped disabled
         # section took all of it and blocked arming outright.
-        working = [s for s in self.sections if s.enabled]
-        claims = [s.claim() for s in working]
+        #
+        # self.sections is read ONCE into a local. It used to be read twice,
+        # with the second pass matching sections to claims by list position:
+        # reload the sections between the two reads and that raises, killing
+        # the tick and leaving some sections without a share at all. Rare,
+        # and reproducible in seconds under a soak.
+        sections = list(self.sections)
+        claims = [s.claim() for s in sections if s.enabled]
+        mine = {id(s): c for s, c in zip([s for s in sections if s.enabled],
+                                         claims)}
         self.pools = book.pools(claims, self.near_positions)
-        for section in self.sections:
-            if not self.cfg.require_position or not section.enabled:
+        for section in sections:
+            claim = mine.get(id(section))
+            if claim is None or not self.cfg.require_position:
                 section.near_position_qty = None
                 continue
-            claim = claims[working.index(section)]
             section.near_position_qty = book.sellable(
                 claims, claim, self.near_positions.get(claim.near_token))
 

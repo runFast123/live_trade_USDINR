@@ -360,6 +360,50 @@ class TestTheEngineHoldsExactlyOne(unittest.TestCase):
         off._share_out()
         self.assertGreaterEqual(off.sections[0].near_position_qty, both)
 
+    def test_sharing_out_reads_the_sections_only_once(self):
+        """The tick and the window are different threads.
+
+        _share_out used to read self.sections twice and match sections to
+        claims by list position. Reload the sections between the two reads --
+        which the window does whenever one is added, removed or switched --
+        and it raised, killing that tick and leaving sections with no share
+        at all. Rare in a second, reproducible in six under a soak.
+
+        Simulated here by handing it a list that changes on every read, which
+        is the worst the race can do.
+        """
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 100000}
+        stable = list(engine.sections)
+        reads = []
+
+        class Shifting:
+            """A different list each time it is looked at."""
+
+            def __get__(inner, obj, owner=None):
+                reads.append(1)
+                # First read: both. Later reads: reversed, then one.
+                if len(reads) == 1:
+                    return list(stable)
+                if len(reads) == 2:
+                    return list(reversed(stable))
+                return stable[:1]
+
+        # sections is an instance attribute, and an instance attribute
+        # shadows a plain descriptor, so it has to go first.
+        del engine.__dict__["sections"]
+        type(engine).sections = Shifting()
+        try:
+            engine._share_out()          # must not raise
+        finally:
+            del type(engine).sections
+            engine.sections = stable
+
+        self.assertGreaterEqual(len(reads), 1)
+        self.assertLessEqual(len(reads), 1,
+                             "self.sections is read more than once, so a "
+                             "reload between reads can still tear")
+
     def test_sections_on_different_near_legs_do_not_constrain_each_other(self):
         other = dict(SEP_NOV, near_token="1800", near_expiry="2026-10-29")
         engine = self.engine(sections=[SEP_OCT, other])
