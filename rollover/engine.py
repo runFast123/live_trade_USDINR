@@ -822,12 +822,18 @@ class RollEngine:
         refuses to sell into those too -- without the gate knowing sections
         exist.
         """
-        claims = [s.claim() for s in self.sections]
+        # Only the sections that can actually trade take a share. A disabled
+        # one sells nothing, so claiming for it took the position away from
+        # the section that was still working -- and an uncapped disabled
+        # section took all of it and blocked arming outright.
+        working = [s for s in self.sections if s.enabled]
+        claims = [s.claim() for s in working]
         self.pools = book.pools(claims, self.near_positions)
-        for section, claim in zip(self.sections, claims):
-            if not self.cfg.require_position:
+        for section in self.sections:
+            if not self.cfg.require_position or not section.enabled:
                 section.near_position_qty = None
                 continue
+            claim = claims[working.index(section)]
             section.near_position_qty = book.sellable(
                 claims, claim, self.near_positions.get(claim.near_token))
 

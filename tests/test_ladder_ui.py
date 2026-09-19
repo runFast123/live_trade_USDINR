@@ -118,6 +118,54 @@ class LadderUICase(unittest.TestCase):
         return self.rows()[index]["cells"][name].cget("text")
 
 
+class TestAnEmptyLadderCanStillBeFilledIn(LadderUICase):
+    """The card used to hide itself when there were no limits.
+
+    Add limit lives in that card. Hiding it meant the only way to make a
+    limit was a button you could not reach until you already had one, so a
+    config with "limit_ladder": [] -- which is what a new install has -- could
+    never acquire a ladder from the window at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.limit_ladder = []
+        self.engine.sections[0].ladder = self.engine._build_ladder(
+            self.engine.sections[0])
+        self.window._rebuild_rung_rows()
+        self.draw()
+
+    def test_there_are_no_cards(self):
+        self.assertEqual(self.rows(), [])
+
+    def test_but_the_card_is_on_screen(self):
+        self.assertTrue(self.window._ladder_shown)
+
+    def test_and_it_says_what_it_is_for(self):
+        self.assertTrue(self.window._ladder_empty_shown)
+        self.assertTrue(self.window.ladder_empty.winfo_ismapped())
+        self.assertIn("Add limit", self.window.ladder_empty.cget("text"))
+
+    def test_adding_one_works_and_the_invitation_goes(self):
+        self.add("30", "10000")
+        self.window._apply_ladder()
+        self.assertEqual(self.applied(), [("30", "10000")])
+        self.assertFalse(self.window._ladder_empty_shown)
+
+    def test_removing_the_last_one_brings_the_invitation_back(self):
+        self.add("30", "10000")
+        self.window._remove_rung(self.rows()[0])
+        self.assertTrue(self.window._ladder_empty_shown)
+
+    def test_it_is_not_re_packed_on_every_tick(self):
+        """winfo_ismapped reads false just after a pack, which would have
+        this re-order the card against the grid a few times a second."""
+        before = self.window.ladder_empty.pack_info()
+        for _ in range(5):
+            self.draw()
+        self.assertEqual(self.window.ladder_empty.pack_info(), before)
+
+
 class TestItStartsFromTheConfiguredLadder(LadderUICase):
     def test_one_row_per_rung(self):
         self.assertEqual(len(self.rows()), 2)

@@ -137,15 +137,36 @@ class SectionsUICase(unittest.TestCase):
                 for i in self.window.strip.get_children()]
 
 
-class TestOneSectionLooksAsItAlwaysDid(SectionsUICase):
-    def test_the_strip_is_hidden(self):
+class TestOneSectionCanStillBecomeTwo(SectionsUICase):
+    """The strip used to hide itself under a single roll.
+
+    Add section lives in that card, so hiding it meant the only route to a
+    second section was a control that appeared once you already had two. A
+    person looking at the window could not get there from here -- which is
+    exactly what happened: the feature shipped and could not be reached.
+    """
+
+    def setUp(self):
+        super().setUp()
         self.build()
         self.draw()
-        self.assertFalse(self.window._strip_shown)
+
+    def test_the_strip_is_on_screen(self):
+        self.assertTrue(self.window._strip_shown)
+
+    def test_add_section_is_reachable(self):
+        self.assertTrue(self.window.strip_card.winfo_ismapped()
+                        or self.window._strip_shown)
+
+    def test_it_is_one_row_high_so_there_are_no_blank_rows(self):
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(int(self.window.strip.cget("height")), 1)
+
+    def test_the_note_says_what_the_card_is_for(self):
+        """With one roll there is nothing to choose between."""
+        self.assertIn("Add section", self.window.strip_note.cget("text"))
 
     def test_the_cards_still_show_the_one_roll(self):
-        self.build()
-        self.draw()
         self.assertEqual(self.window._focused().key, "1769>1584")
 
 
@@ -214,6 +235,9 @@ class TestSelectingASection(SectionsUICase):
 
     def test_the_strip_says_which_one_is_below(self):
         self.assertIn("Sep into Oct", self.window.strip_note.cget("text"))
+
+    def test_it_grows_to_fit_the_sections(self):
+        self.assertEqual(int(self.window.strip.cget("height")), 2)
 
 
 class TestEditingOneSectionsLimits(SectionsUICase):

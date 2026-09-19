@@ -323,6 +323,43 @@ class TestTheEngineHoldsExactlyOne(unittest.TestCase):
         for section in engine.sections:
             self.assertLess(section.near_position_qty, 100000)
 
+    def test_a_disabled_section_takes_nothing_from_the_others(self):
+        """It cannot sell, so it cannot be owed anything to sell.
+
+        It used to claim its share anyway, so switching a section off made the
+        remaining one poorer rather than richer.
+        """
+        engine = self.engine(sections=[SEP_OCT, dict(SEP_NOV, enabled=False)])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+
+        self.assertEqual(engine.sections[0].near_position_qty, 100000)
+        self.assertIsNone(engine.sections[1].near_position_qty)
+
+    def test_a_disabled_section_with_no_ladder_does_not_block_arming(self):
+        """The worst case: uncapped, so it claimed the entire position and
+        left the working section unable to sell a single unit."""
+        engine = self.engine(sections=[
+            SEP_OCT, dict(SEP_NOV, limit_ladder=[], enabled=False)])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+
+        self.assertIsNone(engine.allocation_refusal())
+        self.assertEqual(engine.sections[0].near_position_qty, 100000)
+        engine.arm()
+        self.assertTrue(engine.armed)
+
+    def test_switching_one_off_never_makes_the_other_worse_off(self):
+        engine = self.engine(sections=[SEP_OCT, SEP_NOV])
+        engine.near_positions = {"1769": 100000}
+        engine._share_out()
+        both = engine.sections[0].near_position_qty
+
+        off = self.engine(sections=[SEP_OCT, dict(SEP_NOV, enabled=False)])
+        off.near_positions = {"1769": 100000}
+        off._share_out()
+        self.assertGreaterEqual(off.sections[0].near_position_qty, both)
+
     def test_sections_on_different_near_legs_do_not_constrain_each_other(self):
         other = dict(SEP_NOV, near_token="1800", near_expiry="2026-10-29")
         engine = self.engine(sections=[SEP_OCT, other])

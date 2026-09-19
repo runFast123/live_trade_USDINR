@@ -516,17 +516,20 @@ class RollWindow(tk.Toplevel):
         self.enable_button.set_text("Disable" if view.enabled else "Enable")
 
     def _draw_strip(self, snap) -> None:
+        """The rows, and the controls that change what the rows are.
+
+        Always on screen. It used to hide itself with one roll, to keep the
+        window looking as it had before sections existed -- but Add section
+        lives in this card, so hiding it meant the only way to reach a second
+        section was a button that appeared once you already had two. A person
+        looking at this window could not get there from here.
+        """
         views = list(getattr(snap, "sections", None) or [])
-        if len(views) < 2 and not self.cfg.sections:
-            # One roll and no explicit sections: the window looks exactly as it
-            # did before sections existed.
-            if self._strip_shown:
-                self.strip_card.pack_forget()
-                self._strip_shown = False
-            return
         if not self._strip_shown:
             self.strip_card.pack(fill="x", pady=self.gap, after=self.header_bar)
             self._strip_shown = True
+        # No blank rows under a single roll, and no scrolling under four.
+        self.strip.configure(height=max(1, min(len(views) or 1, 6)))
 
         focused = self._focused()
         self.strip.delete(*self.strip.get_children())
@@ -576,8 +579,13 @@ class RollWindow(tk.Toplevel):
                         self.strip.selection_set(children[index])
                     break
 
-        self.strip_note.configure(
-            text=f"showing {focused.name} below" if focused else "")
+        if len(views) > 1:
+            note = f"showing {focused.name} below" if focused else ""
+        else:
+            # With one roll there is nothing to choose between, so the note
+            # says what the card is for instead.
+            note = "Add section to watch another pair of contracts alongside"
+        self.strip_note.configure(text=note)
         self.allocation_label.configure(
             text=(snap.allocation_refusal or snap.allocation or ""),
             fg=T.DANGER if snap.allocation_refusal else T.MUTED)
@@ -701,9 +709,38 @@ class RollWindow(tk.Toplevel):
                                     justify="left", wraplength=620)
         self.ladder_note.pack(side="left", padx=T.PAD_S, fill="x", expand=True)
 
+        self.ladder_empty = tk.Label(
+            box, bg=T.SURFACE, fg=T.MUTED, font=self.fonts.ui_small,
+            anchor="w", justify="left", wraplength=1000,
+            text=("No limits set, so this roll uses the single roll limit "
+                  "above and rolls the whole position one clip at a time."
+                  + os.linesep +
+                  "Add limit makes a card here: a limit with a quantity is "
+                  "traded at that limit and no looser, and several of them "
+                  "add up. Leave the quantity blank to price and compare a "
+                  "limit without ever trading it."))
+
         self.rung_rows = []
         self._ladder_shown = False
+        self._ladder_empty_shown = False
         self._rebuild_rung_rows()
+
+    def _draw_ladder_invitation(self) -> None:
+        """Say what the empty card is for, rather than showing two buttons.
+
+        Tracked with a flag rather than winfo_ismapped(), which still reads
+        false immediately after a pack and would have this re-pack -- and so
+        re-order the card against ladder_grid -- on every tick.
+        """
+        want = not self.rung_rows
+        if want == self._ladder_empty_shown:
+            return
+        self._ladder_empty_shown = want
+        if want:
+            self.ladder_empty.pack(fill="x", pady=(T.PAD_S, 0),
+                                   before=self.ladder_grid)
+        else:
+            self.ladder_empty.pack_forget()
 
     # ---- one card per limit -----------------------------------------------
     def _rebuild_rung_rows(self) -> None:
@@ -793,6 +830,8 @@ class RollWindow(tk.Toplevel):
 
     def _reflow_rows(self) -> None:
         """Lay the cards out, wrapping onto further lines as they are added."""
+        if getattr(self, "ladder_empty", None) is not None:
+            self._draw_ladder_invitation()
         for index, row in enumerate(self.rung_rows):
             row["card"].grid(row=index // self.LADDER_COLUMNS,
                              column=index % self.LADDER_COLUMNS,
@@ -954,14 +993,14 @@ class RollWindow(tk.Toplevel):
 
     # ---- the live numbers -------------------------------------------------
     def _draw_ladder(self, decision) -> None:
-        """Fill each card in with what the market is doing against its limit."""
-        if (not self.rung_rows and not getattr(self.engine, "ladder", None)
-                and not self.cfg.watch_limits):
-            if self._ladder_shown:
-                self.ladder_card.pack_forget()
-                self._ladder_shown = False
-            return
+        """Fill each card in with what the market is doing against its limit.
+
+        Always on screen. It used to hide itself when there were no limits,
+        which hid the Add limit button with it -- so the only way to make a
+        limit was a control you could not reach until you already had one.
+        """
         self._show_ladder()
+        self._draw_ladder_invitation()
 
         views = {v.rung.key: v for v in (getattr(decision, "rungs", None) or [])}
         watched = {v.rung.key: v

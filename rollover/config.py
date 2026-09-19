@@ -500,10 +500,14 @@ class RollConfig:
         # while contributing nothing to the total that is checked against the
         # position -- so two sections would sum to less than the position while
         # one of them quietly consumed all of it.
-        if len(specs) > 1:
-            for spec in specs:
-                if not spec.enabled:
-                    continue
+        # Counted among the ENABLED sections only. A section that is switched
+        # off sells nothing, so it takes nothing from anyone: one enabled
+        # section with no ladder is the original single-roll arrangement, and
+        # refusing it made "Add section" impossible from a config that had no
+        # ladder -- which is what a new install has.
+        live = [spec for spec in specs if spec.enabled]
+        if len(live) > 1:
+            for spec in live:
                 if not spec.cfg.limit_ladder:
                     errors.append(
                         f"{spec.name} has no limit_ladder. With more than one "

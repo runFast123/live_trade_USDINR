@@ -106,6 +106,47 @@ class TestAdding(unittest.TestCase):
         self.assertEqual(len(got), 3)
 
 
+class TestAddingToAConfigWithNoLadder(unittest.TestCase):
+    """What a new install actually looks like.
+
+    "limit_ladder": [] is the shipped default, and Add section used to refuse
+    outright from it: the existing pair became a section with no cap, and the
+    no-cap rule counted the disabled newcomer as a second section. So the one
+    config every operator starts from could never gain a second section.
+    """
+
+    def setUp(self):
+        self.cfg = config(limit_ladder=[])
+
+    def test_a_section_can_be_added(self):
+        got = editing.add(self.cfg, SEP, OCT)
+        self.assertEqual(len(got), 2)
+
+    def test_the_newcomer_is_still_switched_off(self):
+        got = editing.add(self.cfg, SEP, OCT)
+        self.assertFalse(got[1]["enabled"])
+
+    def test_one_uncapped_section_is_allowed_because_it_is_alone(self):
+        self.cfg.sections = editing.add(self.cfg, SEP, OCT)
+        self.cfg.validate()
+
+    def test_enabling_the_second_is_refused_while_the_first_has_no_cap(self):
+        """Two enabled, one uncapped, is the state that has no arithmetic."""
+        self.cfg.sections = editing.add(self.cfg, SEP, OCT)
+        self.cfg.sections[1]["limit_ladder"] = [{"bps": "30", "qty": 10000}]
+        with self.assertRaises(EditError) as ctx:
+            editing.enable(self.cfg, section_key("1769", "1500"), True)
+        self.assertIn("no limit_ladder", str(ctx.exception))
+        self.assertIn("Sep into Nov", str(ctx.exception))
+
+    def test_and_allowed_once_both_are_capped(self):
+        self.cfg.sections = editing.add(self.cfg, SEP, OCT)
+        self.cfg.sections[0]["limit_ladder"] = [{"bps": "50", "qty": 20000}]
+        self.cfg.sections[1]["limit_ladder"] = [{"bps": "30", "qty": 10000}]
+        got = editing.enable(self.cfg, section_key("1769", "1500"), True)
+        self.assertTrue(got[1]["enabled"])
+
+
 class TestEnabling(unittest.TestCase):
     def setUp(self):
         self.cfg = config()
