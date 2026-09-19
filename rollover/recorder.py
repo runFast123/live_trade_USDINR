@@ -38,12 +38,25 @@ COLUMNS = (
 NEAR_MISS_BPS = (0, 1, 2, 5, 10)
 
 
+def _filename_part(name: str) -> str:
+    """A section key such as "1769>1584" is not a filename on Windows."""
+    keep = [c if (c.isalnum() or c in "-_") else "_" for c in str(name or "")]
+    return "".join(keep).strip("_")
+
+
 class Recorder:
     """Appends one row per interval and keeps the day's statistics."""
 
-    def __init__(self, directory: str, interval_sec: float = 5.0):
+    def __init__(self, directory: str, interval_sec: float = 5.0,
+                 name: str = ""):
         self.directory = directory
         self.interval = max(0.5, float(interval_sec))
+        # Each roll gets its own file. Sep into Oct and Sep into Nov are
+        # different costs against different limits, and pooling them would
+        # produce a "closest approach" belonging to neither.
+        # Kept as given for anything a person reads, and flattened only
+        # where it has to be a filename.
+        self.name = str(name or "")
         os.makedirs(directory, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -63,7 +76,11 @@ class Recorder:
     # ------------------------------------------------------------------ paths
     @property
     def path(self) -> str:
-        return os.path.join(self.directory, f"market-{self._day:%Y-%m-%d}.csv")
+        stem = f"market-{self._day:%Y-%m-%d}"
+        part = _filename_part(self.name)
+        if part:
+            stem += "-" + part
+        return os.path.join(self.directory, stem + ".csv")
 
     def _roll_day_if_needed(self) -> None:
         today = date.today()
@@ -195,9 +212,11 @@ class Recorder:
         """A few lines for the log at the end of a session."""
         with self._lock:
             if not self.samples:
-                return "No market samples recorded."
+                who = f" for {self.name}" if self.name else ""
+                return f"No market samples recorded{who}."
 
-            lines = [f"Market summary for {self._day}: {self.samples} samples, "
+            who = f" ({self.name})" if self.name else ""
+            lines = [f"Market summary for {self._day}{who}: {self.samples} samples, "
                      f"{self.seconds_observed / 60:.0f} minutes observed."]
             if self.best_bps is not None:
                 when = f" at {self.best_at:%H:%M:%S}" if self.best_at else ""

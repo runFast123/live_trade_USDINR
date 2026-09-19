@@ -69,6 +69,74 @@ def _paths():
     return base, os.path.join(base, "config.json"), os.path.join(base, "logs")
 
 
+def _ladder_total(cfg) -> int:
+    from rollover.ladder import parse as parse_ladder
+    return parse_ladder(cfg.limit_ladder,
+                        lot_size=cfg.expected_lot_size).total_qty
+
+
+def _check_section(spec, several: bool) -> int:
+    """Print one section's contracts and limits. Returns 1 if it is unusable.
+
+    Several sections share every setting except the ones each states for
+    itself, so the common ground is printed once above and only the
+    differences appear here. With one section there is nothing to
+    distinguish, and the output is what it always was.
+    """
+    from rollover.ladder import LadderError, parse as parse_ladder
+    from rollover.ladder import parse_watch
+
+    cfg = spec.cfg
+    pad = "      " if several else "  "
+    bad = 0
+
+    if several:
+        print("")
+        state = "" if spec.enabled else "        DISABLED, it will not trade"
+        print(f"  [{spec.index + 1}] {spec.name}{state}")
+
+    print(f"{pad}near token   {cfg.near_token or '(not set)'}   "
+          f"expiry {cfg.near_expiry or '?'}")
+    print(f"{pad}far token    {cfg.far_token or '(not set)'}   "
+          f"expiry {cfg.far_expiry or '?'}")
+    print(f"{pad}size         {cfg.lots} lot(s) = {cfg.clip_qty} units")
+    if not cfg.near_token or not cfg.far_token:
+        bad = 1
+
+    if cfg.limit_ladder:
+        try:
+            built = parse_ladder(cfg.limit_ladder,
+                                 lot_size=cfg.expected_lot_size)
+            print(f"{pad}ladder       {len(built.rungs)} rung(s), "
+                  f"{built.total_qty:,} in total")
+            for rung in built.rungs:
+                orders = -(-rung.qty // cfg.clip_qty)   # round up
+                print(f"{pad}             {rung.describe(cfg.expected_lot_size)}"
+                      f"  = {orders} order(s) of {cfg.clip_qty:,}")
+            slowest = -(-built.total_qty // cfg.clip_qty)
+            if cfg.max_clips_per_day and slowest > cfg.max_clips_per_day:
+                days = -(-slowest // cfg.max_clips_per_day)
+                print(f"{pad}             at {cfg.max_clips_per_day} clip(s) a "
+                      f"day that is {days} trading days; raise lots or "
+                      "max_clips_per_day")
+        except LadderError as exc:
+            print(f"{pad}ladder       UNUSABLE: {exc}")
+            bad = 1
+    elif spec.enabled:
+        print(f"{pad}ladder       none: it rolls the whole position, "
+              "one clip at a time")
+
+    if cfg.watch_limits:
+        try:
+            watch = parse_watch(cfg.watch_limits)
+            shown = ", ".join(f"{b.normalize():f} bps" for b in watch)
+            print(f"{pad}watching     {shown}   priced and compared, never traded")
+        except LadderError as exc:
+            print(f"{pad}watching     UNUSABLE: {exc}")
+            bad = 1
+    return bad
+
+
 def cmd_check(cfg: RollConfig) -> int:
     print("config.json is valid.")
     if cfg.unknown_keys:
@@ -76,8 +144,6 @@ def cmd_check(cfg: RollConfig) -> int:
               + ", ".join(cfg.unknown_keys))
         print("               they are ignored, and left untouched when saving")
     print(f"  contract     {cfg.underlying}  segment {cfg.segment_id}")
-    print(f"  near token   {cfg.near_token or '(not set)'}   expiry {cfg.near_expiry or '?'}")
-    print(f"  far token    {cfg.far_token or '(not set)'}   expiry {cfg.far_expiry or '?'}")
     if cfg.limit_mode == "bps":
         print("  limit mode   basis points, by tenor")
         for months, bps in sorted(cfg.limit_bps_schedule.items(),
@@ -87,24 +153,6 @@ def cmd_check(cfg: RollConfig) -> int:
     else:
         print("  limit mode   fixed")
         print(f"  roll limit   {money(cfg.roll_limit_d)}")
-    print(f"  size         {cfg.lots} lot(s) = {cfg.clip_qty} units")
-    if cfg.limit_ladder:
-        from rollover.ladder import LadderError, parse as parse_ladder
-        try:
-            built = parse_ladder(cfg.limit_ladder, lot_size=cfg.expected_lot_size)
-            print(f"  ladder       {len(built.rungs)} rung(s), "
-                  f"{built.total_qty:,} in total")
-            for rung in built.rungs:
-                orders = -(-rung.qty // cfg.clip_qty)   # round up
-                print(f"               {rung.describe(cfg.expected_lot_size)}"
-                      f"  = {orders} order(s) of {cfg.clip_qty:,}")
-            slowest = -(-built.total_qty // cfg.clip_qty)
-            if cfg.max_clips_per_day and slowest > cfg.max_clips_per_day:
-                days = -(-slowest // cfg.max_clips_per_day)
-                print(f"               at {cfg.max_clips_per_day} clip(s) a day that is "
-                      f"{days} trading days; raise lots or max_clips_per_day")
-        except LadderError as exc:
-            print(f"  ladder       UNUSABLE: {exc}")
     print(f"  allowance    {cfg.allowance_ticks} tick(s) = {money(cfg.allowance)}")
     print(f"  mode         {'DRY RUN' if cfg.dry_run else 'LIVE ORDERS'}")
     print(f"  validity     {cfg.validity} "
@@ -113,8 +161,55 @@ def cmd_check(cfg: RollConfig) -> int:
     if not cfg.quantity_unit_confirmed:
         print("               live mode will refuse until this is settled; see")
         print("               LIVE-FINDINGS.md")
-    if not cfg.near_token or not cfg.far_token:
-        print("\nSet near_token and far_token before running. Use --find to list them.")
+
+    specs = cfg.section_specs()
+    several = len(specs) > 1 or bool(cfg.sections)
+    if several:
+        live = sum(1 for s in specs if s.enabled)
+        print(f"  sections     {len(specs)} configured, {live} enabled")
+        if cfg.max_clips_per_day_account:
+            print("  day budget   "
+                  f"{cfg.max_clips_per_day_account} clip(s) across all sections")
+
+    bad = 0
+    for spec in specs:
+        bad |= _check_section(spec, several)
+
+    # Two sections selling the same near month are spending one position
+    # between them, and the arithmetic only works if each is capped.
+    shared = {}
+    for spec in specs:
+        if spec.enabled and spec.cfg.near_token:
+            shared.setdefault(spec.cfg.near_token, []).append(spec)
+    for token, group in sorted(shared.items()):
+        if len(group) < 2:
+            continue
+        print("")
+        total = 0
+        capped = True
+        for spec in group:
+            if not spec.cfg.limit_ladder:
+                capped = False
+                continue
+            try:
+                total += _ladder_total(spec.cfg)
+            except Exception:
+                capped = False
+        names = ", ".join(s.name for s in group)
+        print(f"  NOTE         {len(group)} sections sell token {token}: {names}")
+        if capped:
+            print(f"               {total:,} claimed between them; it must be "
+                  "no more than the position held")
+        else:
+            print("               one of them has no ladder, so it claims the "
+                  "whole position and")
+            print("               leaves nothing for the others. Give every "
+                  "section a ladder.")
+            bad = 1
+
+    if bad:
+        print("")
+        print("Fix what is marked above before running. --find lists the tokens.")
         return 1
     return 0
 

@@ -14,7 +14,7 @@ Nothing here touches Tk, so all of it is testable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, List, Optional
 
@@ -124,6 +124,16 @@ def _feed_is_healthy(engine) -> bool:
 
 
 @dataclass
+class Roll:
+    """One enabled section's share of what going live authorises."""
+    name: str
+    lots: int
+    qty_sent: int
+    total: int
+    left: int
+
+
+@dataclass
 class Exposure:
     """What one clip commits, read both ways round.
 
@@ -140,6 +150,10 @@ class Exposure:
     # the clip would understate it by the number of clips in the ladder.
     campaign_qty: int = 0
     campaign_left: int = 0
+    # And it authorises every enabled section, not the one on screen. Summing
+    # them is the point: a dialog that showed only the first would understate
+    # the money by whatever the others still have to roll.
+    rolls: List["Roll"] = field(default_factory=list)
 
     @property
     def as_units(self) -> Optional[Decimal]:
@@ -179,10 +193,22 @@ class Exposure:
         if self.campaign_left:
             clips = -(-self.campaign_left // max(1, self.qty_sent))
             out.append("")
-            out.append(f"the ladder still has {self.campaign_left:,} to roll, "
+            what = ("the ladders still have" if self.rolls
+                    else "the ladder still has")
+            out.append(f"{what} {self.campaign_left:,} to roll, "
                        f"about {clips} clip(s)")
             if self.campaign_value is not None:
                 out.append(f"which is {rupees(self.campaign_value)} in total")
+
+        if self.rolls:
+            # Named, because going live switches on all of them at once and
+            # the operator may be looking at only one of them on screen.
+            out.append("")
+            out.append(f"this authorises all {len(self.rolls)} enabled "
+                       "section(s):")
+            for roll in self.rolls:
+                out.append(f"    {roll.name}: {roll.left:,} left of "
+                           f"{roll.total:,}, in clips of {roll.qty_sent:,}")
         return out
 
 
@@ -210,25 +236,61 @@ def _round(value: Decimal, places: int) -> Decimal:
     return value.quantize(D(1).scaleb(-places), rounding=ROUND_HALF_UP)
 
 
+def _rolls(engine, size: int) -> List[Roll]:
+    """Every enabled section, and what each still has to roll.
+
+    getattr's default only swallows AttributeError, so each lookup belongs
+    inside the guard. Nothing about the ladders may stop the dialog that asks
+    whether to send real orders from opening.
+    """
+    out: List[Roll] = []
+    try:
+        sections = list(getattr(engine, "sections", None) or [])
+    except Exception:
+        sections = []
+    for section in sections:
+        try:
+            if not getattr(section, "enabled", True):
+                continue
+            lots = int(getattr(section.cfg, "lots", 1) or 1)
+            ladder = getattr(section, "ladder", None)
+            total = ladder.total_qty if ladder else 0
+            left = (ladder.remaining_total(getattr(section, "ladder_progress", {}))
+                    if ladder else 0)
+            out.append(Roll(name=str(getattr(section, "name", "") or "this roll"),
+                            lots=lots, qty_sent=lots * size,
+                            total=total, left=left))
+        except Exception:
+            continue
+    return out
+
+
 def exposure(cfg, price: Optional[Decimal], lot_size: Optional[int] = None,
              engine=None) -> Exposure:
     lots = int(getattr(cfg, "lots", 1) or 1)
     size = int(lot_size or getattr(cfg, "lot_size", 1000) or 1000)
 
-    total = left = 0
-    try:
-        # getattr's default only swallows AttributeError, so the lookup itself
-        # belongs inside the guard. Nothing about the ladder may stop the
-        # dialog that asks whether to send real orders from opening.
-        ladder = getattr(engine, "ladder", None)
-        if ladder:
-            total = ladder.total_qty
-            left = ladder.remaining_total(getattr(engine, "ladder_progress", {}))
-    except Exception:
+    rolls = _rolls(engine, size)
+    if rolls:
+        # The largest clip, because the question this dialog answers is what a
+        # single order could commit, and sections may be sized differently.
+        lots = max(r.lots for r in rolls)
+        total = sum(r.total for r in rolls)
+        left = sum(r.left for r in rolls)
+    else:
         total = left = 0
+        try:
+            ladder = getattr(engine, "ladder", None)
+            if ladder:
+                total = ladder.total_qty
+                left = ladder.remaining_total(
+                    getattr(engine, "ladder_progress", {}))
+        except Exception:
+            total = left = 0
 
     return Exposure(lots=lots, lot_size=size, price=price, qty_sent=lots * size,
-                    campaign_qty=total, campaign_left=left)
+                    campaign_qty=total, campaign_left=left,
+                    rolls=rolls if len(rolls) > 1 else [])
 
 
 def summary(cfg, checks: List[Check], exposure_: Exposure) -> str:

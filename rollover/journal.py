@@ -163,6 +163,38 @@ class Journal:
     def note(self, kind: str, message: str, **fields: Any) -> bool:
         return self.write(kind, message=message, **fields)
 
+    def for_section(self, key: str, name: str = "") -> "Journal":
+        """A view that stamps every line with the roll it came from.
+
+        Without this the record does not stand up. Two sections selling the
+        same September differ only in their far leg, and a near-leg SELL line
+        carries no far leg at all -- so the one order that leaves the account
+        short is the one line you could not attribute. Same file, same lock,
+        so the events stay in the order they happened.
+        """
+        return SectionJournal(self, key, name)
+
+
+class SectionJournal(Journal):
+    """One section's view of the shared journal. Read-only on the parent."""
+
+    def __init__(self, parent: Journal, key: str, name: str = ""):
+        # Deliberately not calling Journal.__init__: everything else --
+        # directory, enabled, the lock, the open day -- is the parent's, found
+        # through __getattr__, so there is exactly one file and one lock.
+        self._parent = parent
+        self.key = key
+        self.name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._parent, attr)
+
+    def write(self, kind: str, **fields: Any) -> bool:
+        fields.setdefault("section", self.key)
+        if self.name:
+            fields.setdefault("section_name", self.name)
+        return self._parent.write(kind, **fields)
+
 
 def _positions(value) -> Optional[Dict[str, Any]]:
     if value is None:

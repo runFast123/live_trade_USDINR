@@ -128,9 +128,10 @@ class RollEngine:
         self.reader: Optional[QuoteReader] = None
         self.feed = LiveFeed(cfg, log)
         self.quote_source = "starting"
-        self.recorder = (Recorder(os.path.join(base_dir, "data"),
-                                  cfg.record_interval_sec)
-                         if cfg.record_market else None)
+        # One recorder per section, built below. Sep into Oct and Sep into
+        # Nov are different costs against different limits, so a single file
+        # would produce a "closest approach" belonging to neither roll.
+        self._recording = bool(cfg.record_market)
         self.journal = journallib.Journal(os.path.join(base_dir, "data"),
                                           enabled=cfg.journal)
         # Whether the cost was clearing the limit on the previous tick,
@@ -164,10 +165,24 @@ class RollEngine:
         saved = self.store.for_campaign(saved, self.campaign_key())
         self.saved = saved
 
+        solo = len(self.sections) < 2 and not cfg.sections
         for section in self.sections:
             section.ladder = self._build_ladder(section)
             section.watch_limits = self._build_watch(section)
             section.load_from(saved.section(section.key))
+            # One roll keeps the plain market-<date>.csv it has always had;
+            # several get a file each, named after the section.
+            section.recorder = (
+                Recorder(os.path.join(base_dir, "data"),
+                         cfg.record_interval_sec,
+                         name="" if solo else (section.name or section.key))
+                if self._recording else None)
+            # One file, one lock, but every line from this roll says so. With
+            # one roll there is nothing to distinguish, and the record reads
+            # exactly as it always did.
+            section.journal = (self.journal if solo else
+                               self.journal.for_section(section.key,
+                                                        section.name))
 
         # A version 1 file had no sections, so its figures were migrated under
         # the campaign key. Where that key is not one of ours -- the operator
@@ -246,16 +261,26 @@ class RollEngine:
 
     def stop(self) -> None:
         self._stop.set()
-        if self.recorder is not None:
+        for section in self.sections:
+            recorder = getattr(section, "recorder", None)
+            if recorder is None:
+                continue
+            # Each section is summarised against its OWN limit. Measuring one
+            # roll's cost against another's limit is how you get told a roll
+            # was never in the money when it was.
             limit_bps = None
-            snap = self._snapshot
-            if snap is not None and snap.decision is not None:
-                limit_bps = snap.decision.limit_bps
-            for line in self.recorder.summary(limit_bps).splitlines():
+            if section.decision is not None:
+                limit_bps = section.decision.limit_bps
+            for line in recorder.summary(limit_bps).splitlines():
                 self.log.info(line)
         self.feed.stop()
         if self._thread:
             self._thread.join(timeout=5)
+
+    @property
+    def recorder(self):
+        """The first section's, the way .session and .ladder are."""
+        return getattr(self.sections[0], "recorder", None) if self.sections else None
 
     def restart(self) -> None:
         """Re-read the configured contracts and start watching again.
@@ -892,10 +917,11 @@ class RollEngine:
                       first.decision if first else None, self._note,
                       first.report if first else None)
 
-        if self.recorder is not None and near_q is not None and far_q is not None:
-            self.recorder.sample(near_q, far_q, first.decision, first.report,
-                                 self.quote_source)
         for section in self.sections:
+            quotes = getattr(section, "quotes", None)
+            if section.recorder is not None and quotes:
+                section.recorder.sample(quotes[0], quotes[1], section.decision,
+                                        section.report, self.quote_source)
             if section.decision is not None:
                 self._announce_crossing(section.decision, section)
 
@@ -979,6 +1005,8 @@ class RollEngine:
         """
         section = section if section is not None else self.sections[0]
         cfg = section.cfg
+        # Every line this clip writes says which roll it belongs to.
+        journal = section.journal
         if sequence is None:
             sequence = self._choose_sequence(decision, near_q, far_q, section)
 
@@ -986,8 +1014,8 @@ class RollEngine:
         self.log.info(f"--- ROLL: {section.label()} ---")
         self.log.info(decision.describe().replace("\n", " | "))
         self.log.info(f"Order of legs: {sequence.describe()}")
-        self.journal.decision(decision, dry_run=cfg.dry_run, armed=True)
-        self.journal.note("sequence", sequence.describe(),
+        journal.decision(decision, dry_run=cfg.dry_run, armed=True)
+        journal.note("sequence", sequence.describe(),
                           section=section.label(), order=sequence.order,
                           near_bid_qty=getattr(near_q, "bid_qty", None),
                           far_ask_qty=getattr(far_q, "ask_qty", None),
@@ -1012,7 +1040,7 @@ class RollEngine:
             estimate = marginlib.estimate(
                 self.broker, cfg.near_token, cfg.far_token, decision.qty)
             self.account.margin = estimate
-            self.journal.margin(estimate, decision.qty)
+            journal.margin(estimate, decision.qty)
             if estimate.affordable is not True:
                 self.account.in_flight = False
                 self.disarm("margin")
@@ -1040,7 +1068,7 @@ class RollEngine:
                                          first.price, f"leg 1 {first.role} "
                                          f"{'BUY' if first.side == BUY else 'SELL'}")
             self.log.info(f"leg 1 result: {leg1.detail}")
-            self.journal.order(first.role, first.side, first.token, decision.qty,
+            journal.order(first.role, first.side, first.token, decision.qty,
                                first.price, leg1)
 
             if cfg.dry_run:
@@ -1076,7 +1104,7 @@ class RollEngine:
                                          f"leg 2 {second.role} "
                                          f"{'BUY' if second.side == BUY else 'SELL'}")
             self.log.info(f"leg 2 result: {leg2.detail}")
-            self.journal.order(second.role, second.side, second.token,
+            journal.order(second.role, second.side, second.token,
                                leg1.filled_qty, second.price, leg2)
 
             if leg2.fully_filled:
@@ -1091,7 +1119,7 @@ class RollEngine:
                     self.broker, cfg.near_token, cfg.far_token,
                     before_positions or reconcile.Positions(None, None),
                     leg2.filled_qty, wait=cfg.reconcile_wait_sec)
-                self.journal.reconciliation(verdict)
+                journal.reconciliation(verdict)
                 if verdict.contradicted:
                     # Count the clip before halting: whatever else is wrong,
                     # this much was sent, and the daily budget must reflect it.
@@ -1111,7 +1139,7 @@ class RollEngine:
                     f"{near_leg.filled_qty} near, bought {far_leg.filled_qty} "
                     f"far, at a booked cost near {money(decision.roll_cost)} "
                     "per unit.")
-                self.journal.note(
+                journal.note(
                     "complete", "roll complete", section=section.label(),
                     near_filled=near_leg.filled_qty,
                     far_filled=far_leg.filled_qty,

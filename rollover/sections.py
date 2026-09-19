@@ -96,6 +96,13 @@ class Section:
         self.quotes = None
         self.note = ""
 
+        # Its own evidence file, and its own view of the shared journal.
+        # Both are set by the engine: each roll is a different cost against a
+        # different limit, so the evidence is not pooled, and every order line
+        # says which roll asked for it.
+        self.recorder = None
+        self.journal = None
+
     # ------------------------------------------------------- the config
     @property
     def cfg(self):
