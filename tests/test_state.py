@@ -145,6 +145,184 @@ class TestWriting(StateCase):
         self.assertIn(result, (True, False))
 
 
+class TestPerSectionState(StateCase):
+    """Each section keeps its own count, its own progress and its own halt."""
+
+    def test_a_section_is_created_on_first_use(self):
+        state = self.store.load(self.today)
+        section = state.section("1769>1584")
+        self.assertEqual(section.clips_done, 0)
+        self.assertIs(state.section("1769>1584"), section)
+
+    def test_sections_survive_a_restart(self):
+        state = self.store.load(self.today)
+        state.section("1769>1500").clips_done = 2
+        state.section("1769>1584").ladder_done = {"50": 3000}
+        self.store.save(state)
+
+        again = StateStore(self.dir).load(self.today)
+        self.assertEqual(again.section("1769>1500").clips_done, 2)
+        self.assertEqual(again.section("1769>1584").ladder_done, {"50": 3000})
+
+    def test_one_section_halting_does_not_halt_another(self):
+        state = self.store.load(self.today)
+        state.section("a").halted_reason = "HALF ROLLED"
+        state.section("b").clips_done = 1
+        self.store.save(state)
+
+        again = StateStore(self.dir).load(self.today)
+        self.assertTrue(again.section("a").halted)
+        self.assertFalse(again.section("b").halted)
+
+    def test_daily_counts_reset_per_section(self):
+        state = self.store.load(self.today)
+        state.section("a").clips_done = 2
+        state.section("a").lots_rolled = 2000
+        self.store.save(state)
+
+        tomorrow = self.store.load(self.today + timedelta(days=1))
+        self.assertEqual(tomorrow.section("a").clips_done, 0)
+        self.assertEqual(tomorrow.section("a").lots_rolled, 0)
+
+    def test_a_halt_and_ladder_progress_do_not_reset_overnight(self):
+        state = self.store.load(self.today)
+        state.section("a").halted_reason = "HALF ROLLED, short 600"
+        state.section("a").ladder_done = {"30": 4000}
+        self.store.save(state)
+
+        tomorrow = self.store.load(self.today + timedelta(days=1))
+        self.assertTrue(tomorrow.section("a").halted)
+        self.assertEqual(tomorrow.section("a").ladder_done, {"30": 4000})
+
+    def test_an_unrecognised_section_field_does_not_brick_it(self):
+        self.store.save(DayState(trading_date="2026-09-18"))
+        with open(self.store.path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        body["sections"] = {"a": {"clips_done": 2, "something_new": 9}}
+        with open(self.store.path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+        again = StateStore(self.dir).load(self.today)
+        self.assertEqual(again.section("a").clips_done, 2)
+
+    def test_a_section_entry_that_is_not_an_object_is_skipped(self):
+        self.store.save(DayState(trading_date="2026-09-18"))
+        with open(self.store.path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        body["sections"] = {"a": "nonsense", "b": {"clips_done": 1}}
+        with open(self.store.path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+        again = StateStore(self.dir).load(self.today)
+        self.assertNotIn("a", again.sections)
+        self.assertEqual(again.section("b").clips_done, 1)
+
+
+class TestUpgradingFromAFileWithNoSections(StateCase):
+    """A version 1 file records one roll in flat fields.
+
+    Its ladder_campaign is already the pair of contracts, the same near>far a
+    section key uses, so the migration is to move the flat figures under that
+    key. Without it, upgrading would present a part-finished campaign as
+    untouched and roll the whole thing again.
+    """
+
+    def write_v1(self, **overrides):
+        body = {"version": 1, "trading_date": "2026-09-18", "clips_done": 3,
+                "lots_rolled": 3000, "ladder_campaign": "1769>1584",
+                "ladder_done": {"50": 3000}, "halted_reason": None}
+        body.update(overrides)
+        with open(self.store.path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+    def test_the_old_roll_becomes_a_section(self):
+        self.write_v1()
+        state = self.store.load(self.today)
+        self.assertIn("1769>1584", state.sections)
+
+    def test_its_progress_comes_with_it(self):
+        self.write_v1()
+        section = self.store.load(self.today).section("1769>1584")
+        self.assertEqual(section.clips_done, 3)
+        self.assertEqual(section.lots_rolled, 3000)
+        self.assertEqual(section.ladder_done, {"50": 3000})
+
+    def test_a_halt_comes_with_it(self):
+        self.write_v1(halted_reason="HALF ROLLED")
+        self.assertTrue(self.store.load(self.today).section("1769>1584").halted)
+
+    def test_an_untouched_old_file_creates_nothing(self):
+        self.write_v1(clips_done=0, lots_rolled=0, ladder_done={})
+        self.assertEqual(self.store.load(self.today).sections, {})
+
+    def test_an_old_file_with_no_campaign_creates_nothing(self):
+        """Without a pair of contracts there is no key to file it under."""
+        self.write_v1(ladder_campaign="")
+        self.assertEqual(self.store.load(self.today).sections, {})
+
+    def test_saving_upgrades_the_file(self):
+        self.write_v1()
+        self.store.save(self.store.load(self.today))
+        with open(self.store.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["version"], 2)
+
+
+class TestADowngradeCannotRollTwice(StateCase):
+    """An older build reads only the flat fields.
+
+    It must not conclude that nothing has been rolled and nothing is wrong, so
+    the flat fields carry the account's totals, chosen conservatively.
+    """
+
+    def flat(self, state):
+        self.store.save(state)
+        with open(self.store.path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_any_section_halted_halts_the_file(self):
+        state = self.store.load(self.today)
+        state.section("a").name = "Sep into Oct"
+        state.section("a").halted_reason = "HALF ROLLED, short 600"
+        state.section("b").clips_done = 1
+
+        body = self.flat(state)
+        self.assertTrue(body["halted_reason"])
+        self.assertIn("Sep into Oct", body["halted_reason"])
+        self.assertIn("short 600", body["halted_reason"])
+
+    def test_every_halted_section_is_named(self):
+        state = self.store.load(self.today)
+        state.section("a").name = "A"
+        state.section("a").halted_reason = "one"
+        state.section("b").name = "B"
+        state.section("b").halted_reason = "two"
+
+        body = self.flat(state)
+        self.assertIn("A: one", body["halted_reason"])
+        self.assertIn("B: two", body["halted_reason"])
+
+    def test_the_flat_clip_count_is_the_largest_not_the_sum(self):
+        """Under-trading on a downgrade is recoverable; over-trading is not."""
+        state = self.store.load(self.today)
+        state.section("a").clips_done = 3
+        state.section("b").clips_done = 1
+        self.assertEqual(self.flat(state)["clips_done"], 3)
+
+    def test_the_flat_lots_are_the_sum(self):
+        state = self.store.load(self.today)
+        state.section("a").lots_rolled = 2000
+        state.section("b").lots_rolled = 3000
+        self.assertEqual(self.flat(state)["lots_rolled"], 5000)
+
+    def test_no_sections_leaves_the_flat_fields_alone(self):
+        state = self.store.load(self.today)
+        state.clips_done = 2
+        state.halted_reason = "something"
+        body = self.flat(state)
+        self.assertEqual(body["clips_done"], 2)
+        self.assertEqual(body["halted_reason"], "something")
+
+
 class TestThroughTheEngine(unittest.TestCase):
     """The engine must actually use it."""
 
