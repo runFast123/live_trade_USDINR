@@ -398,3 +398,41 @@ Their answers 3 and 4 are mutually inconsistent. Worth asking which feed, if
 any, normalises to units -- and whether `TotalBuyQty` / `TotalSellQty` differ
 from the touch sizes, since the app does not use them today but the depth
 ladder work in phase 2 will.
+
+### Choice confirmed the split, 19 September 2026
+
+Asked again, with the arithmetic. They agreed, and gave the full table.
+
+| Field | Unit |
+|---|---|
+| `placeorder` `Qty` | units of the underlying |
+| order book `Qty`, trade book `TradedQty` | units |
+| `get_margin` `qty` | units |
+| touchline `BidQty` / `AskQty` | **contracts** |
+| depth `TotalBuyQty` / `TotalSellQty` | **contracts** |
+| `Volume` / `TotalTradedQty` | **contracts** |
+
+Their own translation rule is what the app now does: order quantity is feed
+quantity times MarketLot.
+
+The app reads none of the depth totals or the day volume, so nothing else
+needed changing. `TotalBuyQty` and `TotalSellQty` do appear in broker.py, but
+as fallback aliases when reading the POSITION book, which is a different
+response from a different endpoint. Worth knowing the names collide.
+
+### Still unanswered: the position book
+
+Their table does not cover it, and it is the one that decides whether the app
+can roll anything. A 100 lot holding read as 100 units would refuse to trade;
+100,000 units read as 100,000 lots would try to roll a thousand times too
+much.
+
+There is no evidence to settle it either way, because this account holds
+nothing. So the app now settles it by itself: a **position unit** gate refuses
+when the reported holding is not a whole multiple of the lot size. A position
+is always whole lots -- an exchange cannot fill a part contract -- so a figure
+that is not is a figure in the wrong unit. It names both readings and blocks
+until the operator confirms.
+
+Same arithmetic that settled the depth question, applied to the one field
+still open.

@@ -206,6 +206,26 @@ def evaluate(cfg, session, quotes, decision, now: Optional[datetime] = None,
             "the account's clips for today are all used")
 
     # ---- position ----------------------------------------------------------
+    # A position is a whole number of lots, always: an exchange cannot fill a
+    # part contract. So a holding that is NOT a whole multiple of the lot size
+    # is not a holding -- it is a figure in the wrong unit, and the broker
+    # quotes depth in lots while taking orders in units, so both readings
+    # genuinely exist in this API. Reading a 100 lot position as 100 units
+    # would refuse to roll anything; reading it the other way would try to
+    # roll a thousand times too much.
+    #
+    # This is the same arithmetic that settled the depth question, and it
+    # settles the position the moment one is actually held.
+    held = session.near_position_qty
+    lot = int(getattr(near_info, "lot_size", 0) or 0)
+    if held and lot > 1 and int(held) % lot:
+        add("position unit", False,
+            f"the position book reports {held:,}, which is not a whole "
+            f"multiple of the {lot:,} lot. A position is always whole lots, "
+            f"so this is being read in the wrong unit -- it is most likely "
+            f"{int(held):,} contracts, or {int(held) * lot:,} units. Confirm "
+            "with the broker before trading against it.")
+
     if cfg.require_position:
         qty = session.near_position_qty
         if qty is None:

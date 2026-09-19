@@ -343,3 +343,90 @@ class TestTheBookAndTheOrderUseDifferentUnits(unittest.TestCase):
     def test_a_missing_size_stays_missing(self):
         got = self.quotes(far_size=None)
         self.assertIsNone(got["1584"].ask_qty)
+
+
+class TestThePositionUnitCatchesItself(unittest.TestCase):
+    """A position is always a whole number of lots.
+
+    An exchange cannot fill a part contract, so a holding that is not a whole
+    multiple of the lot size is not a holding -- it is a figure in the wrong
+    unit. Both readings genuinely exist in this API: the broker quotes depth
+    in lots and takes orders in units, and their own table does not say which
+    the position book uses.
+
+    Reading a 100 lot position as 100 units would refuse to roll anything.
+    Reading 100,000 units as 100,000 lots would try to roll a thousand times
+    too much. This gate notices either the moment a position is held.
+    """
+
+    def report(self, held, lot=1000):
+        from datetime import date, datetime
+
+        from rollover import gates, rule
+        from rollover.broker import InstrumentInfo
+        from rollover.quotes import Quote
+
+        def leg(token, desc, expiry):
+            return InstrumentInfo(token=token, symbol="USDINR", sec_desc=desc,
+                                  segment="13", lot_size=lot, expiry=expiry,
+                                  instrument="FUTCUR",
+                                  price_divisor=D("10000000"),
+                                  tick=D("0.0025"), tick_units=D("25000"),
+                                  low_range=D("93"), high_range=D("99"))
+
+        class Session:
+            logged_in = True
+            market_open = True
+            in_flight = False
+            halted_reason = None
+            clips_done_today = 0
+            account_clips_left = None
+            scrip_file_date = date(2026, 9, 17)
+            near = leg("1769", "USDINR26SEPFUT", date(2026, 9, 28))
+            far = leg("1584", "USDINR26NOVFUT", date(2026, 11, 26))
+            near_position_qty = held
+            margin = None
+
+        cfg = RollConfig(near_token="1769", far_token="1584",
+                         limit_bps_schedule={"1": "50", "2": "50"},
+                         expected_lot_size=lot, lots=1)
+        now = time.monotonic()
+        quotes = {"1769": Quote("1769", D("95.78"), D("95.7825"), now, D(1),
+                                bid_qty=400000, ask_qty=400000),
+                  "1584": Quote("1584", D("95.80"), D("95.8025"), now, D(1),
+                                bid_qty=400000, ask_qty=400000)}
+        decision = rule.compute(quotes["1769"], quotes["1584"], cfg, days=59)
+        return gates.evaluate(cfg, Session(), quotes, decision,
+                              datetime(2026, 9, 17, 11, 0, 0))
+
+    def named(self, report):
+        return [g for g in report.gates if g.name == "position unit"]
+
+    def test_a_whole_number_of_lots_raises_nothing(self):
+        self.assertEqual(self.named(self.report(100000)), [])
+
+    def test_no_position_raises_nothing(self):
+        """Zero is not a wrong unit, it is nothing held."""
+        self.assertEqual(self.named(self.report(0)), [])
+
+    def test_an_unknown_position_raises_nothing(self):
+        """That already has its own gate, and it blocks."""
+        self.assertEqual(self.named(self.report(None)), [])
+
+    def test_a_hundred_lots_read_as_a_hundred_units_is_caught(self):
+        got = self.named(self.report(100))
+        self.assertTrue(got)
+        self.assertFalse(got[0].ok)
+
+    def test_and_it_says_what_the_figure_probably_means(self):
+        got = self.named(self.report(100))[0]
+        self.assertIn("100 contracts", got.detail)
+        self.assertIn("100,000 units", got.detail)
+
+    def test_it_blocks_the_roll(self):
+        """Trading against a position you cannot read is the whole risk."""
+        self.assertFalse(self.report(100).ok)
+
+    def test_a_different_lot_size_is_respected(self):
+        self.assertEqual(self.named(self.report(500, lot=100)), [])
+        self.assertTrue(self.named(self.report(550, lot=100)))
