@@ -219,6 +219,36 @@ class QuoteReader:
         circuit limits can be used instead of a guessed scale and a generic band."""
         self.instruments = dict(instruments)
 
+    def _depth_in_units(self, token: str, bid_qty, ask_qty):
+        """Put the book's sizes into the same unit as an order quantity.
+
+        An order quantity is in units of the underlying: one USDINR contract
+        is qty 1000. The book is NOT -- it is quoted in contracts. Both are
+        the broker's own answer, and they are only consistent if the sizes
+        are converted before anything compares them.
+
+        The proof is in the broker's own rule that an order quantity must be
+        an exact multiple of the lot size. If every resting order is a
+        multiple of 1,000 units then the total resting at a price is a sum of
+        multiples of 1,000, and so a multiple of 1,000 itself. A book cannot
+        show 29 units. Ours showed 29, and 1, and 302, in 11,092 readings out
+        of 11,272 across both the websocket and the polled touchline.
+
+        Without this the touch-size gate compared a 1,000 unit clip against a
+        size in contracts and demanded a thousand lots resting to trade one.
+        It blocked essentially every observation of a full trading day.
+        """
+        if not self.cfg.depth_in_lots:
+            return bid_qty, ask_qty
+        info = self.instruments.get(token)
+        lot = int(getattr(info, "lot_size", 0) or 0)
+        if lot <= 0:
+            # Unknown lot size: leave the figure alone rather than scale it by
+            # a guess. The gate then blocks, which is the safe direction.
+            return bid_qty, ask_qty
+        return (None if bid_qty is None else int(bid_qty) * lot,
+                None if ask_qty is None else int(ask_qty) * lot)
+
     def _divisor_candidates(self) -> Tuple[Decimal, ...]:
         declared = []
         for info in self.instruments.values():
@@ -405,7 +435,7 @@ class QuoteReader:
                     "This is bad data or a halted contract."
                 )
             self._check_against_limits(token, bid_r, ask_r)
-            bid_qty, ask_qty = sizes[token]
+            bid_qty, ask_qty = self._depth_in_units(token, *sizes[token])
             quotes[token] = Quote(
                 token=token, bid=bid_r, ask=ask_r, at=at, divisor=divisor,
                 bid_qty=bid_qty, ask_qty=ask_qty, raw=by_token[token],

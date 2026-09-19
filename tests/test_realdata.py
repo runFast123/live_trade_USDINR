@@ -321,9 +321,23 @@ class TestLiveTouchlineShape(unittest.TestCase):
         self.assertEqual(floor_tick(raw, D("0.0025")), D("95.9175"))
         self.assertEqual(self.quotes["1769"].bid, D("95.9200"))
 
-    def test_the_top_of_book_size_is_carried_through(self):
-        self.assertEqual(self.quotes["1769"].bid_qty, 338)
-        self.assertEqual(self.quotes["1584"].ask_qty, 7)
+    def test_the_top_of_book_size_is_put_into_order_units(self):
+        """The feed says 338 and 7. Those are CONTRACTS.
+
+        An order quantity is in units of the underlying -- one contract is
+        qty 1000 -- so the sizes have to be converted before anything
+        compares them against a clip. The broker's own rule that an order
+        quantity must be an exact multiple of the lot size is what proves it:
+        a total resting at a price is then a sum of multiples of 1,000, and
+        this book shows 7.
+        """
+        self.assertEqual(self.quotes["1769"].bid_qty, 338 * 1000)
+        self.assertEqual(self.quotes["1584"].ask_qty, 7 * 1000)
+
+    def test_the_raw_feed_figures_are_not_themselves_whole_lots(self):
+        """Which is the evidence. 7 cannot be 7 units of a 1,000 unit lot."""
+        for raw in (338, 7):
+            self.assertNotEqual(raw % 1000, 0)
 
     def test_the_top_rung_is_used_not_a_deeper_one(self):
         self.assertEqual(self.quotes["1769"].bid, D("95.9200"))   # not 95.9150
@@ -344,15 +358,33 @@ class TestLiveTouchlineShape(unittest.TestCase):
             self.reader.parse(payload, ["1769", "1584"], time.monotonic())
         self.assertIn("away from the tick grid", str(ctx.exception))
 
-    def test_a_thin_far_offer_blocks_the_roll(self):
-        """7 units on the far offer cannot fill a 1000 unit clip."""
+    def test_a_far_offer_of_seven_lots_covers_a_one_lot_clip(self):
+        """It used to be read as 7 units and block.
+
+        That comparison -- a clip in units against a size in contracts --
+        demanded a thousand lots resting to trade one, and blocked
+        essentially every observation of a full trading day.
+        """
         decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
                                 self.cfg, days=59)
         session = FakeSession(near_leg(), far_leg())
         report = gates.evaluate(self.cfg, session, self.quotes, decision,
                                 datetime(2026, 9, 17, 11, 0, 0))
+        self.assertIn("7000 resting at the ask, clip needs 1000", str(report))
+        touch = [g for g in report.gates if g.name == "far touch size"]
+        self.assertTrue(touch and touch[0].ok)
+
+    def test_a_far_offer_genuinely_too_small_still_blocks(self):
+        """The gate must still be able to refuse, or it is not a gate."""
+        self.cfg.lots = 20            # a 20,000 unit clip against 7,000
+        decision = rule.compute(self.quotes["1769"], self.quotes["1584"],
+                                self.cfg, days=59)
+        session = FakeSession(near_leg(), far_leg())
+        report = gates.evaluate(self.cfg, session, self.quotes, decision,
+                                datetime(2026, 9, 17, 11, 0, 0))
+        touch = [g for g in report.gates if g.name == "far touch size"]
+        self.assertTrue(touch and not touch[0].ok)
         self.assertFalse(report.ok)
-        self.assertIn("7 resting at the ask", str(report))
 
     def test_the_size_check_can_be_turned_off(self):
         self.cfg.require_touch_size = False

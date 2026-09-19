@@ -146,6 +146,15 @@ class RollConfig:
 
     # --- data quality gates ------------------------------------------------
     max_quote_age_sec: float = 3.0
+    # The book is quoted in CONTRACTS; an order quantity is in units of the
+    # underlying. Both are the broker's own answer, and they are only
+    # consistent if the sizes are multiplied by the lot size before anything
+    # compares them against a clip. Proof: the broker enforces that an order
+    # quantity is an exact multiple of the lot size, so a total resting at a
+    # price must be a multiple of it too -- and 11,092 of 11,272 observed
+    # sizes were not. Set false only if the feed ever starts reporting units.
+    depth_in_lots: bool = True
+
     max_leg_spread: str = "0.0500"       # reject a leg whose own bid/ask spread is wider
     price_band_low: str = "70"           # a USDINR price outside this band is bad data
     price_band_high: str = "130"

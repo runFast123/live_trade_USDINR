@@ -335,3 +335,66 @@ Two things must be true before 3.1 can even be attempted, and neither is code:
 Plus a trading day. September stops trading at 12:30 on **28 September**, which
 is six sessions away, so the recommendation in the plan stands and has become
 urgent: roll September by hand this cycle.
+
+---
+
+## Settled by Choice, 19 September 2026: the quantity unit
+
+Asked in writing, answered in writing. **An order quantity is in units of the
+underlying.** One USDINR contract is `Qty = 1000`.
+
+| | |
+|---|---|
+| `placeorder` `Qty` for one contract | **1000**, not 1 |
+| unit | units of the underlying (USD) |
+| must be a multiple of `MarketLot` | **yes**, hard-enforced by OMS/RMS and the exchange |
+| order book `Qty`, `LeavesQty` | same unit as sent |
+| trade book `TradedQty`, `FilledQty` | same unit |
+| `get_margin` `token\|qty` | same unit — `1769\|1000` for one contract |
+| freeze limit | 10,000 contracts = `Qty` 10,000,000 |
+
+This confirms the app's existing clip of `lots x 1000`. It is **not** a
+thousand-fold over-order. `quantity_unit_confirmed` is now true on evidence
+rather than on a statement.
+
+### But their answer about the market feed is wrong, and their own rule proves it
+
+Choice also said the feed's `BidQty` / `AskQty` are "normalized and broadcast
+in units of the underlying", so that "a BidQty of 5000 represents 5
+contracts".
+
+That cannot be true, and the proof is their own answer above. If every order
+quantity must be an exact multiple of 1,000 units, then the total resting at a
+price is a sum of multiples of 1,000, and so a multiple of 1,000 itself.
+
+Of 11,272 depth readings recorded on 18 September across **both** the
+websocket feed and the polled touchline, **11,092 were not multiples of
+1,000**. The commonest values were 10, 50, 100, 30, 5, 1, 8, 2. Read as
+contracts every one of them is ordinary: 1 contract is $1,000 resting, 302 is
+$302,000.
+
+**The feed is in contracts. The order is in units.**
+
+### What that cost
+
+The touch-size gate compared a clip in units against a size in contracts, so
+a one lot clip demanded a thousand lots resting before it would trade.
+
+    Sep -> Nov, 2,117 observations on 18 September
+      touch-size gate passed, reading depth as units     : 0
+      touch-size gate passes, reading depth as contracts : 2,117
+
+It blocked every observation of a full trading day. Sizes are converted to
+order units as the quote is built (`depth_in_lots`, default true), so
+everything downstream compares like with like.
+
+The price was still never inside the limit that day, so the roll would not
+have fired regardless -- but it would have been the price stopping it rather
+than a unit mismatch, and only one of those is worth acting on.
+
+### Worth putting back to them
+
+Their answers 3 and 4 are mutually inconsistent. Worth asking which feed, if
+any, normalises to units -- and whether `TotalBuyQty` / `TotalSellQty` differ
+from the touch sizes, since the app does not use them today but the depth
+ladder work in phase 2 will.

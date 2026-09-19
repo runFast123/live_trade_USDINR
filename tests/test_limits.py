@@ -270,3 +270,76 @@ class TestTheLimitIsNeverLooserThanAsked(unittest.TestCase):
             gap = self.exact("30", reference) - limits.from_bps(D("30"), reference)
             self.assertGreaterEqual(gap, 0)
             self.assertLess(gap, D("0.0001"))
+
+
+class TestTheBookAndTheOrderUseDifferentUnits(unittest.TestCase):
+    """The broker gave both answers, and they only fit together one way.
+
+    An order quantity is in units of the underlying: one USDINR contract is
+    qty 1000, and a quantity must be an exact multiple of the lot size. The
+    book is quoted in contracts. That second part is not a guess -- it
+    follows from the first. If every resting order is a multiple of 1,000
+    units then the total resting at a price is a sum of multiples of 1,000,
+    so a book showing 7, or 29, or 302 cannot be in units.
+
+    Read as units, a one lot clip needed a thousand lots resting to trade,
+    and the touch-size gate blocked essentially every observation of a full
+    trading day.
+    """
+
+    def reader(self, lot=1000, convert=True):
+        from datetime import date
+
+        from rollover.broker import InstrumentInfo
+        from rollover.quotes import QuoteReader
+
+        cfg = RollConfig(near_token="1769", far_token="1584",
+                         depth_in_lots=convert)
+        reader = QuoteReader(None, cfg)
+        reader.set_instruments({
+            t: InstrumentInfo(token=t, symbol="USDINR", sec_desc=t,
+                              segment="13", lot_size=lot,
+                              expiry=date(2026, 9, 28), instrument="FUTCUR",
+                              price_divisor=D("1"), tick=D("0.0025"),
+                              tick_units=D("25000"), low_range=D("93"),
+                              high_range=D("99"))
+            for t in ("1769", "1584")})
+        return reader
+
+    def payload(self, near_size=338, far_size=7):
+        return {"Response": {"MultipleTouchline": [
+            {"Token": 1769,
+             "Buy": [{"Price": 95.9200, "Qty": near_size}],
+             "Sell": [{"Price": 95.9225, "Qty": near_size}]},
+            {"Token": 1584,
+             "Buy": [{"Price": 96.4500, "Qty": far_size}],
+             "Sell": [{"Price": 96.5200, "Qty": far_size}]},
+        ]}}
+
+    def quotes(self, **kw):
+        reader = self.reader(**{k: v for k, v in kw.items()
+                                if k in ("lot", "convert")})
+        return reader.parse(self.payload(**{k: v for k, v in kw.items()
+                                            if k.endswith("_size")}),
+                            ["1769", "1584"], time.time())
+
+    def test_a_size_of_seven_becomes_seven_thousand_units(self):
+        self.assertEqual(self.quotes()["1584"].ask_qty, 7000)
+
+    def test_and_the_near_side_too(self):
+        self.assertEqual(self.quotes()["1769"].bid_qty, 338000)
+
+    def test_a_different_lot_size_scales_differently(self):
+        self.assertEqual(self.quotes(lot=100)["1584"].ask_qty, 700)
+
+    def test_it_can_be_switched_off_if_the_feed_ever_changes(self):
+        self.assertEqual(self.quotes(convert=False)["1584"].ask_qty, 7)
+
+    def test_an_unknown_lot_size_leaves_the_figure_alone(self):
+        """Scaling by a guess is worse than not scaling: the gate then
+        blocks, which is the safe direction."""
+        self.assertEqual(self.quotes(lot=0)["1584"].ask_qty, 7)
+
+    def test_a_missing_size_stays_missing(self):
+        got = self.quotes(far_size=None)
+        self.assertIsNone(got["1584"].ask_qty)
