@@ -15,7 +15,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from . import theme as T
-from . import __version__, livemode, notify, updater
+from . import __version__, editing, livemode, notify, updater
 from .engine import ARMED, DONE, HALTED, RollEngine, WATCHING, WORKING
 from .money import D, money
 
@@ -202,6 +202,7 @@ class RollWindow(tk.Toplevel):
         self._ticks: dict = {}
         self._release = None
         self._updating = False
+        self._last_snapshot = None
         self._build()
         self._start_update_check()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -214,6 +215,7 @@ class RollWindow(tk.Toplevel):
         root = tk.Frame(self.scroller.body, bg=T.BG, padx=T.PAD_L, pady=self.gap)
         root.pack(fill="both", expand=True)
         self._build_header(root)
+        self._build_strip(root)
         self._build_legs(root)
         self._build_cost(root)
         self._build_ladder(root)
@@ -223,6 +225,7 @@ class RollWindow(tk.Toplevel):
     def _build_header(self, parent) -> None:
         bar = tk.Frame(parent, bg=T.BG)
         bar.pack(fill="x", pady=(0, self.gap))
+        self.header_bar = bar
 
         left = tk.Frame(bar, bg=T.BG)
         left.pack(side="left", fill="x", expand=True)
@@ -396,6 +399,262 @@ class RollWindow(tk.Toplevel):
             self.stat_labels[key] = value
 
     # How many cards sit side by side before wrapping to the next line.
+    # ---- the sections, and which one the cards below are showing -----------
+    STRIP_COLUMNS = (
+        ("name", "Section", 190, "w"),
+        ("legs", "Near into far", 220, "w"),
+        ("cost", "Roll cost", 110, "e"),
+        ("limit", "Limit", 90, "e"),
+        ("gap", "Distance", 100, "e"),
+        ("rolled", "Rolled", 150, "e"),
+        ("state", "", 150, "w"),
+    )
+
+    def _build_strip(self, parent) -> None:
+        """One row per section, so several can be compared at a glance.
+
+        The cards below show one section in full. Stacking every section's
+        cards would put the second one off the bottom of the screen, which is
+        no way to compare them; a row each, with the detail for whichever is
+        selected, keeps both the comparison and the detail available.
+        """
+        self.strip_card = T.card(parent, padx=T.PAD_L, pady=self.gap)
+        box = self.strip_card.inner
+
+        head = tk.Frame(box, bg=T.SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text="SECTIONS", bg=T.SURFACE, fg=T.FAINT,
+                 font=self.fonts.label, anchor="w").pack(side="left")
+        self.strip_note = tk.Label(head, text="", bg=T.SURFACE, fg=T.MUTED,
+                                   font=self.fonts.ui_small, anchor="e")
+        self.strip_note.pack(side="right")
+
+        self.strip = ttk.Treeview(
+            box, columns=[c[0] for c in self.STRIP_COLUMNS],
+            show="headings", height=3, selectmode="browse")
+        for key, title, width, anchor in self.STRIP_COLUMNS:
+            self.strip.heading(key, text=title)
+            self.strip.column(key, width=width, anchor=anchor,
+                              stretch=(key == "state"))
+        self.strip.pack(fill="x", pady=(T.PAD_S, 0))
+        self.strip.bind("<<TreeviewSelect>>", lambda _e: self._focus_selected())
+
+        self.strip.tag_configure("ready", foreground=T.SUCCESS)
+        self.strip.tag_configure("halted", foreground=T.DANGER)
+        self.strip.tag_configure("off", foreground=T.FAINT)
+        self.strip.tag_configure("waiting", foreground=T.MUTED)
+
+        row = tk.Frame(box, bg=T.SURFACE)
+        row.pack(fill="x", pady=(T.PAD_M, 0))
+        T.Button(row, "Add section", self._add_section, self.fonts,
+                 width=140, height=30).pack(side="left")
+        self.enable_button = T.Button(row, "Enable", self._toggle_section,
+                                      self.fonts, width=110, height=30)
+        self.enable_button.pack(side="left", padx=T.PAD_XS)
+        T.Button(row, "Change contracts", self._change_contracts, self.fonts,
+                 width=170, height=30).pack(side="left")
+        T.Button(row, "Remove section", self._remove_section, self.fonts,
+                 kind="danger", width=150, height=30).pack(side="left",
+                                                           padx=T.PAD_XS)
+        self.section_note = tk.Label(row, text="", bg=T.SURFACE, fg=T.FAINT,
+                                     font=self.fonts.ui_small, anchor="w",
+                                     justify="left", wraplength=520)
+        self.section_note.pack(side="left", padx=T.PAD_S, fill="x", expand=True)
+
+        self.allocation_label = tk.Label(
+            box, text="", bg=T.SURFACE, fg=T.MUTED, font=self.fonts.ui_small,
+            anchor="w", justify="left", wraplength=1000)
+        self.allocation_label.pack(fill="x", pady=(T.PAD_S, 0))
+
+        self._strip_shown = False
+        self.focus_key = None
+
+    def _focused_section(self):
+        """The engine's Section for whatever the strip has selected."""
+        view = self._focused()
+        if view is not None:
+            for section in self.engine.sections:
+                if section.key == view.key:
+                    return section
+        return self.engine.sections[0] if self.engine.sections else None
+
+    def _section_note(self, text: str, colour: str) -> None:
+        self.section_note.configure(text=text, fg=colour)
+
+    def _views(self):
+        snap = self._last_snapshot
+        return list(getattr(snap, "sections", None) or []) if snap else []
+
+    def _focused(self):
+        """The section whose cards are on screen, or the first one."""
+        views = self._views()
+        if not views:
+            return None
+        for view in views:
+            if view.key == self.focus_key:
+                return view
+        return views[0]
+
+    def _focus_selected(self) -> None:
+        picked = self.strip.selection()
+        if not picked:
+            return
+        chosen = self.strip.item(picked[0])["values"]
+        for view in self._views():
+            if view.name == chosen[0]:
+                if view.key != self.focus_key:
+                    self.focus_key = view.key
+                    self._rebuild_rung_rows()
+                    self._reset_limit()
+                break
+        self._update_enable_button()
+
+    def _update_enable_button(self) -> None:
+        view = self._focused()
+        if view is None:
+            return
+        self.enable_button.set_text("Disable" if view.enabled else "Enable")
+
+    def _draw_strip(self, snap) -> None:
+        views = list(getattr(snap, "sections", None) or [])
+        if len(views) < 2 and not self.cfg.sections:
+            # One roll and no explicit sections: the window looks exactly as it
+            # did before sections existed.
+            if self._strip_shown:
+                self.strip_card.pack_forget()
+                self._strip_shown = False
+            return
+        if not self._strip_shown:
+            self.strip_card.pack(fill="x", pady=self.gap, after=self.header_bar)
+            self._strip_shown = True
+
+        focused = self._focused()
+        self.strip.delete(*self.strip.get_children())
+        for view in views:
+            decision = view.decision
+            cost = (f"{money(decision.cost_bps, 1)} bps"
+                    if decision is not None and decision.cost_bps is not None
+                    else "--")
+            limit = (f"{money(decision.limit_bps, 0)} bps"
+                     if decision is not None and decision.limit_bps is not None
+                     else "--")
+            gap = "--"
+            if decision is not None and decision.cost_bps is not None \
+                    and decision.limit_bps is not None:
+                inside = decision.limit_bps - decision.cost_bps
+                gap = (f"{money(abs(inside), 1)} bps "
+                       + ("inside" if inside > 0 else "away"))
+
+            if not view.enabled:
+                tag, state = "off", "disabled"
+            elif view.halted_reason:
+                tag, state = "halted", "HALTED"
+            elif decision is not None and decision.qualifies and \
+                    view.report is not None and view.report.ok:
+                tag, state = "ready", "READY"
+            elif view.report is not None and view.report.failures:
+                tag, state = "waiting", view.report.failures[0].name
+            else:
+                tag, state = "waiting", "watching"
+
+            rolled = ("--" if view.allocated is None
+                      else f"{view.done:,} / {view.allocated:,}")
+            legs = "--"
+            if view.near is not None and view.far is not None:
+                legs = f"{view.near.sec_desc} -> {view.far.sec_desc}"
+
+            self.strip.insert("", "end", values=(
+                view.name, legs, cost, limit, gap, rolled, state),
+                tags=(tag, view.key))
+
+        # Keep the selection on the focused section without re-entering.
+        children = self.strip.get_children()
+        if focused is not None:
+            for index, view in enumerate(views):
+                if view.key == focused.key and index < len(children):
+                    if self.strip.selection() != (children[index],):
+                        self.strip.selection_set(children[index])
+                    break
+
+        self.strip_note.configure(
+            text=f"showing {focused.name} below" if focused else "")
+        self.allocation_label.configure(
+            text=(snap.allocation_refusal or snap.allocation or ""),
+            fg=T.DANGER if snap.allocation_refusal else T.MUTED)
+        self._update_enable_button()
+
+    # ---- changing the sections ---------------------------------------------
+    def _pick_contracts(self, title, apply):
+        from .picker import ContractWindow
+
+        window = ContractWindow(self, self.cfg, self.log, self.engine.broker,
+                                self.config_path, apply=apply, title=title)
+        self.wait_window(window)
+        return bool(getattr(window, "ok", False))
+
+    def _add_section(self) -> None:
+        def accept(near_row, far_row):
+            sections = editing.add(self.cfg, near_row, far_row)
+            editing.apply(self.cfg, sections, self.config_path)
+
+        if not self._pick_contracts("Add a section: choose its two contracts",
+                                    accept):
+            return
+        self._section_note(
+            "added, switched off. Set its limits below, then Enable it.",
+            T.WARN)
+        self.log.info(f"Section added. {len(self.cfg.sections)} configured.")
+        self._restart_engine()
+
+    def _remove_section(self) -> None:
+        from tkinter import messagebox
+
+        view = self._focused()
+        if view is None:
+            return
+        if not messagebox.askyesno(
+                "Remove section",
+                f"Remove {view.name}?" + os.linesep * 2
+                + "This stops it rolling and forgets what it has rolled so "
+                  "far. It changes nothing at the exchange.",
+                parent=self, default="no"):
+            return
+        try:
+            sections = editing.remove(self.cfg, view.key)
+        except editing.EditError as exc:
+            self._section_note(str(exc), T.DANGER)
+            return
+        editing.apply(self.cfg, sections, self.config_path)
+        self.focus_key = None
+        self.log.warn(f"Section removed: {view.name}")
+        self._restart_engine()
+
+    def _toggle_section(self) -> None:
+        view = self._focused()
+        if view is None:
+            return
+        try:
+            sections = editing.enable(self.cfg, view.key, not view.enabled)
+        except editing.EditError as exc:
+            self._section_note(str(exc), T.DANGER)
+            return
+        editing.apply(self.cfg, sections, self.config_path)
+        self._section_note(
+            f"{view.name} {'disabled' if view.enabled else 'enabled'}", T.MUTED)
+        self.log.info(f"{view.name} "
+                      f"{'disabled' if view.enabled else 'enabled'}.")
+        self._restart_engine()
+
+    def _restart_engine(self) -> None:
+        """Put a change to the sections into force.
+
+        Always disarms: the set of things that could trade has changed, and
+        whoever armed was authorising the old set.
+        """
+        self.engine.disarm("sections changed")
+        if self.on_change_contracts:
+            self.on_change_contracts()
+
     LADDER_COLUMNS = 4
 
     def _build_ladder(self, parent) -> None:
@@ -453,11 +712,12 @@ class RollWindow(tk.Toplevel):
             self._forget_row(row)
         self.rung_rows = []
 
-        ladder = getattr(self.engine, "ladder", None)
+        section = self._focused_section()
+        ladder = getattr(section, "ladder", None)
         for rung in (ladder.rungs if ladder else []):
             self._add_row(f"{rung.bps.normalize():f}", str(rung.qty), rung.key)
 
-        for bps in (getattr(self.engine, "watch_limits", None) or []):
+        for bps in (getattr(section, "watch_limits", None) or []):
             key = f"{bps.normalize():f}"
             self._add_row(key, "", key, watch=True)
         self._reflow_rows()
@@ -616,7 +876,9 @@ class RollWindow(tk.Toplevel):
                               T.WARN)
             return
 
-        ceiling = self.engine._tenor_ceiling_bps()
+        section = self._focused_section()
+        ceiling = self.engine._tenor_ceiling_bps(
+            section.cfg if section is not None else None, section)
         if wanted and ceiling is None and self.cfg.limit_mode == "bps":
             # Without a tenor there is no ceiling, and without a ceiling a rung
             # could quietly be looser than the limit for this roll. Refusing is
@@ -634,8 +896,16 @@ class RollWindow(tk.Toplevel):
             # makes them the safe place to ask what a wider limit would look
             # like -- the single roll limit is not, because it IS the ceiling.
             parse_watch(watch)
-            candidate = replace(self.cfg, limit_ladder=wanted,
-                                watch_limits=watch)
+            if self.cfg.sections and section is not None:
+                # Several sections: these limits belong to the one on screen,
+                # and editing it must not disturb the others.
+                new_sections = editing.set_limits(self.cfg, section.key,
+                                                  wanted, watch)
+                candidate = replace(self.cfg, sections=new_sections)
+            else:
+                new_sections = None
+                candidate = replace(self.cfg, limit_ladder=wanted,
+                                    watch_limits=watch)
             candidate.validate()
         except Exception as exc:
             first = str(exc).splitlines()[-1].strip(" -")
@@ -645,17 +915,23 @@ class RollWindow(tk.Toplevel):
         # Compare the limits, not the text. config.json holds qty as a number
         # and the box hands back a string, so comparing the raw entries made
         # every press look like a change: disarming and re-saving each time.
-        current = getattr(self.engine, "ladder", None)
+        current = getattr(section, "ladder", None)
         same_rungs = ([(r.bps, r.qty) for r in (current.rungs if current else [])]
                       == [(r.bps, r.qty) for r in built.rungs])
-        if same_rungs and parse_watch(watch) == parse_watch(self.cfg.watch_limits):
+        was_watching = parse_watch(
+            getattr(section.cfg, "watch_limits", None) if section is not None
+            else self.cfg.watch_limits)
+        if same_rungs and parse_watch(watch) == was_watching:
             self._ladder_note("unchanged", T.MUTED)
             return
 
         was_armed = self.engine.armed
         self.engine.disarm("limits changed")
-        self.cfg.limit_ladder = wanted
-        self.cfg.watch_limits = watch
+        if new_sections is not None:
+            self.cfg.sections = new_sections
+        else:
+            self.cfg.limit_ladder = wanted
+            self.cfg.watch_limits = watch
         self.engine.rebuild_ladder()
         self._rebuild_rung_rows()
 
@@ -1170,24 +1446,41 @@ class RollWindow(tk.Toplevel):
         if snap is None:
             return
 
+        self._last_snapshot = snap
         self.state_pill.set(snap.state.lower(),
                             STATE_COLOUR.get(snap.state, T.MUTED))
         self._refresh_mode(snap.dry_run)
-        self._draw_ladder(snap.decision)
+        self._draw_strip(snap)
+
+        # The cards below belong to whichever section is selected in the strip.
+        # With one section that is the only one, and the window looks exactly
+        # as it did before sections existed.
+        shown = self._focused()
+        if shown is not None:
+            near, far = shown.near, shown.far
+            near_q, far_q = shown.near_quote, shown.far_quote
+            decision, report = shown.decision, shown.report
+            note = shown.halted_reason or snap.halted_reason or shown.note or snap.note
+        else:
+            near, far = snap.near, snap.far
+            near_q, far_q = snap.near_quote, snap.far_quote
+            decision, report = snap.decision, snap.report
+            note = snap.halted_reason or snap.note
+
+        self._draw_ladder(decision)
 
         source = snap.quote_source or "connecting"
         self.source_pill.set(source,
                              T.SUCCESS if source == "live feed" else T.WARN)
-        self.note.configure(text=snap.halted_reason or snap.note,
+        self.note.configure(text=note,
                             fg=T.DANGER if snap.halted_reason else T.MUTED)
         self.halt_button.set_enabled(bool(snap.halted_reason))
 
-        for key, info, quote in (("near", snap.near, snap.near_quote),
-                                 ("far", snap.far, snap.far_quote)):
+        for key, info, quote in (("near", near, near_q), ("far", far, far_q)):
             self._draw_leg(self.leg_widgets[key], info, quote, key)
 
-        self._draw_cost(snap)
-        self._draw_gates(snap.report)
+        self._draw_cost(snap, decision)
+        self._draw_gates(report)
 
         if snap.armed_until:
             left = max(0, int(snap.armed_until - time.monotonic()))
@@ -1288,8 +1581,8 @@ class RollWindow(tk.Toplevel):
             cells["age"].configure(text=f"read {age:.1f}s ago",
                                    fg=T.FAINT if fresh else T.DANGER)
 
-    def _draw_cost(self, snap) -> None:
-        dec = snap.decision
+    def _draw_cost(self, snap, decision=None) -> None:
+        dec = decision if decision is not None else snap.decision
         if dec is None:
             self.cost.configure(text="--", fg=T.FAINT)
             self.cost_delta.configure(text="", fg=T.SURFACE)

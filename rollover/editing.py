@@ -188,6 +188,32 @@ def enable(cfg: RollConfig, key: str, on: bool = True) -> List[Dict[str, Any]]:
     return out
 
 
+def set_limits(cfg: RollConfig, key: str, ladder: List[Dict[str, Any]],
+               watch: List[Any]) -> Optional[List[Dict[str, Any]]]:
+    """Give one section a new set of limits.
+
+    Returns the new section list, or None when the config has no sections at
+    all -- in which case the caller edits the top level, which is the
+    single-pair arrangement and where its limits already live.
+    """
+    if not cfg.sections:
+        return None
+
+    out, found = [], False
+    for other in cfg.sections:
+        merged = {**{k: getattr(cfg, k) for k in SECTION_OVERRIDES}, **other}
+        if section_key(merged["near_token"], merged["far_token"]) == key:
+            found = True
+            out.append({**other, "limit_ladder": ladder, "watch_limits": watch})
+        else:
+            out.append(dict(other))
+    if not found:
+        raise EditError("that section is not in the configuration")
+
+    _validated(cfg, out)
+    return out
+
+
 def apply(cfg: RollConfig, sections: List[Dict[str, Any]],
           path: Optional[str] = None) -> None:
     """Put a section list into force, and write it down if there is a file."""
