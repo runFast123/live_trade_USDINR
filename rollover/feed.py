@@ -150,6 +150,35 @@ class LiveFeed:
         # again after any reconnect.
         threading.Thread(target=self._subscribe_when_ready, daemon=True).start()
 
+    def watch(self, tokens) -> bool:
+        """Add tokens to the subscription, and subscribe them if we are up.
+
+        A section added while the app is running needs its legs quoted, and
+        start() returns early once the socket exists -- so without this the
+        new section showed a dash in every column forever and the operator
+        could not tell it from a dead market.
+
+        Returns True when something new was added.
+        """
+        wanted = [str(t) for t in tokens if t]
+        fresh = [t for t in wanted if t not in self.tokens]
+        if not fresh:
+            return False
+        self.tokens.extend(fresh)
+        self.log.info(f"Live feed also watching {', '.join(fresh)}.")
+        if self._started and self._connected:
+            try:
+                for token in fresh:
+                    self._socket.subscribe_touchline(
+                        self.client.session_id, self.cfg.segment_id,
+                        int(token))
+                    time.sleep(0.2)
+            except Exception as exc:
+                # The periodic resubscribe will pick them up.
+                self.log.warn(f"Live feed subscribe failed for the new "
+                              f"token(s): {exc}")
+        return True
+
     def _subscribe_when_ready(self) -> None:
         deadline = time.time() + 15
         while time.time() < deadline and self._started:

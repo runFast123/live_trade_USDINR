@@ -683,6 +683,72 @@ class TestTheRefusalToEnableIsReadable(WorkflowCase):
         self.assertTrue(self.note().rstrip().endswith("."))
 
 
+class TestASectionWithNoQuoteShowsNothing(WorkflowCase):
+    """Reported: "in the sep to oct i am unable to change the bps".
+
+    The second section had no quote -- its far leg was never subscribed --
+    so every column showed a dash. The ROLL COST card below it then fell
+    back to the snapshot's own decision, which is the FIRST section's, and
+    showed that roll's cost, limit and tenor under this one's name. Pressing
+    Set would have written the other roll's tenor in the schedule.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.set_limit("30", "10000")
+        self.add_section("1769", "1284")
+        self.window._toggle_section()          # enable the new one
+        self.tick()
+        # Now take its quote away, which is the reported state.
+        for section in self.engine.sections:
+            if section.key == "1769>1284":
+                section.decision, section.report, section.quotes = None, None, None
+        self.engine._republish()
+        self.window.focus_key = "1769>1284"
+        self.window._draw(self.engine.snapshot())
+        _root.update_idletasks()
+
+    def test_the_section_on_screen_is_the_one_with_no_quote(self):
+        self.assertEqual(self.window._focused().key, "1769>1284")
+
+    def test_the_cost_card_shows_nothing_rather_than_another_rolls_cost(self):
+        self.assertEqual(self.window.cost.cget("text"), "--")
+
+    def test_and_says_so(self):
+        self.assertEqual(self.window.verdict.cget("text"), "NO DATA")
+
+    def test_the_rupee_line_is_cleared_too(self):
+        self.assertEqual(self.window.cost_rupees.cget("text"), "")
+
+    def test_no_tenor_is_borrowed_from_the_other_section(self):
+        """It is one month to October and two to November. Editing the limit
+        against the wrong one writes the wrong entry in the schedule."""
+        self.assertIsNone(self.window._current_tenor())
+
+    def test_so_setting_a_limit_is_refused_rather_than_misapplied(self):
+        before = dict(self.cfg.limit_bps_schedule)
+        self.window.limit_var.set("30")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule, before)
+        self.assertIn("no tenor", self.window.limit_note.cget("text"))
+
+    def test_once_it_has_a_quote_the_limit_can_be_set(self):
+        self.tick()                            # gives it a decision again
+        self.window._draw(self.engine.snapshot())
+        self.assertEqual(self.window._current_tenor(), 1)   # Sep -> Oct
+        self.window.limit_var.set("28")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule["1"], "28")
+
+    def test_and_it_changes_the_one_month_entry_not_the_two_month_one(self):
+        self.tick()
+        self.window._draw(self.engine.snapshot())
+        before_two = self.cfg.limit_bps_schedule["2"]
+        self.window.limit_var.set("28")
+        self.window._apply_limit()
+        self.assertEqual(self.cfg.limit_bps_schedule["2"], before_two)
+
+
 class TestTheEvidenceCard(WorkflowCase):
     """What the day's recording says, on screen.
 

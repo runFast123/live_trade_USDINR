@@ -1734,9 +1734,19 @@ class RollWindow(tk.Toplevel):
         return self.cfg.limit_mode == "bps"
 
     def _current_tenor(self):
-        """The tenor of the pair on screen, which is what the limit keys off."""
-        detail = getattr(self._last_decision, "limit_detail", None)
-        return detail.tenor_months if detail else None
+        """The tenor of the pair on screen, which is what the limit keys off.
+
+        From the focused section first. _last_decision is whatever the cost
+        card last drew, and editing a limit against the wrong tenor writes
+        the wrong entry in the schedule -- quietly changing a roll the
+        operator is not even looking at.
+        """
+        view = self._focused()
+        for decision in (getattr(view, "decision", None), self._last_decision):
+            detail = getattr(decision, "limit_detail", None)
+            if detail is not None and detail.tenor_months is not None:
+                return detail.tenor_months
+        return None
 
     def _rungs_above(self, ceiling):
         """Rungs the ladder holds that a proposed ceiling would not allow."""
@@ -2142,7 +2152,17 @@ class RollWindow(tk.Toplevel):
                                    fg=T.FAINT if fresh else T.DANGER)
 
     def _draw_cost(self, snap, decision=None) -> None:
-        dec = decision if decision is not None else snap.decision
+        """The cost of the roll ON SCREEN, or nothing.
+
+        There used to be a fallback here to the snapshot's own decision,
+        which belongs to the FIRST section. So a section with no quote yet
+        borrowed another section's cost, limit, tenor and verdict and showed
+        them under its own name -- and _current_tenor then read that
+        borrowed tenor, so pressing Set would have changed the other
+        section's limit. A section with no decision has no cost, and saying
+        so is the whole job.
+        """
+        dec = decision
         if dec is None:
             self.cost.configure(text="--", fg=T.FAINT)
             self.cost_delta.configure(text="", fg=T.SURFACE)

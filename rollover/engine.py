@@ -288,6 +288,13 @@ class RollEngine:
         self._share_out()
         self._persist()
         self._republish()
+        # A new section's legs have to reach the feed, or it shows a dash in
+        # every column and looks like a dead market.
+        if self.cfg.use_live_feed:
+            try:
+                self.feed.watch(self.quote_tokens())
+            except Exception as exc:
+                self.log.warn(f"Could not extend the live feed: {exc}")
         return True
 
     def _republish(self) -> None:
@@ -523,8 +530,7 @@ class RollEngine:
         self.account.scrip_file_date = self.broker.scrip_file_date
 
         if self.cfg.use_live_feed:
-            self.feed.start(self.broker.client,
-                            [self.session.near.token, self.session.far.token])
+            self.feed.start(self.broker.client, self.quote_tokens())
 
         for role, info in (("Near leg (SELL)", self.session.near),
                            ("Far leg  (BUY) ", self.session.far)):
@@ -577,12 +583,13 @@ class RollEngine:
             self._publish(None, None, None, str(exc))
             return
 
-        tokens = [self.session.near.token, self.session.far.token]
-
         while not self._stop.is_set():
             cycle_started = time.monotonic()
             try:
-                self._tick(tokens)
+                # Asked every tick, not once: the sections change while this
+                # runs, and a section nobody quotes is a section that can
+                # never trade.
+                self._tick(self.quote_tokens())
             except QuoteError as exc:
                 self._publish(None, None, None, f"quote problem: {exc}")
                 self._complain("warn", f"Quote problem, not trading this tick: {exc}")
@@ -907,6 +914,24 @@ class RollEngine:
             return
         self._last_complaint = (message, now)
         getattr(self.log, level)(message)
+
+    def quote_tokens(self) -> List[str]:
+        """Every token any section needs, in the order they were configured.
+
+        This used to be [session.near.token, session.far.token] -- the FIRST
+        section's two legs -- worked out once before the watch loop started.
+        So a second section on a different far month was never quoted at all:
+        it showed a dash in every column, which reads as a dead market rather
+        than as a leg nobody asked for. And because it was computed once,
+        adding a section while the app ran changed nothing.
+        """
+        out: List[str] = []
+        for section in list(self.sections):
+            for info in (section.near, section.far):
+                token = getattr(info, "token", None)
+                if token and token not in out:
+                    out.append(token)
+        return out
 
     def _read_positions(self) -> None:
         """The near-leg position, once per distinct contract.
