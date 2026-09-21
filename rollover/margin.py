@@ -24,12 +24,31 @@ from typing import Any, Optional
 from .broker import _first, _iter_records, call_failed
 from .money import D
 
-# What the margin response might call the number we want. The response shape is
-# not documented and has not been seen from this account, so several spellings
-# are tried and anything unrecognised reads as unknown rather than as zero.
-_MARGIN_KEYS = ("TotalMargin", "RequiredMargin", "Margin", "MarginRequired",
-                "TotalMarginRequired", "NetMargin", "SpanMargin", "OrderMargin",
-                "TotalRequirement")
+# The shape, now that it has been seen from a live account (21 Sep 2026,
+# segment 13, one lot of each leg):
+#
+#   {"Status": "Success", "Response": {
+#      "Margins": [{"Token": 1769, "QTY": 1, "InitialMargin": 1817.0,
+#                   "ExpMgn": 478.9, "LastRate": 95.78}, ...],
+#      "Span_Summary": {"Span": 3638.0, "ExpMgn": 959.35,
+#                       "MgnBenefit": 0.0, "TotalMgn": 4597.35}}}
+#
+# The figure wanted is Span_Summary.TotalMgn -- the whole basket. It is read
+# by name rather than by scanning, because a per-leg record is walked FIRST
+# and taking a number out of one of those would report one leg's margin as
+# the roll's, which is an undercount of about half.
+_SUMMARY_KEYS = ("Span_Summary", "SpanSummary", "Summary")
+_TOTAL_KEYS = ("TotalMgn", "TotalMargin", "TotalMarginRequired",
+               "TotalRequirement")
+
+# Fallbacks, for a response that carries no summary at all. Checked against
+# the live shape: none of these appears on a per-leg record, which carries
+# InitialMargin, ExpMgn, LastRate, Strike, QTY, Segment and Token. A spelling
+# that did appear there would be found first by the generic walk and would
+# report one leg's margin as the roll's.
+_MARGIN_KEYS = ("TotalMgn", "TotalMargin", "RequiredMargin", "Margin",
+                "MarginRequired", "TotalMarginRequired", "NetMargin",
+                "SpanMargin", "OrderMargin", "TotalRequirement")
 _FUNDS_KEYS = ("AvailableMargin", "AvailableBalance", "NetAvailableMargin",
                "CashAvailable", "AvailableCash", "Available", "NetCash",
                "WithdrawableBalance", "MarginAvailable")
@@ -82,6 +101,26 @@ def _number(node: Any, keys) -> Optional[Decimal]:
     return None
 
 
+def total_from(resp: Any) -> Optional[Decimal]:
+    """The margin for the WHOLE basket, from a get_margin response.
+
+    The summary is looked for first and by name. Scanning generically would
+    reach a per-leg record before it, and one leg's margin is roughly half
+    the roll's -- an undercount, in the direction that lets an order through.
+    """
+    for record in _iter_records(resp):
+        for name in _SUMMARY_KEYS:
+            summary = record.get(name) if isinstance(record, dict) else None
+            if isinstance(summary, dict):
+                value = _first(summary, _TOTAL_KEYS)
+                if value is not None:
+                    try:
+                        return D(value)
+                    except Exception:
+                        pass
+    return _number(resp, _MARGIN_KEYS)
+
+
 def required(broker, near_token: str, far_token: str, qty: int) -> Optional[Decimal]:
     """Margin for the whole roll, both legs in one request. None if unreadable."""
     orders = getattr(getattr(broker, "client", None), "orders", None)
@@ -97,7 +136,7 @@ def required(broker, near_token: str, far_token: str, qty: int) -> Optional[Deci
     if call_failed(resp):
         broker.log.warn(f"Margin call refused: {call_failed(resp)}")
         return None
-    return _number(resp, _MARGIN_KEYS)
+    return total_from(resp)
 
 
 def available(broker) -> Optional[Decimal]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 
+from rollover import margin
 from rollover.config import RollConfig
 from rollover.margin import Estimate, available, estimate, required
 from rollover.money import D
@@ -297,3 +298,78 @@ class TestItIsOnByDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheRealMarginResponse(unittest.TestCase):
+    """The shape, seen from a live account on 21 September 2026.
+
+    Before this the app could not read it at all: the figure lives in
+    Span_Summary under the name TotalMgn, which was in none of the spellings
+    tried, so every margin estimate came back "could not be read". That
+    blocks rather than permits, so it was safe -- and it also meant the gate
+    could never pass, which would have stopped a funded account trading.
+
+    The trap is the other direction. _iter_records walks a per-leg record
+    BEFORE the summary, so a generic scan that recognised a per-leg spelling
+    would report one leg's margin as the roll's: 1,817 instead of 4,597, an
+    undercount of about half, in the direction that lets an order through.
+    """
+
+    LIVE = {
+        "Status": "Success",
+        "Response": {
+            "Margins": [
+                {"Segment": 13, "Token": 1769, "Strike": 0.0, "QTY": 1,
+                 "InitialMargin": 1817.0, "ExpMgn": 478.9, "LastRate": 95.78},
+                {"Segment": 13, "Token": 1284, "Strike": 0.0, "QTY": 1,
+                 "InitialMargin": 1821.0, "ExpMgn": 480.45, "LastRate": 96.09},
+            ],
+            "Span_Summary": {"Span": 3638.0, "ExpMgn": 959.35,
+                             "OptionPremium": 0.0, "MgnBenefit": 0.0,
+                             "TotalMgn": 4597.35},
+        },
+        "Reason": "",
+    }
+
+    def test_it_reads_the_basket_total(self):
+        self.assertEqual(margin.total_from(self.LIVE), D("4597.35"))
+
+    def test_and_not_one_leg(self):
+        """1,817 is the near leg alone. Half the answer, and the dangerous
+        half, because it is the one that lets an order through."""
+        self.assertNotEqual(margin.total_from(self.LIVE), D("1817.0"))
+
+    def test_nor_the_span_without_the_exposure(self):
+        self.assertNotEqual(margin.total_from(self.LIVE), D("3638.0"))
+
+    def test_a_response_with_no_summary_falls_back(self):
+        got = margin.total_from({"Response": {"TotalMargin": 1234.5}})
+        self.assertEqual(got, D("1234.5"))
+
+    def test_a_response_it_cannot_read_is_unknown_not_zero(self):
+        self.assertIsNone(margin.total_from({"Response": {"Something": 1}}))
+
+    def test_no_per_leg_spelling_is_in_the_fallback_list(self):
+        """The fallback scans generically and a per-leg record is walked
+        first, so a spelling that appears on one leg would be read as the
+        whole roll."""
+        per_leg = {k.lower() for leg in self.LIVE["Response"]["Margins"]
+                   for k in leg}
+        listed = {k.lower() for k in margin._MARGIN_KEYS}
+        self.assertEqual(per_leg & listed, set())
+
+    def test_the_quantity_sent_comes_back_as_contracts(self):
+        """A second, independent confirmation of the unit: 1000 units was
+        sent for each leg and the broker echoed QTY 1."""
+        legs = self.LIVE["Response"]["Margins"]
+        self.assertEqual([leg["QTY"] for leg in legs], [1, 1])
+
+    def test_this_broker_gives_no_calendar_spread_benefit(self):
+        """The plan assumed a calendar spread would net down. It does not --
+        MgnBenefit is zero and the total is the simple sum -- so the roll
+        needs about 4,600 a lot, not the ~2,300 a netted spread would."""
+        summary = self.LIVE["Response"]["Span_Summary"]
+        self.assertEqual(summary["MgnBenefit"], 0.0)
+        legs = self.LIVE["Response"]["Margins"]
+        summed = sum(leg["InitialMargin"] + leg["ExpMgn"] for leg in legs)
+        self.assertAlmostEqual(summary["TotalMgn"], summed, places=2)

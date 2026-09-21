@@ -436,3 +436,96 @@ until the operator confirms.
 
 Same arithmetic that settled the depth question, applied to the one field
 still open.
+
+---
+
+## 21 September 2026: a new account, and segment 13 is live
+
+The account was changed. Checked read-only -- `get_margin`, `get_funds_view`
+and `get_net_position` ask questions and place nothing.
+
+### Segment 13 is enabled
+
+`get_margin` for segment 13 returns `Status: Success` with real figures for
+both legs. The entitlement that blocked every live step since 18 September is
+gone.
+
+```
+Span_Summary: {"Span": 3638.0, "ExpMgn": 959.35,
+               "OptionPremium": 0.0, "MgnBenefit": 0.0, "TotalMgn": 4597.35}
+Margins:      [{"Token": 1769, "QTY": 1, "InitialMargin": 1817.0, "ExpMgn": 478.9},
+               {"Token": 1284, "QTY": 1, "InitialMargin": 1821.0, "ExpMgn": 480.45}]
+```
+
+### The quantity unit, confirmed a third time and by the exchange side
+
+`token_qty` was sent as `1769|1000` and `1284|1000`. The response echoes
+**`"QTY": 1`** for each. So 1,000 units is one contract, exactly as Choice
+said in writing, and now demonstrated by the broker's own arithmetic rather
+than by their description of it.
+
+### There is no calendar spread benefit
+
+`MgnBenefit` is **0.0**, and the total is the simple sum of the two legs:
+1817 + 478.9 + 1821 + 480.45 = 4,597.35. The plan assumed a calendar spread
+would net down and therefore cost far less than two outrights. It does not,
+on this account.
+
+That changes the funding arithmetic, and not by a little:
+
+| lots | margin needed |
+|---|---|
+| 1 | Rs 4,597 |
+| 10 | Rs 45,973 |
+| 100 | **Rs 459,725** |
+
+### The account holds Rs 825.40 and no position
+
+`CashAvailable` and `MarginAvailable` are both 825.40; everything else is
+zero. `get_net_position` returns Success with **no rows at all** -- no
+September, no position in any contract.
+
+So one lot is short by Rs 3,772, and the 100+ lot roll the whole app exists
+for needs about Rs 460,000 of margin against a position that is not there.
+
+### A bug this found: the app could not read the margin response
+
+`margin.required` came back `None` -- "the margin requirement for this roll
+could not be read". The figure lives in `Span_Summary` under the name
+`TotalMgn`, which was in none of the spellings tried.
+
+Unknown blocks rather than permits, so nothing unsafe followed. But it also
+means the margin gate could never have passed, and a funded account would
+have been stopped by it with a message saying only that the figure was
+unreadable.
+
+The basket total is now read by name. It is read by name rather than by
+scanning because `_iter_records` walks a **per-leg** record first: a generic
+scan that recognised a per-leg spelling would report 1,817 as the roll's
+margin instead of 4,597 -- an undercount of about half, in the direction that
+lets an order through.
+
+Against the live account it now says:
+
+    margin Rs 4,597 needed, Rs 825 available: NOT ENOUGH (-Rs 3,772 spare)
+
+### The second section is quoted now
+
+Confirmed against the live feed, which is what v2.7.1 fixed:
+
+    tokens the engine wants quoted: ['1769', '1584', '1284']
+    1769 USDINR26SEPFUT  bid 95.7750 x 40000   ask 95.7800 x 10000
+    1584 USDINR26NOVFUT  bid 96.2000 x 50000   ask 96.5000 x 211000
+    1284 USDINR26OCTFUT  bid 96.0800 x 30000   ask 96.0900 x 93000
+
+Every depth figure is a whole multiple of 1,000, which is the contracts to
+units conversion working.
+
+### And the market is saying something useful
+
+    Sep -> Nov  cost 0.7250  =  75.7 bps  against 50   25.7 bps away
+    Sep -> Oct  cost 0.3150  =  32.9 bps  against 30    2.9 bps away
+
+The two month roll is further out than the recorded day suggested. The **one
+month roll is close** -- 2.9 bps -- and the recorded day agrees: Sep into Oct
+sat at a median of 31.3 bps and spent 7.4% of that day at or below 30.
