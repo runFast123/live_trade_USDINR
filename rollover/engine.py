@@ -890,11 +890,18 @@ class RollEngine:
                 + ", ".join(f"{k} bps ({old[k]:,})" for k in dropped))
         self._persist()
 
-    def reset_ladder(self) -> None:
-        """Start the campaign again. The operator's decision, never the app's."""
-        self.ladder_progress = {}
+    def reset_ladder(self, section=None) -> None:
+        """Start ONE section's campaign again. The operator's decision.
+
+        Took no section, so it always reset sections[0] -- whichever section
+        was on screen. With several rolls that forgets the wrong one's
+        progress, and the next clip rolls quantity that was already rolled.
+        """
+        section = section if section is not None else self.sections[0]
+        section.ladder_progress = {}
         self._persist()
-        self.log.warn("Ladder progress reset. The whole campaign is outstanding again.")
+        self.log.warn(f"{section.label()}: ladder progress reset. The whole "
+                      "campaign is outstanding again.")
 
     def tenor_days(self, section=None) -> Optional[int]:
         """How far apart the two contracts expire.

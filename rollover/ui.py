@@ -129,10 +129,17 @@ class LiveModeDialog(tk.Toplevel):
         return None
 
     def _lot_size(self):
-        try:
-            return self.engine.session.near.lot_size
-        except Exception:
-            return None
+        """The lot size, from the first section whose contract is resolved.
+
+        Every section here rolls the same underlying, so every lot is the
+        same size; what matters is not reading it off sections[0] alone,
+        which may be the one section whose contract failed to resolve.
+        """
+        for section in list(getattr(self.engine, "sections", None) or []):
+            size = getattr(getattr(section, "near", None), "lot_size", None)
+            if size:
+                return size
+        return None
 
     def _retest(self) -> None:
         typed = self.entry.get().strip()
@@ -1546,16 +1553,20 @@ class RollWindow(tk.Toplevel):
     def _reset_ladder(self) -> None:
         from tkinter import messagebox
 
-        ladder = getattr(self.engine, "ladder", None)
+        # The section on screen, not sections[0]. Resetting a section the
+        # operator is not looking at forgets rolled quantity silently, and
+        # the next clip rolls it again.
+        section = self._focused_section()
+        ladder = getattr(section, "ladder", None)
         if not ladder:
             return
-        if getattr(self.engine.session, "in_flight", False):
+        if getattr(self.engine.account, "in_flight", False):
             messagebox.showwarning(
                 "Reset ladder",
                 "An order is working. Wait for it to finish, so its fill is "
                 "counted before the record is cleared.", parent=self)
             return
-        done = ladder.done_total(self.engine.ladder_progress)
+        done = ladder.done_total(section.ladder_progress)
         if not messagebox.askyesno(
                 "Reset ladder",
                 f"This forgets that {done:,} of {ladder.total_qty:,} has been "
@@ -1566,7 +1577,7 @@ class RollWindow(tk.Toplevel):
                 parent=self, default="no"):
             return
         self.engine.disarm("ladder reset")
-        self.engine.reset_ladder()
+        self.engine.reset_ladder(section)
 
     # ---- dry run and live -------------------------------------------------
     def _refresh_mode(self, dry_run=None) -> None:

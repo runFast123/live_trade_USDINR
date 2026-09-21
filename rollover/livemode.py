@@ -116,9 +116,14 @@ def _feed_is_healthy(engine) -> bool:
     if feed is None:
         return False
     try:
-        tokens = [t for t in (getattr(engine.session, "near", None),
+        # Every leg of every section, not the first section's two. A stale
+        # feed on a second section's far month is exactly what would let a
+        # live clip be sized against a price nobody has seen for minutes.
+        getter = getattr(engine, "quote_tokens", None)
+        tokens = list(getter()) if callable(getter) else [
+            t.token for t in (getattr(engine.session, "near", None),
                               getattr(engine.session, "far", None)) if t]
-        return bool(feed.healthy([t.token for t in tokens]))
+        return bool(feed.healthy(tokens))
     except Exception:
         return False
 
