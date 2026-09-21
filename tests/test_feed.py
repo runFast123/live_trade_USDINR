@@ -160,15 +160,26 @@ class TestQuotesFromTheFeed(unittest.TestCase):
         self.assertEqual(quotes["1769"].bid_qty, 15)
         self.assertEqual(quotes["1584"].ask_qty, 9)
 
-    def test_a_missing_leg_is_an_error_not_a_guess(self):
-        with self.assertRaises(QuoteError):
-            self.reader.from_feed({"1769": self.feed.tick("1769")},
-                                  ["1769", "1584"])
+    def test_a_leg_with_no_tick_is_left_out_with_a_reason(self):
+        """It used to raise for the whole batch, which blinded the sections
+        whose legs were fine. A leg that cannot be read is ABSENT, so no
+        section can price against it -- which is where the safety was all
+        along."""
+        got = self.reader.from_feed({"1769": self.feed.tick("1769")},
+                                    ["1769", "1584"])
+        self.assertIn("1769", got)
+        self.assertNotIn("1584", got)
+        self.assertIn("no live tick", self.reader.problems["1584"])
 
-    def test_an_empty_side_is_refused(self):
+    def test_an_empty_side_produces_no_quote_for_that_leg(self):
         self.feed._on_message({"Raw": dict(LIVE_209, **{"3": "0"})})
+        got = self.reader.from_feed(self.feed.ticks(), ["1769", "1584"])
+        self.assertNotIn("1769", got)
+        self.assertIn("no two-sided market", self.reader.problems["1769"])
+
+    def test_nothing_readable_at_all_still_raises(self):
         with self.assertRaises(QuoteError):
-            self.reader.from_feed(self.feed.ticks(), ["1769", "1584"])
+            self.reader.from_feed({}, ["1769", "1584"])
 
     def test_a_crossed_book_is_refused(self):
         self.feed._on_message({"Raw": dict(LIVE_209, **{"3": "959700000"})})

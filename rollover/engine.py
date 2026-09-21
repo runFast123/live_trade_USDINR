@@ -1041,7 +1041,19 @@ class RollEngine:
             far_q = quotes.get(section.far.token)
             if near_q is None or far_q is None:
                 section.decision, section.report = None, None
-                section.note = "no quote"
+                # Say WHICH leg and why. "no quote" on a row whose other leg
+                # is trading fine sends the operator looking at the wrong
+                # thing -- and the usual reason is a far month with a bid and
+                # no ask, which is worth knowing about the contract itself.
+                problems = getattr(self.reader, "problems", None) or {}
+                missing = [(info.sec_desc or info.token, info.token)
+                           for info, quote in ((section.near, near_q),
+                                               (section.far, far_q))
+                           if quote is None]
+                said = "; ".join(
+                    f"{name}: {problems.get(token, 'no quote')}"
+                    for name, token in missing)
+                section.note = said or "no quote"
                 continue
 
             cfg = section.cfg

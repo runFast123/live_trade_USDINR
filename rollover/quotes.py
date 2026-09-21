@@ -214,6 +214,10 @@ class QuoteReader:
         self.last_raw: Any = None
         self.instruments: Dict[str, Any] = {}
 
+    #: token -> why it could not be read, from the last fetch. A token in
+    #: here is absent from the quotes, so nothing can price against it.
+    problems: Dict[str, str] = {}
+
     def set_instruments(self, instruments: Dict[str, Any]) -> None:
         """Hand over the resolved contracts so their declared PriceDivisor and
         circuit limits can be used instead of a guessed scale and a generic band."""
@@ -334,13 +338,26 @@ class QuoteReader:
             if token in wanted and token not in by_token:
                 by_token[token] = record
 
-        missing = wanted - set(by_token)
-        if missing:
-            raise QuoteError(
-                "touchline did not return these tokens: " + ", ".join(sorted(missing))
-            )
+        # A token the app cannot read is left OUT, with its reason recorded.
+        # It used to raise for the whole batch, which was right when there
+        # were exactly two legs and both were needed. With several sections
+        # it is not: one dead leg on one section -- a December contract with
+        # a bid and no ask at all -- took every quote off the screen and
+        # blinded the sections that were perfectly tradeable.
+        #
+        # The safety this replaces is kept, because it never depended on
+        # raising: a token whose price is doubtful is ABSENT from the result,
+        # so no section can price against it and none can trade on it.
+        self.problems = {}
+        for token in sorted(wanted - set(by_token)):
+            self.problems[token] = "the touchline did not return it"
 
-        sample = by_token[next(iter(wanted))]
+        if not by_token:
+            raise QuoteError(
+                "touchline returned none of the tokens asked for: "
+                + ", ".join(sorted(wanted)))
+
+        sample = by_token[next(iter(by_token))]
         self.bid_key = _pick_field(sample, BID_CANDIDATES, self.cfg.bid_field, "bid")
         self.ask_key = _pick_field(sample, ASK_CANDIDATES, self.cfg.ask_field, "ask")
 
@@ -350,17 +367,25 @@ class QuoteReader:
             try:
                 bid, bid_qty = top_of_book(record.get(self.bid_key), "bid", token)
                 ask, ask_qty = top_of_book(record.get(self.ask_key), "ask", token)
-            except PriceError as exc:
-                raise QuoteError(f"token {token}: unreadable price ({exc})") from exc
+            except (PriceError, QuoteError) as exc:
+                self.problems[token] = f"unreadable price ({exc})"
+                continue
             if bid <= 0 or ask <= 0:
-                raise QuoteError(
-                    f"token {token}: no two-sided market (bid={bid}, ask={ask}). "
-                    "An empty side means there is nothing to trade against."
-                )
+                self.problems[token] = (
+                    f"no two-sided market (bid={bid}, ask={ask}); an empty "
+                    "side means there is nothing to trade against")
+                continue
             raw_values[token] = (bid, ask)
             sizes[token] = (bid_qty, ask_qty)
 
-        return self._finish(raw_values, sizes, at, by_token, source="touchline")
+        if not raw_values:
+            raise QuoteError("; ".join(
+                f"token {t}: {why}" for t, why in sorted(self.problems.items()))
+                or "no usable prices in the touchline response")
+
+        return self._finish(raw_values, sizes, at,
+                            {t: by_token[t] for t in raw_values},
+                            source="touchline")
 
     def from_feed(self, ticks: Dict[str, Any], tokens: List[str],
                   at: Optional[float] = None) -> Dict[str, Quote]:
@@ -376,18 +401,24 @@ class QuoteReader:
         moved: Dict[str, float] = {}
         declared: List[Decimal] = []
 
+        # Same rule as the touchline above: a token that cannot be read is
+        # left out with its reason, not raised for the whole batch.
+        self.problems = {}
         for token in (str(t) for t in tokens):
             tick = ticks.get(token)
             if tick is None:
-                raise QuoteError(f"no live tick for token {token}")
+                self.problems[token] = "no live tick yet"
+                continue
             try:
                 bid, ask = D(tick.bid), D(tick.ask)
             except PriceError as exc:
-                raise QuoteError(f"token {token}: unreadable live price ({exc})") from exc
+                self.problems[token] = f"unreadable live price ({exc})"
+                continue
             if bid <= 0 or ask <= 0:
-                raise QuoteError(
-                    f"token {token}: no two-sided market on the live feed "
+                self.problems[token] = (
+                    f"no two-sided market on the live feed "
                     f"(bid={bid}, ask={ask})")
+                continue
             raw_values[token] = (bid, ask)
             sizes[token] = (_as_int(tick.bid_qty), _as_int(tick.ask_qty))
             moved[token] = tick.at
@@ -398,6 +429,11 @@ class QuoteReader:
                         declared.append(value)
                 except PriceError:
                     pass
+
+        if not raw_values:
+            raise QuoteError("; ".join(
+                f"token {t}: {why}" for t, why in sorted(self.problems.items()))
+                or "no usable prices on the live feed")
 
         return self._finish(raw_values, sizes, at,
                             {t: ticks[t].raw for t in raw_values},

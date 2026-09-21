@@ -201,3 +201,100 @@ class TestNoSectionBorrowsAnothersNumbers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOneDeadLegDoesNotBlindTheRest(EngineCase):
+    """Found live: a December contract with a bid and no ask at all.
+
+    Quoting every section's legs meant that one dead leg -- on a section
+    that was SWITCHED OFF -- raised for the whole batch, so the enabled
+    section lost its quotes too. Every leg card went blank, the roll cost
+    read NO DATA, and the screen said "no prices to scale" while the market
+    it cared about was trading normally.
+
+    The safety never depended on raising. A token that cannot be read is
+    absent from the quotes, so no section can price against it and none can
+    trade on it.
+    """
+
+    def reader(self):
+        from rollover.quotes import QuoteReader
+
+        cfg = RollConfig(near_token="1284", far_token="1584")
+        got = QuoteReader(None, cfg)
+        got.set_instruments({t: contract(t) for t in
+                             ("1769", "1284", "1584")})
+        return got
+
+    def payload(self, dead=None):
+        """A touchline where `dead` has a bid and no ask, as December had."""
+        rows = []
+        for token, bid, ask in (("1284", "96.1350", "96.1500"),
+                                ("1584", "96.3500", "96.4200"),
+                                ("1769", "95.7750", "95.7800")):
+            if token == dead:
+                ask = "0"
+            rows.append({"Token": token, "BestBidPrice": bid,
+                         "BestAskPrice": ask, "LTP": bid})
+        return {"Status": "Success", "Response": rows}
+
+    def test_the_healthy_legs_still_quote(self):
+        import time as _time
+        reader = self.reader()
+        got = reader.parse(self.payload(dead="1769"),
+                           ["1284", "1584", "1769"], _time.monotonic())
+        self.assertEqual(sorted(got), ["1284", "1584"])
+
+    def test_the_dead_one_is_absent_so_nothing_can_trade_on_it(self):
+        import time as _time
+        reader = self.reader()
+        got = reader.parse(self.payload(dead="1769"),
+                           ["1284", "1584", "1769"], _time.monotonic())
+        self.assertNotIn("1769", got)
+
+    def test_and_the_reason_is_kept(self):
+        import time as _time
+        reader = self.reader()
+        reader.parse(self.payload(dead="1769"), ["1284", "1584", "1769"],
+                     _time.monotonic())
+        self.assertIn("no two-sided market", reader.problems["1769"])
+
+    def test_the_section_with_the_dead_leg_says_which_leg(self):
+        """"no quote" on a row whose other leg is trading fine sends the
+        operator looking at the wrong thing."""
+        import time as _time
+
+        engine = self.engine([NOV, OCT])
+        engine.account.logged_in = True
+        engine.account.market_open = True
+        engine.near_positions = {"1769": 100000}
+        reader = self.reader()
+        quotes = reader.parse(self.payload(dead="1584"),
+                              ["1284", "1584", "1769"], _time.monotonic())
+        engine.reader = reader
+        engine._read_quotes = lambda tokens: quotes
+        engine._slow_refresh = lambda: None
+        engine._tick(engine.quote_tokens())
+
+        by_name = {s.name: s for s in engine.sections}
+        self.assertIn("USDINR26NOVFUT", by_name["Sep into Nov"].note)
+        self.assertIn("no two-sided market", by_name["Sep into Nov"].note)
+
+    def test_while_the_other_section_prices_normally(self):
+        import time as _time
+
+        engine = self.engine([NOV, OCT])
+        engine.account.logged_in = True
+        engine.account.market_open = True
+        engine.near_positions = {"1769": 100000}
+        reader = self.reader()
+        quotes = reader.parse(self.payload(dead="1584"),
+                              ["1284", "1584", "1769"], _time.monotonic())
+        engine.reader = reader
+        engine._read_quotes = lambda tokens: quotes
+        engine._slow_refresh = lambda: None
+        engine._tick(engine.quote_tokens())
+
+        by_name = {s.name: s for s in engine.sections}
+        self.assertIsNotNone(by_name["Sep into Oct"].decision)
+        self.assertIsNone(by_name["Sep into Nov"].decision)

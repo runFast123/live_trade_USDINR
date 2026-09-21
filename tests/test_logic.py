@@ -172,13 +172,34 @@ class TestTouchlineParsing(unittest.TestCase):
         self.assertEqual(quotes["1002"].ask, D("96.5200"))
         self.assertEqual(quotes["1001"].divisor, D("100"))
 
-    def test_missing_token_is_an_error(self):
-        with self.assertRaises(QuoteError):
-            self.reader.parse(self.payload(), ["1001", "9999"], time.monotonic())
+    def test_a_missing_token_is_left_out_with_a_reason(self):
+        """It used to raise for the whole batch. With several sections that
+        is wrong: one dead leg took every quote off the screen, including
+        the legs that were trading perfectly well. The safety never depended
+        on raising -- a token that cannot be read is ABSENT, so nothing can
+        price against it and nothing can trade on it."""
+        got = self.reader.parse(self.payload(), ["1001", "9999"],
+                                time.monotonic())
+        self.assertIn("1001", got)
+        self.assertNotIn("9999", got)
+        self.assertIn("9999", self.reader.problems)
 
-    def test_empty_side_is_an_error(self):
+    def test_an_empty_side_produces_no_quote_for_that_token(self):
+        got = self.reader.parse(self.payload(bid1="0"), ["1001", "1002"],
+                                time.monotonic())
+        self.assertNotIn("1001", got)
+        self.assertIn("no two-sided market", self.reader.problems["1001"])
+
+    def test_and_the_other_leg_still_comes_back(self):
+        got = self.reader.parse(self.payload(bid1="0"), ["1001", "1002"],
+                                time.monotonic())
+        self.assertIn("1002", got)
+
+    def test_every_token_unreadable_still_raises(self):
+        """A feed that gives nothing usable is a feed problem, not a quote."""
         with self.assertRaises(QuoteError):
-            self.reader.parse(self.payload(bid1="0"), ["1001", "1002"], time.monotonic())
+            self.reader.parse(self.payload(bid1="0", bid2="0"),
+                              ["1001", "1002"], time.monotonic())
 
     def test_crossed_book_is_an_error(self):
         bad = self.payload(bid1="9595.00", ask1="9594.00")
