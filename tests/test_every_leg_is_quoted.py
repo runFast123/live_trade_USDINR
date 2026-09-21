@@ -298,3 +298,124 @@ class TestOneDeadLegDoesNotBlindTheRest(EngineCase):
         by_name = {s.name: s for s in engine.sections}
         self.assertIsNotNone(by_name["Sep into Oct"].decision)
         self.assertIsNone(by_name["Sep into Nov"].decision)
+
+
+class TestASectionAddedMidSessionGetsItsContracts(EngineCase):
+    """The bug reported three times as "it still shows no data".
+
+    Contracts were resolved at startup and again only when the scrip master
+    changed day. reload_sections carried over the contracts of sections that
+    already existed -- and a section that was NEW had none to carry, so its
+    near and far stayed None for the rest of the session. The tick skipped
+    it as "contracts not resolved" and it showed NO DATA until the app was
+    restarted. Every time a section was added.
+    """
+
+    class ScripBroker(Broker):
+        """A broker whose instrument() answers from the fixture chain."""
+        def __init__(self):
+            self.looked_up = []
+
+        def instrument(self, token):
+            self.looked_up.append(str(token))
+            return contract(str(token))
+
+    def running_engine(self):
+        from rollover.engine import RollEngine
+        from rollover.quotes import QuoteReader
+
+        cfg = RollConfig(
+            near_token="1769", near_expiry="2026-09-28",
+            far_token="1584", far_expiry="2026-11-26",
+            limit_bps_schedule={"1": "30", "2": "50"},
+            sections=[NOV], use_live_feed=False, record_market=False,
+            update_check=False, journal=False, dry_run=True)
+        broker = self.ScripBroker()
+        engine = RollEngine(cfg, self.log, self.dir, broker=broker)
+        engine.reader = QuoteReader(None, cfg)      # as _connect would
+        engine.resolve_contracts(force=True)         # startup
+        return engine, broker
+
+    def test_the_new_section_is_resolved_on_reload(self):
+        engine, broker = self.running_engine()
+        engine.cfg.sections = [NOV, OCT]
+        engine.reload_sections()
+        new = next(s for s in engine.sections if s.name == "Sep into Oct")
+        self.assertIsNotNone(new.near)
+        self.assertIsNotNone(new.far)
+        self.assertEqual(new.far.sec_desc, "USDINR26OCTFUT")
+
+    def test_so_it_is_quoted_from_then_on(self):
+        engine, _ = self.running_engine()
+        engine.cfg.sections = [NOV, OCT]
+        engine.reload_sections()
+        self.assertIn("1284", engine.quote_tokens())
+
+    def test_the_existing_section_is_not_looked_up_again(self):
+        """Carrying over is cheaper and keeps the screen from blanking."""
+        engine, broker = self.running_engine()
+        broker.looked_up.clear()
+        engine.cfg.sections = [NOV, OCT]
+        engine.reload_sections()
+        self.assertNotIn("1584", broker.looked_up)
+        self.assertIn("1284", broker.looked_up)
+
+    def test_the_reader_learns_the_new_contract_too(self):
+        """Or the quote layer cannot check its price scale."""
+        engine, _ = self.running_engine()
+        engine.cfg.sections = [NOV, OCT]
+        engine.reload_sections()
+        self.assertIn("1284", engine.reader.instruments)
+
+    def test_a_contract_the_scrip_master_lacks_is_a_warning_not_a_crash(self):
+        engine, broker = self.running_engine()
+
+        def missing(token):
+            if str(token) == "9999":
+                raise KeyError("no such token")
+            return contract(str(token))
+        broker.instrument = missing
+        engine.cfg.sections = [NOV, {"name": "Bad", "near_token": "1769",
+                                     "far_token": "9999",
+                                     "near_expiry": "2026-09-28",
+                                     "far_expiry": "2026-12-29",
+                                     "limit_ladder": [], "enabled": False}]
+        engine.reload_sections()                 # must not raise
+        bad = next(s for s in engine.sections if s.name == "Bad")
+        self.assertIsNone(bad.far)
+        self.assertIn("9999", self.log.text())
+
+
+class TestTheTradeBookIsCheckedAgainstTheSectionThatTraded(EngineCase):
+    """_confirm_trades used the top-level near and far tokens. With several
+    sections those differ from the pair that actually rolled, so it would
+    check the exchange's trade record against the wrong contracts -- alerting
+    on a disagreement that is not there, or missing one that is."""
+
+    def test_it_asks_the_trade_book_about_the_sections_own_legs(self):
+        engine = self.engine([NOV, OCT])
+        asked = []
+
+        def traded_since(before, token, side):
+            asked.append(str(token))
+            return 1000, "ok"
+        engine.broker.traded_since = traded_since
+
+        class Leg:
+            filled_qty = 1000
+        oct_section = next(s for s in engine.sections
+                           if s.name == "Sep into Oct")
+        engine._confirm_trades(Leg(), Leg(), set(), section=oct_section)
+        # The top-level far token is 1584; the section that traded buys 1284.
+        self.assertEqual(asked, ["1769", "1284"])
+
+    def test_without_a_section_it_falls_back_to_the_top_level_pair(self):
+        engine = self.engine([])
+        asked = []
+        engine.broker.traded_since = lambda b, t, s: (asked.append(str(t)),
+                                                      (1000, "ok"))[1]
+
+        class Leg:
+            filled_qty = 1000
+        engine._confirm_trades(Leg(), Leg(), set())
+        self.assertEqual(asked, ["1769", "1584"])

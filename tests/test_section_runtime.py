@@ -99,9 +99,13 @@ class TestWhatIsSharedAndWhatIsNot(unittest.TestCase):
         self.a.logged_in = True
         self.assertTrue(self.b.logged_in)
 
-    def test_the_margin_is_shared(self):
-        self.a.margin = "an estimate"
-        self.assertEqual(self.b.margin, "an estimate")
+    def test_the_margin_is_not_shared(self):
+        """It was. The AVAILABLE side is the account's, but the REQUIRED
+        side is this roll's -- a one month and a two month roll on the same
+        near month need different margin -- so one slot on the account meant
+        every section's gate read whichever section was estimated last."""
+        self.a.margin = "an estimate for a"
+        self.assertIsNone(self.b.margin)
 
     def test_the_contracts_are_not_shared(self):
         self.a.near = "a contract"

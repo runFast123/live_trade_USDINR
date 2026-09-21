@@ -277,6 +277,14 @@ class RollEngine:
                 self.saved,
                 load_keys={s.key for s in self.sections} - set(before))
 
+        # A section that is new here has no contracts carried over, and
+        # nothing else would ever look them up.
+        if self.reader is not None:
+            try:
+                self.resolve_contracts()
+            except Exception as exc:
+                self.log.warn(f"Could not resolve the new contracts: {exc}")
+
         kept = sorted(set(before) & {s.key for s in self.sections})
         gone = sorted(set(before) - {s.key for s in self.sections})
         fresh = sorted({s.key for s in self.sections} - set(before))
@@ -524,30 +532,28 @@ class RollEngine:
                 "Run the app with --find USDINR to list the contracts and their tokens."
             )
 
-        known = {}
-        for section in self.sections:
-            cfg = section.cfg
-            section.near = self.broker.instrument(cfg.near_token)
-            section.far = self.broker.instrument(cfg.far_token)
-            known[section.near.token] = section.near
-            known[section.far.token] = section.far
-
         # The scrip master states the price scale and the tick for each
         # contract, so the quote reader checks a declared scale instead of
         # guessing one. Sections that share a leg share one entry.
-        self.reader.set_instruments(known)
+        self.resolve_contracts(force=True)
 
         self.account.scrip_file_date = self.broker.scrip_file_date
 
         if self.cfg.use_live_feed:
             self.feed.start(self.broker.client, self.quote_tokens())
 
-        for role, info in (("Near leg (SELL)", self.session.near),
-                           ("Far leg  (BUY) ", self.session.far)):
-            self.log.info(
-                f"{role}: {info.label()} [{info.instrument}] expiry {info.expiry} "
-                f"lot {info.lot_size} tick {info.tick} divisor {info.price_divisor} "
-                f"limits {info.low_range}..{info.high_range}")
+        seen = set()
+        for section in self.sections:
+            for role, info in (("Near leg (SELL)", section.near),
+                               ("Far leg  (BUY) ", section.far)):
+                if info is None or info.token in seen:
+                    continue
+                seen.add(info.token)
+                self.log.info(
+                    f"{role}: {info.label()} [{info.instrument}] expiry "
+                    f"{info.expiry} lot {info.lot_size} tick {info.tick} "
+                    f"divisor {info.price_divisor} limits "
+                    f"{info.low_range}..{info.high_range}")
 
     def _slow_refresh(self) -> None:
         """Position, market status, and the day's scrip master."""
@@ -555,14 +561,7 @@ class RollEngine:
             if self.broker.refresh_scrip_master_if_stale():
                 # New day, new file: the contracts must be read again, since
                 # their expiries and circuit limits have all moved.
-                known = {}
-                for section in self.sections:
-                    cfg = section.cfg
-                    section.near = self.broker.instrument(cfg.near_token)
-                    section.far = self.broker.instrument(cfg.far_token)
-                    known[section.near.token] = section.near
-                    known[section.far.token] = section.far
-                self.reader.set_instruments(known)
+                self.resolve_contracts(force=True)
                 self.account.scrip_file_date = self.broker.scrip_file_date
                 self.log.info("Contracts re-read from the new scrip master.")
         except Exception as exc:
@@ -575,9 +574,17 @@ class RollEngine:
         # rather than every tick. This is the screen's copy; the one that
         # actually stops an order is taken immediately before leg 1.
         if self.cfg.require_margin and not self.cfg.dry_run:
-            self.session.margin = marginlib.estimate(
-                self.broker, self.cfg.near_token, self.cfg.far_token,
-                self.cfg.clip_qty)
+            # One estimate per enabled section, on that section's own pair.
+            # This used to estimate the top-level pair once and hand it to
+            # sections[0] only, leaving every other section's margin gate
+            # reading "unknown" -- which blocks -- and the first section's
+            # reading a figure that might be for a different roll.
+            for section in list(self.sections):
+                if not section.enabled:
+                    continue
+                cfg = section.cfg
+                section.margin = marginlib.estimate(
+                    self.broker, cfg.near_token, cfg.far_token, cfg.clip_qty)
 
     # ------------------------------------------------------------------- loop
     def _run(self) -> None:
@@ -741,7 +748,7 @@ class RollEngine:
         except Exception:
             return None
 
-    def _confirm_trades(self, leg1, leg2, before_trades) -> None:
+    def _confirm_trades(self, leg1, leg2, before_trades, section=None) -> None:
         """Compare the order book's fills against the exchange's trade record.
 
         Two independent accounts of the same event. The order book is what the
@@ -756,8 +763,13 @@ class RollEngine:
                           "the fills rest on the order book alone.")
             return
 
+        # The section that just traded, not the top-level pair. With several
+        # sections those differ, and checking the trade book against the
+        # wrong contracts would either alert on a disagreement that is not
+        # there or miss one that is.
+        cfg = section.cfg if section is not None else self.cfg
         for leg, side, outcome in (("near", SELL, leg1), ("far", BUY, leg2)):
-            token = (self.cfg.near_token if leg == "near" else self.cfg.far_token)
+            token = (cfg.near_token if leg == "near" else cfg.far_token)
             traded, detail = self.broker.traded_since(before_trades, token, side)
             if traded is None:
                 self.log.warn(f"Trade book, {leg} leg: {detail}")
@@ -924,6 +936,45 @@ class RollEngine:
             return
         self._last_complaint = (message, now)
         getattr(self.log, level)(message)
+
+    def resolve_contracts(self, force: bool = False) -> int:
+        """Give every section its two contracts from the scrip master.
+
+        `force` re-reads them all, for startup and for a new day's file.
+        Without it only the sections that have none are looked up, which is
+        what a section ADDED while the app is running needs.
+
+        That was the hole. Contracts were resolved at startup and again only
+        when the scrip master changed day, and reload_sections carries over
+        the contracts of sections that already existed. So a section added
+        mid-session had near and far of None for the rest of the session,
+        the tick skipped it as "contracts not resolved", and it showed NO
+        DATA until the app was restarted. Every time. Reported three times
+        before this was the answer.
+        """
+        known = {}
+        resolved = 0
+        for section in list(self.sections):
+            cfg = section.cfg
+            for role in ("near", "far"):
+                token = getattr(cfg, f"{role}_token", None)
+                if not token:
+                    continue
+                if force or getattr(section, role, None) is None:
+                    try:
+                        setattr(section, role, self.broker.instrument(token))
+                        resolved += 1
+                    except Exception as exc:
+                        self.log.warn(
+                            f"{section.name}: could not read the {role} "
+                            f"contract ({token}) from the scrip master: {exc}")
+                        continue
+                info = getattr(section, role, None)
+                if info is not None:
+                    known[info.token] = info
+        if known:
+            self.reader.set_instruments(known)
+        return resolved
 
     def quote_tokens(self) -> List[str]:
         """Every token any section needs, in the order they were configured.
@@ -1250,7 +1301,7 @@ class RollEngine:
         if cfg.require_margin and not cfg.dry_run:
             estimate = marginlib.estimate(
                 self.broker, cfg.near_token, cfg.far_token, decision.qty)
-            self.account.margin = estimate
+            section.margin = estimate
             journal.margin(estimate, decision.qty)
             if estimate.affordable is not True:
                 self.account.in_flight = False
@@ -1321,7 +1372,8 @@ class RollEngine:
             if leg2.fully_filled:
                 near_leg = leg1 if first.role == "near" else leg2
                 far_leg = leg2 if first.role == "near" else leg1
-                self._confirm_trades(near_leg, far_leg, before_trades)
+                self._confirm_trades(near_leg, far_leg, before_trades,
+                                     section=section)
 
                 # The order book is the broker's summary of what it believes.
                 # The position book is what the account actually holds. Saying

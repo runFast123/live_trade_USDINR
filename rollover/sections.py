@@ -45,7 +45,6 @@ class AccountState:
     market_open: Optional[bool] = None
     scrip_file_date: Optional[date] = None
     quote_source: str = "starting"
-    margin: Optional[Any] = None
 
     # One order at a time across every section. They compete for the same
     # inventory and the same margin, so two in flight could each be sound on
@@ -99,6 +98,13 @@ class Section:
         self.sequence = None
         self.quotes = None
         self.note = ""
+
+        # Its own margin estimate. The AVAILABLE side is the account's, but
+        # the REQUIRED side is this roll's -- a one month and a two month
+        # roll on the same September need different margin -- so one shared
+        # slot on the account meant every section's gate read whichever
+        # section had been estimated last.
+        self.margin = None
 
         # Its own evidence file, and its own view of the shared journal.
         # Both are set by the engine: each roll is a different cost against a
@@ -167,14 +173,6 @@ class Section:
     @quote_source.setter
     def quote_source(self, value: str) -> None:
         self.account.quote_source = value
-
-    @property
-    def margin(self):
-        return self.account.margin
-
-    @margin.setter
-    def margin(self, value) -> None:
-        self.account.margin = value
 
     @property
     def account_clips_left(self) -> Optional[int]:
