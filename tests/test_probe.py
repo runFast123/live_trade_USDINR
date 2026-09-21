@@ -187,3 +187,93 @@ class TestTheWarning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestItKnowsWhichOrderIsOurs(unittest.TestCase):
+    """The probe places a real order and then cancels it.
+
+    Which means it has to be certain which row in the book is its own. It
+    used to take "the most recent row on this token", which is only right on
+    an account with nothing else working -- and the next thing it does with
+    that row is cancel it.
+
+    The id place_order hands back cannot help: the live capture from
+    18 September returns "260918000069382" and that value appears nowhere in
+    the order book row, which carries ClientOrderNo 100000014 and an empty
+    ExchangeOrderNo. So ours is the row that was NOT there before, exactly
+    as the execution path identifies its own orders.
+    """
+
+    def book(self, *rows):
+        return {"ok": True, "response": {"Response": list(rows)}}
+
+    def row(self, client_no, token="1769", status="PENDING"):
+        return {"Token": int(token), "ClientOrderNo": client_no,
+                "ExchangeOrderNo": "", "GatewayOrderNo": None,
+                "OrderStatus": status, "Qty": 1, "Price": 93.06,
+                "SegmentId": 13, "BS": "1"}
+
+    def test_the_one_new_order_is_ours(self):
+        before = probe._identities(self.book(self.row(1), self.row(2)))
+        after = self.book(self.row(1), self.row(2), self.row(3))
+        found, problem = probe._find_ours(after, "1769", before)
+        self.assertIsNone(problem)
+        self.assertEqual(found["ClientOrderNo"], 3)
+
+    def test_it_is_not_simply_the_most_recent(self):
+        """Someone else's order arriving after ours must not be taken."""
+        before = probe._identities(self.book(self.row(1)))
+        after = self.book(self.row(1), self.row(2))
+        found, _ = probe._find_ours(after, "1769", before)
+        self.assertEqual(found["ClientOrderNo"], 2)
+
+    def test_two_new_orders_are_refused_rather_than_guessed(self):
+        before = probe._identities(self.book(self.row(1)))
+        after = self.book(self.row(1), self.row(2), self.row(3))
+        found, problem = probe._find_ours(after, "1769", before)
+        self.assertIsNone(found)
+        self.assertIn("2 new orders", problem)
+        self.assertIn("cancel by hand", problem)
+
+    def test_no_new_order_is_reported_as_such(self):
+        before = probe._identities(self.book(self.row(1)))
+        found, problem = probe._find_ours(self.book(self.row(1)), "1769",
+                                          before)
+        self.assertIsNone(found)
+        self.assertIn("no NEW order", problem)
+
+    def test_an_order_on_another_token_is_not_ours(self):
+        before = probe._identities(self.book(self.row(1)))
+        after = self.book(self.row(1), self.row(9, token="1584"))
+        found, problem = probe._find_ours(after, "1769", before)
+        self.assertIsNone(found)
+        self.assertIn("no NEW order", problem)
+
+    def test_an_empty_book_says_it_never_appeared(self):
+        found, problem = probe._find_ours(self.book(), "1769", set())
+        self.assertIsNone(found)
+        self.assertIn("never appeared", problem)
+
+    def test_an_unreadable_book_is_not_treated_as_empty(self):
+        found, problem = probe._find_ours({"ok": False, "error": "boom"},
+                                          "1769", set())
+        self.assertIsNone(found)
+
+    def test_the_identities_of_an_unreadable_book_are_empty(self):
+        """And the run refuses to place anything in that case -- an empty
+        set would make every order in the book look new."""
+        self.assertEqual(probe._identities({"ok": False}), set())
+
+
+class TestItWillNotPlaceWhatItCannotIdentify(unittest.TestCase):
+    def test_the_run_refuses_when_the_book_cannot_be_read(self):
+        import inspect
+        source = inspect.getsource(probe.run)
+        self.assertIn("order_book_before", source)
+        self.assertIn("Nothing was sent.", source)
+
+    def test_and_it_reads_the_book_before_it_places(self):
+        import inspect
+        source = inspect.getsource(probe.run)
+        self.assertLess(source.index("order_book_before"),
+                        source.index("place_order"))

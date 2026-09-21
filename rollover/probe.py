@@ -143,6 +143,21 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None, qty: int = 1,
     }
 
     orders = broker.client.orders
+
+    # What is in the book already, so our own order can be told apart from
+    # anything else working on this contract. Without it the only way to
+    # find ours is "the most recent row on this token", and the next thing
+    # done with that row is to cancel it.
+    record["order_book_before"] = _capture("order_book_before",
+                                           orders.get_order_book)
+    if not record["order_book_before"].get("ok"):
+        print("  The order book could not be read, so an order placed now "
+              "could not be told from any other on this contract -- and it "
+              "would have to be cancelled by hand. Nothing was sent.")
+        return 2
+    before = _identities(record["order_book_before"])
+    print(f"  {len(before)} order(s) already in the book")
+
     log.info(f"PROBE: BUY {qty} of {info.label()} at {money(price)} ({units})")
 
     record["place_order"] = _capture("place", lambda: orders.place_order(
@@ -156,10 +171,15 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None, qty: int = 1,
     record["order_book_v2"] = _capture("order_book_v2", orders.get_order_book_v2)
     record["trade_book"] = _capture("trade_book", orders.get_trade_book)
 
-    ours = _find_ours(record["order_book"], info.token)
+    ours, problem = _find_ours(record["order_book"], info.token, before)
     if ours is None:
-        ours = _find_ours(record["order_book_v2"], info.token)
+        ours, problem_v2 = _find_ours(record["order_book_v2"], info.token,
+                                      before)
+        problem = None if ours is not None else (problem or problem_v2)
     record["matched_order"] = ours
+    record["match_problem"] = problem
+    if problem:
+        print(f"  COULD NOT IDENTIFY OUR ORDER: {problem}")
 
     order_no = _first(ours, _ORDER_NO_KEYS) if ours else None
     if order_no is not None:
@@ -180,25 +200,74 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None, qty: int = 1,
         record["order_book_after_cancel"] = _capture(
             "order_book_after", orders.get_order_book)
     else:
-        print("  the order was not found in the book, so there was nothing to cancel")
+        print("  nothing was cancelled. If an order did reach the exchange it "
+              "is still working -- check the broker terminal.")
 
     path = _save(record, base_dir)
     _report(record, info, qty, path)
     return 0
 
 
-def _find_ours(captured: Dict[str, Any], token: str) -> Optional[Dict[str, Any]]:
-    """The most recent row on our token, whatever shape the book came in."""
+def _rows_on(captured: Dict[str, Any], token: str) -> list:
+    """Every row in the book on this token, whatever shape it came in."""
     if not captured.get("ok"):
-        return None
+        return []
     from .broker import _iter_records
 
-    found = None
+    out = []
     for row in _iter_records(captured["response"]):
+        if not isinstance(row, dict):
+            continue
         value = _first(row, ("Token", "ScripToken", "InstrumentToken"))
         if value is not None and str(value).strip() == str(token):
-            found = row
+            out.append(row)
+    return out
+
+
+def _identities(captured: Dict[str, Any]) -> set:
+    """What was already in the book, so our own order can be told apart."""
+    from .broker import _iter_records, order_identity
+
+    found = set()
+    if not captured.get("ok"):
+        return found
+    for row in _iter_records(captured["response"]):
+        ref = order_identity(row) if isinstance(row, dict) else None
+        if ref is not None:
+            found.add(ref)
     return found
+
+
+def _find_ours(captured: Dict[str, Any], token: str,
+               before: Optional[set] = None):
+    """Our order, or a reason we cannot say which one it is.
+
+    Returns (row, problem). It used to return the most recent row on the
+    token, which is only right on an account with nothing else working. The
+    order this places cannot be tied to the id place_order returns -- that
+    id appears nowhere in the order book -- so ours is identified as the row
+    that was NOT there before, exactly as the execution path does it.
+
+    If that is ambiguous it refuses rather than guesses, because the next
+    thing done with this row is to cancel it.
+    """
+    from .broker import order_identity
+
+    rows = _rows_on(captured, token)
+    if not rows:
+        return None, "the order never appeared in the book"
+    if before is None:
+        return rows[-1], None
+
+    fresh = [r for r in rows if order_identity(r) not in before]
+    if len(fresh) == 1:
+        return fresh[0], None
+    if not fresh:
+        return None, ("no NEW order appeared on this token; the rows there "
+                      "were all in the book before this ran")
+    return None, (f"{len(fresh)} new orders appeared on this token, so which "
+                  "one is ours cannot be established. Nothing was cancelled "
+                  "-- check the broker terminal and cancel by hand.")
 
 
 def _save(record: Dict[str, Any], base_dir: str) -> str:

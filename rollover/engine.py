@@ -426,6 +426,16 @@ class RollEngine:
         before anything is armed rather than discovered when the second order
         is rejected.
         """
+        if not any(section.enabled for section in self.sections):
+            # It used to arm: the button went green, the countdown ran, and
+            # "ARMED across 0 section(s)" went in the log. An authorisation
+            # that cannot reach anything is worse than no authorisation,
+            # because it looks like one.
+            self.log.alert(
+                "Cannot arm: no section is switched on, so nothing could "
+                "trade. Select one and press Enable.")
+            return
+
         refusal = self.allocation_refusal()
         if refusal:
             self.log.alert("Cannot arm: " + refusal)
@@ -1128,8 +1138,17 @@ class RollEngine:
             return
 
         working = [s for s in self.sections if s.enabled]
-        if working and all(s.clips_done_today >= s.cfg.max_clips_per_day
-                           for s in working):
+        if not working:
+            # It is watching, and nothing it watches can trade. Saying
+            # "watching both legs" here is the screen claiming a readiness
+            # it does not have.
+            self._set_state(
+                WATCHING,
+                "nothing is switched on, so nothing can trade"
+                if self.sections else "no sections configured")
+            return
+        if all(s.clips_done_today >= s.cfg.max_clips_per_day
+               for s in working):
             self._set_state(DONE, "the day's clips are done")
             return
         left = self._account_clips_left()
