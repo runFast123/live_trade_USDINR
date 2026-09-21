@@ -683,6 +683,124 @@ class TestTheRefusalToEnableIsReadable(WorkflowCase):
         self.assertTrue(self.note().rstrip().endswith("."))
 
 
+class TestTheEvidenceCard(WorkflowCase):
+    """What the day's recording says, on screen.
+
+    The recorder wrote a row every few seconds and nothing ever read those
+    files back, so the question that decides whether this roll happens had
+    no answer on the screen.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.set_limit("30", "10000")
+        self.write_day()
+        # The tick above already refreshed, and refreshing is throttled to
+        # once every twenty seconds so it does not re-read a day file five
+        # times a second. force is how a caller says the file just changed.
+        self.window._refresh_evidence(force=True)
+        self.window._draw_evidence()
+        self.window._draw_today_line()
+        _root.update_idletasks()
+
+    def write_day(self, costs=("60", "62", "58"), far="1584"):
+        """A recording where 1769>1584 sits well above the limit."""
+        import csv as _csv
+        from datetime import datetime, timedelta
+
+        from rollover.recorder import COLUMNS
+
+        folder = os.path.join(self.dir, "data")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(
+            folder, f"market-{date.today():%Y-%m-%d}.csv")
+        at = datetime.now().replace(hour=10, minute=0, second=0)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = _csv.writer(fh)
+            writer.writerow(COLUMNS)
+            for i, cost in enumerate(costs):
+                at += timedelta(seconds=5)
+                row = {c: "" for c in COLUMNS}
+                row.update({"timestamp": at.isoformat(timespec="milliseconds"),
+                            "near_token": "1769", "far_token": far,
+                            "cost_bps": cost, "limit_bps": "30",
+                            "qualifies": "no"})
+                writer.writerow([row[c] for c in COLUMNS])
+        return path
+
+    def rows(self):
+        return [self.window.evidence.item(i)["values"]
+                for i in self.window.evidence.get_children()]
+
+    def test_the_card_appears_once_there_is_a_recording(self):
+        self.assertTrue(self.window._evidence_shown)
+
+    def test_it_reads_the_pair_on_screen(self):
+        reading = self.window._evidence_reading
+        self.assertEqual(reading.key, "1769>1584")
+
+    def test_it_judges_against_the_limit_in_force_now(self):
+        self.assertEqual(self.window._evidence_reading.limit_bps,
+                         self.window._current_limit_bps())
+
+    def test_it_says_the_limit_was_never_met(self):
+        self.assertIn("0.0 of", self.window.evidence_note.cget("text"))
+
+    def test_and_names_a_level_that_would_have_worked(self):
+        levels = [str(r[0]) for r in self.rows()
+                  if str(r[1]) != "never"]
+        self.assertTrue(levels, "no level was reported as available")
+
+    def test_the_coverage_has_a_denominator(self):
+        """A percentage of an unstated amount of time is not a fact."""
+        self.assertIn("watched of",
+                      self.window.evidence_coverage.cget("text"))
+
+    def test_the_operators_own_limit_is_marked(self):
+        marked = [r for r in self.rows() if str(r[3]) == "your limit"]
+        self.assertEqual(len(marked), 1)
+
+    def test_nothing_is_coloured_as_good(self):
+        """A level that was available is not a level that should be used."""
+        for tag in ("yours", "other", "never"):
+            colour = self.window.evidence.tag_configure(tag, "foreground")
+            self.assertNotIn("SUCCESS", str(colour).upper())
+
+    def test_the_line_above_the_fold_says_the_same_thing(self):
+        line = self.window.cost_today.cget("text")
+        self.assertTrue(line.startswith("today:"))
+        self.assertIn("0.0 of", line)
+
+    def test_and_offers_the_tightest_level_that_would_have_worked(self):
+        self.assertIn("would have been available",
+                      self.window.cost_today.cget("text"))
+
+    def test_it_never_tells_the_operator_to_change_the_limit(self):
+        """Loosening it is the client's decision, not the screen's."""
+        whole = " ".join([self.window.cost_today.cget("text"),
+                          self.window.evidence_note.cget("text"),
+                          self.window.evidence_coverage.cget("text")]).lower()
+        for word in ("recommend", "should", "raise your", "increase"):
+            self.assertNotIn(word, whole)
+
+    def test_no_recording_means_no_card(self):
+        import shutil as _shutil
+        _shutil.rmtree(os.path.join(self.dir, "data"), ignore_errors=True)
+        self.window._refresh_evidence(force=True)
+        self.window._draw_evidence()
+        self.assertFalse(self.window._evidence_shown)
+
+    def test_a_recording_for_another_pair_is_not_borrowed(self):
+        """Judging this roll by another roll's day would be worse than
+        showing nothing."""
+        import shutil as _shutil
+        _shutil.rmtree(os.path.join(self.dir, "data"), ignore_errors=True)
+        self.write_day(costs=("20", "21"), far="9999")
+        self.window._refresh_evidence(force=True)
+        self.window._draw_evidence()
+        self.assertIsNone(self.window._evidence_reading)
+
+
 class TestTheWaitingColumnSaysSomethingTrue(WorkflowCase):
     """Reported as: "it say market is open but is close".
 

@@ -260,6 +260,8 @@ class RollWindow(tk.Toplevel):
         self._build_cost(root)
         self._build_ladder(root)
         self._build_actions(root)
+        # Built after the actions bar because it packs itself before it.
+        self._build_evidence(root)
         self._build_gates_and_log(root)
 
     def _build_header(self, parent) -> None:
@@ -388,6 +390,14 @@ class RollWindow(tk.Toplevel):
         self.cost_rupees = tk.Label(left, text="", bg=T.SURFACE, fg=T.MUTED,
                                     font=self.fonts.ui, anchor="w")
         self.cost_rupees.pack(fill="x")
+        # What the day's recording says, one line, right under the number it
+        # is about. The full table is lower down and below the fold; this is
+        # the part that has to be seen without scrolling. Both come off the
+        # same reader, so they cannot disagree.
+        self.cost_today = tk.Label(left, text="", bg=T.SURFACE, fg=T.FAINT,
+                                   font=self.fonts.ui_small, anchor="w",
+                                   justify="left", wraplength=420)
+        self.cost_today.pack(fill="x", pady=(T.PAD_XS, 0))
 
         right = tk.Frame(box, bg=T.SURFACE)
         right.pack(side="right", padx=(T.PAD_L, 0))
@@ -976,6 +986,184 @@ class RollWindow(tk.Toplevel):
                                    before=self.ladder_grid)
         else:
             self.ladder_empty.pack_forget()
+
+    # ---- what the recording says the day would have allowed ----------------
+    EVIDENCE_COLUMNS = (
+        ("bps", "Limit", 110, "e"),
+        ("time", "Available", 160, "e"),
+        ("share", "Share of watched", 170, "e"),
+        ("note", "", 300, "w"),
+    )
+
+    def _build_evidence(self, parent) -> None:
+        """Read the day's recording back.
+
+        The recorder has written a row every few seconds since it was built
+        and nothing has ever opened those files again, so the one question
+        that decides whether this roll happens has had no answer on screen
+        while the answer sat on disk.
+
+        It is worded as "would have worked", never as a recommendation, and
+        it is deliberately not wired to the ROLL LIMIT box. Loosening the
+        limit is the client's decision; this is the evidence for it.
+        """
+        self.evidence_card = T.card(parent, padx=T.PAD_L, pady=self.gap)
+        box = self.evidence_card.inner
+
+        head = tk.Frame(box, bg=T.SURFACE)
+        head.pack(fill="x")
+        self.evidence_heading = tk.Label(
+            head, text="WHAT WOULD HAVE WORKED TODAY", bg=T.SURFACE,
+            fg=T.FAINT, font=self.fonts.label, anchor="w")
+        self.evidence_heading.pack(side="left")
+        self.evidence_coverage = tk.Label(
+            head, text="", bg=T.SURFACE, fg=T.MUTED,
+            font=self.fonts.ui_small, anchor="e")
+        self.evidence_coverage.pack(side="right")
+
+        self.evidence_note = tk.Label(
+            box, text="", bg=T.SURFACE, fg=T.MUTED, font=self.fonts.ui_small,
+            anchor="w", justify="left", wraplength=1100)
+        self.evidence_note.pack(fill="x", pady=(T.PAD_XS, 0))
+
+        self.evidence = ttk.Treeview(
+            box, columns=[c[0] for c in self.EVIDENCE_COLUMNS],
+            show="headings", height=4, selectmode="none")
+        for key, title, width, anchor in self.EVIDENCE_COLUMNS:
+            self.evidence.heading(key, text=title)
+            self.evidence.column(key, width=width, anchor=anchor,
+                                 stretch=(key == "note"))
+        self.evidence.pack(fill="x", pady=(T.PAD_S, 0))
+        # Never green. A level that was available is not a level that should
+        # be used, and colouring it as good would be an argument the screen
+        # has no business making.
+        self.evidence.tag_configure("yours", foreground=T.TEXT)
+        self.evidence.tag_configure("other", foreground=T.MUTED)
+        self.evidence.tag_configure("never", foreground=T.FAINT)
+
+        tk.Label(box,
+                 text="One recorded day, and only the time the app was "
+                      "actually watching. Evidence for a conversation about "
+                      "the limit, not a setting to change here.",
+                 bg=T.SURFACE, fg=T.FAINT, font=self.fonts.ui_small,
+                 anchor="w", justify="left", wraplength=1100).pack(
+                     fill="x", pady=(T.PAD_S, 0))
+
+        self._evidence_shown = False
+        self._evidence_at = 0.0
+        self._evidence_reading = None
+
+    def _current_limit_bps(self):
+        """The ceiling the roll ON SCREEN is judged against right now.
+
+        From the focused section, not from _last_decision: with several
+        sections that one belongs to whichever card the header is showing,
+        and judging one roll's recorded day against another roll's limit is
+        how you get told a limit was never met when it was.
+        """
+        view = self._focused()
+        for decision in (getattr(view, "decision", None), self._last_decision):
+            got = getattr(decision, "limit_bps", None)
+            if got is not None:
+                return got
+        try:
+            typed = (self.limit_var.get() or "").strip()
+            return D(typed) if typed else None
+        except Exception:
+            return None
+
+    def _refresh_evidence(self, force: bool = False) -> None:
+        """Re-read the day file. Cheap, but not every 200ms."""
+        import time as _time
+
+        from . import dayfile
+
+        now = _time.monotonic()
+        if not force and now - self._evidence_at < 20.0:
+            return
+        self._evidence_at = now
+
+        view = self._focused()
+        near = getattr(getattr(view, "near", None), "token", None)
+        far = getattr(getattr(view, "far", None), "token", None)
+        limit = self._current_limit_bps()
+
+        try:
+            folder = os.path.join(self.engine.base_dir, "data")
+            readings = dayfile.read(dayfile.files_for(folder),
+                                    limit_bps=limit)
+        except Exception:
+            # A recording that cannot be read is not a reason to take the
+            # screen down.
+            readings = []
+
+        chosen = None
+        for reading in readings:
+            if near and far and reading.near_token == near \
+                    and reading.far_token == far:
+                chosen = reading
+                break
+        if chosen is None and readings and not (near and far):
+            chosen = readings[0]
+        self._evidence_reading = chosen
+
+    def _draw_evidence(self) -> None:
+        self._refresh_evidence()
+        reading = self._evidence_reading
+
+        if reading is None or not reading.samples:
+            if self._evidence_shown:
+                self.evidence_card.pack_forget()
+                self._evidence_shown = False
+            return
+        if not self._evidence_shown:
+            self.evidence_card.pack(fill="x", pady=self.gap,
+                                    before=self.actions_bar)
+            self._evidence_shown = True
+
+        self.evidence_coverage.configure(
+            text=f"{reading.watched_minutes:,.0f} min watched of "
+                 f"{reading.span_minutes:,.0f} ({reading.coverage:.0%})")
+        self.evidence_note.configure(text=reading.headline())
+
+        limit = reading.limit_bps
+        self.evidence.delete(*self.evidence.get_children())
+        for level in reading.levels:
+            if limit is not None and level.bps < limit and level.seconds <= 0:
+                continue          # tighter than yours and never happened
+            if limit is not None and level.bps == limit:
+                tag, note = "yours", "your limit"
+            elif level.seconds <= 0:
+                tag, note = "never", ""
+            else:
+                tag, note = "other", ""
+            self.evidence.insert(
+                "", "end",
+                values=(f"{level.bps.normalize():f} bps",
+                        "never" if level.seconds <= 0
+                        else f"{level.minutes:,.1f} min",
+                        "--" if level.seconds <= 0 else f"{level.share:.0%}",
+                        note),
+                tags=(tag,))
+        rows = len(self.evidence.get_children())
+        self.evidence.configure(height=max(3, min(rows, 10)))
+
+    def _draw_today_line(self) -> None:
+        """The same evidence, one line, above the fold."""
+        reading = self._evidence_reading
+        if reading is None or not reading.samples:
+            self.cost_today.configure(text="")
+            return
+
+        text = "today: " + reading.headline()
+        if reading.limit_bps is not None and not reading.ever_met:
+            workable = reading.cheapest_workable()
+            if workable is not None:
+                text += (f" · {workable.bps.normalize():f} bps would have "
+                         f"been available for {workable.minutes:,.1f} min")
+            else:
+                text += " · no offered level was available either"
+        self.cost_today.configure(text=text)
 
     # ---- one card per limit -----------------------------------------------
     def _rebuild_rung_rows(self) -> None:
@@ -1838,6 +2026,8 @@ class RollWindow(tk.Toplevel):
             note = snap.halted_reason or snap.note
 
         self._draw_ladder(decision)
+        self._draw_evidence()
+        self._draw_today_line()
 
         source = snap.quote_source or "connecting"
         self.source_pill.set(source,
