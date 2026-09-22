@@ -129,6 +129,20 @@ TOPICS: List[Topic] = [
         "Going back to dry run is instant and asks nothing.",
     ]),
 
+    ("Where the prices are coming from", [
+        "The line above the leg cards says which source is being used. "
+        "live feed is the websocket and is what you want. polled is the "
+        "broker's REST snapshot, which lags.",
+
+        "live feed, reconnecting means the socket dropped and the last "
+        "prices it sent are still on screen. They age, and once they pass "
+        "the freshness limit nothing can trade on them.",
+
+        "polled, not answering means the broker's price endpoint is failing. "
+        "The screen keeps the last live prices so you can still see the "
+        "market; the same freshness limit still applies.",
+    ]),
+
     ("If something goes wrong", [
         "HALTED stops everything, not one section: they sell the same month "
         "into the same uncertainty. It survives closing the app, and only "

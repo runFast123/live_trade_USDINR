@@ -136,6 +136,33 @@ class TestItStillDescribesTheRealSystem(unittest.TestCase):
         self.assertIn('self.disarm("condition met, firing")',
                       inspect.getsource(RollEngine._tick))
 
+    def test_the_quote_source_names_are_the_ones_the_engine_sets(self):
+        """The guide explains two states the screen shows. If _read_quotes
+        stops setting them, or renames them, the guide is describing a screen
+        nobody sees."""
+        import inspect
+
+        from rollover.engine import RollEngine
+
+        source = inspect.getsource(RollEngine._read_quotes)
+        for name in ("live feed, reconnecting", "polled, not answering",
+                     "live feed"):
+            self.assertIn(f'_set_source("{name}")', source, name)
+            self.assertIn(name, self.text())
+
+    def test_a_held_price_still_cannot_be_traded(self):
+        """The guide promises the freshness limit still applies to prices
+        held through an outage. That promise rests on the held quote being
+        dated from the tick's arrival, not from the read."""
+        import inspect
+
+        from rollover.engine import RollEngine
+
+        self.assertIn("once they pass the freshness limit nothing can trade",
+                      self.text())
+        self.assertIn("at=min(arrived)",
+                      inspect.getsource(RollEngine._held_quotes))
+
     def test_a_halt_is_still_account_wide(self):
         import inspect
 

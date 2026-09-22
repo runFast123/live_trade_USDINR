@@ -4,6 +4,8 @@
     roll_app.exe --find USDINR   list the contracts and their tokens
     roll_app.exe --check         validate config.json and exit
     roll_app.exe --selftest      run the rule on worked examples, no network
+    roll_app.exe --preflight     check the whole live order path against the
+                                 broker, read-only, and print what would be sent
     roll_app.exe --probe         place one resting order that cannot fill,
                                  read it back and cancel it (asks first)
 """
@@ -389,6 +391,9 @@ def main(argv=None) -> int:
                         help="validate the configuration and exit")
     parser.add_argument("--selftest", action="store_true",
                         help="run the rule on worked examples with no network")
+    parser.add_argument("--preflight", action="store_true",
+                        help="check everything a live order depends on, "
+                             "read-only. Sends nothing.")
     parser.add_argument("--probe", action="store_true",
                         help="place ONE resting order that cannot fill, read it "
                              "back, and cancel it. Asks before sending.")
@@ -400,12 +405,20 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     # Anything other than opening the windows needs somewhere to talk.
-    on_command_line = bool(args.probe or args.find or args.check or args.selftest)
+    on_command_line = bool(args.probe or args.preflight or args.find
+                           or args.check or args.selftest)
     own_console = _attach_console() if on_command_line else False
 
     base, config_path, log_dir = _paths()
     if args.config:
-        config_path = args.config
+        # The config file's folder IS the app folder: the session, the logs,
+        # the state file and the day's recordings all live beside it. Pointing
+        # --config somewhere else and still reading the session from next to
+        # the executable finds the wrong account, or none at all, and says so
+        # in a way that sends you looking in the wrong place.
+        config_path = os.path.abspath(args.config)
+        base = os.path.dirname(config_path)
+        log_dir = os.path.join(base, "logs")
 
     try:
         cfg = RollConfig.load(config_path)
@@ -444,6 +457,9 @@ def main(argv=None) -> int:
 
     log = Logbook(log_dir)
     try:
+        if args.preflight:
+            from rollover import preflight
+            return finish(preflight.run(cfg, log, base))
         if args.probe:
             from rollover import probe
             return finish(probe.run(cfg, log, base, token=args.probe_token,

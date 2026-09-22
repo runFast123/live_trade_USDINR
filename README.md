@@ -335,8 +335,13 @@ roll_app.exe                 the windows
 roll_cli.exe --find USDINR   list contracts and tokens
 roll_cli.exe --check         validate config.json and exit
 roll_cli.exe --selftest      run the rule on worked examples, no network
+roll_cli.exe --preflight     check the whole live order path, read-only
 roll_cli.exe --probe         place ONE resting order, read it back, cancel it
 ```
+
+`--config` also decides where everything else lives. The session, the logs, the
+state file and the day's recordings all sit beside the config file you point
+at, not beside the executable.
 
 **Two executables, one program.** `roll_app.exe` is built windowed so that
 double-clicking it opens the app and not a black console behind it. The price
@@ -347,6 +352,19 @@ answer -- run `roll_app.exe --check` from PowerShell and you get silence.
 `roll_cli.exe` is the same program built as a console application. Use it for
 everything on this list except the first line. It matters most for `--probe`,
 which has to be able to ask you a question and hear the answer.
+
+### `--preflight` sends nothing
+
+Run it before any live step. It reads the broker as it stands right now and
+prints, field by field, the order the app *would* send: the quantity as a
+number of lots, the limit price as the integer the API wants, and whether that
+price sits on the tick grid and inside today's circuit band. It also reads the
+position, both books, the margin one clip needs against the funds available,
+and every gate.
+
+It places nothing, cancels nothing, and a clean run is not permission to trade
+-- `--probe` is still the first thing that puts an order in front of the
+exchange.
 
 ### `--probe` places a real order
 

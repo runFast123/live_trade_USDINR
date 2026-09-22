@@ -41,6 +41,12 @@ MSG_LOGON = "102"
 MSG_TOUCHLINE = "209"
 MSG_BEST_FIVE = "128"
 
+#: Seconds between keepalive pings, and the wait before a reconnect. Both
+#: match the vendor's own numbers; what differs is that no answer to a ping
+#: is demanded. See LiveFeed._keep_alive.
+PING_INTERVAL = 30
+RECONNECT_WAIT = 3
+
 
 class Tick:
     """One instrument's latest state, as the feed last sent it."""
@@ -130,6 +136,67 @@ class LiveFeed:
         return time.monotonic() - self._last_any if self._last_any else float("inf")
 
     # ------------------------------------------------------------- connection
+    def _keep_alive(self, socket) -> bool:
+        """Stop the library killing a connection that is working perfectly.
+
+        The vendor's client runs ``run_forever(ping_interval=30,
+        ping_timeout=10)``. The broadcast server never answers a WebSocket
+        PING -- measured twice on the live socket, both times ending in
+        ``WEBSOCKET ERROR => ping/pong timed out`` -- so websocket-client
+        closes a connection that was delivering ticks a moment earlier,
+        reconnects three seconds later, and does it again. Drops came 91
+        seconds apart, all session.
+
+        Each drop put the app on the REST touchline, and that is where the
+        damage was: the touchline answers with an HTTP 500, a Redis timeout,
+        or ``MultipleTouchline: None`` often enough that the screen went
+        blank several times an hour.
+
+        So the loop is run here instead, with the pong deadline removed. The
+        pings still go out, which is what holds the connection open through a
+        firewall; only the demand for an answer is dropped. A socket that has
+        genuinely died is still caught -- by ``feed_max_silence`` above, and
+        by the read failing.
+
+        Returns False if the vendor client is not the shape expected, in
+        which case its own loop runs unchanged.
+        """
+        import types
+
+        try:
+            import websocket
+        except ImportError:                                  # pragma: no cover
+            return False
+
+        needed = ("host", "port", "_is_running", "_on_open", "_on_message",
+                  "_on_error", "_on_close")
+        if any(not hasattr(socket, name) for name in needed):
+            self.log.warn("The price feed client is not the shape this app "
+                          "knows; leaving its keepalive alone.")
+            return False
+
+        log = self.log
+
+        def run(self) -> None:
+            websocket.enableTrace(False)
+            url = self.host
+            if self.port and not url.startswith("ws"):
+                url = f"wss://{self.host}:{self.port}"
+            while self._is_running:
+                try:
+                    self.ws = websocket.WebSocketApp(
+                        url, on_open=self._on_open, on_message=self._on_message,
+                        on_error=self._on_error, on_close=self._on_close)
+                    self.ws.run_forever(ping_interval=PING_INTERVAL,
+                                        ping_timeout=None)
+                except Exception as exc:                     # pragma: no cover
+                    log.warn(f"Live feed connection error: {exc}")
+                if self._is_running:
+                    time.sleep(RECONNECT_WAIT)
+
+        socket._ws_run = types.MethodType(run, socket)
+        return True
+
     def start(self, client, tokens: List[str]) -> None:
         from choice_api import PriceFeedSocketClient
 
@@ -142,6 +209,7 @@ class LiveFeed:
         self._socket = PriceFeedSocketClient(vendor_id=self.cfg.vendor_id,
                                              access_token=token)
         self._socket.on_message(self._on_message)
+        self._keep_alive(self._socket)
         self._socket.start_websocket()
         self._started = True
         self.log.info("Live price feed starting.")

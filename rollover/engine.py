@@ -158,6 +158,9 @@ class RollEngine:
         self._note = "not started"
         self._last_slow_refresh = 0.0
         self._last_complaint = ("", 0.0)
+        #: True when the last read fell back to held ticks instead of a clean
+        #: source. Keeps the complaint throttle from being reset every tick.
+        self._quotes_degraded = False
         self.near_positions: dict = {}
         self.pools: dict = {}
         # Which section would roll next, for the window. Never a decision.
@@ -681,18 +684,84 @@ class RollEngine:
         """Take the websocket when it is live, and poll only when it is not.
 
         The REST touchline is a cached snapshot and has been seen many minutes
-        behind, so it is the fallback rather than the source.
+        behind, so it is the fallback rather than the source. It also fails
+        outright -- HTTP 500, a Redis timeout, or MultipleTouchline: None --
+        often enough that it cannot be allowed the last word.
         """
+        self._quotes_degraded = False
         if self.cfg.use_live_feed and self.feed.healthy(
                 tokens, self.cfg.feed_max_silence):
             quotes = self.reader.from_feed(self.feed.ticks(), tokens)
             self._set_source("live feed")
             return quotes
 
-        quotes = self.reader.fetch(tokens)
+        # The socket drops and comes back every ninety seconds or so, and
+        # each blip lasts a few seconds. Ticks that arrived just before the
+        # drop are better evidence than a cached REST snapshot -- and much
+        # better than a REST call that fails, which is what used to take
+        # every price off the screen.
+        #
+        # They are dated from when they ARRIVED, not from now, so the
+        # freshness gate refuses them the moment they pass
+        # max_quote_age_sec. That is where the safety is: the screen keeps
+        # its numbers, and nothing can trade on them once they are old.
+        held = self._held_quotes(tokens)
+        if held is not None and self._all_fresh(held, tokens):
+            self._set_source("live feed, reconnecting")
+            return held
+
+        try:
+            quotes = self.reader.fetch(tokens)
+        except Exception as exc:
+            self._set_source("polled, not answering")
+            if held is not None:
+                self._quotes_degraded = True
+                self._complain(
+                    "warn",
+                    f"The polled touchline is not answering ({exc}). Showing "
+                    "the last prices the live feed sent; nothing will trade "
+                    "on them once they age past "
+                    f"{self.cfg.max_quote_age_sec:.0f}s.")
+                return held
+            # A broker-side HTTP failure is a quote problem, not a fault in
+            # this app, and the watch loop should say so.
+            if isinstance(exc, QuoteError):
+                raise
+            raise QuoteError(str(exc)) from exc
         self._set_source("polled" if not self.feed.connected
                          else "polled, feed stale")
         return quotes
+
+    def _held_quotes(self, tokens: List[str]):
+        """The live feed's last ticks, dated from when they arrived.
+
+        Returns None when the feed is off, has nothing yet, or none of the
+        tokens can be read.
+        """
+        if not self.cfg.use_live_feed:
+            return None
+        ticks = self.feed.ticks()
+        arrived = [ticks[t].at for t in tokens if ticks.get(t) is not None]
+        if not arrived:
+            return None
+        try:
+            # Dated at the OLDEST of them, so the age shown is the worst of
+            # what is on screen rather than the best.
+            return self.reader.from_feed(ticks, tokens, at=min(arrived))
+        except QuoteError:
+            return None
+
+    def _all_fresh(self, quotes, tokens) -> bool:
+        """Every leg asked for is present, and none of them is old.
+
+        Coverage matters as much as age: a leg the feed has never sent is a
+        leg the polled touchline might still have, so a partial answer must
+        not be allowed to skip the poll.
+        """
+        if not quotes or any(t not in quotes for t in tokens):
+            return False
+        return all(q.age() <= self.cfg.max_quote_age_sec
+                   for q in quotes.values())
 
     # ---- the ladder -------------------------------------------------------
     def campaign_key(self) -> str:
@@ -1092,7 +1161,12 @@ class RollEngine:
             self._last_slow_refresh = now
 
         quotes = self._read_quotes(tokens)
-        self._last_complaint = ("", 0.0)
+        # Cleared only on a clean read. A read that FELL BACK returns
+        # normally too, and clearing the throttle there would put its warning
+        # in the log once a second for as long as the broker's touchline
+        # stayed down.
+        if not self._quotes_degraded:
+            self._last_complaint = ("", 0.0)
         self._share_out()
         # Published to the account BEFORE the sections are gated, so the gate
         # below sees this tick's figure rather than the previous one.

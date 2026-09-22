@@ -362,11 +362,19 @@ class Broker:
             self.build_client()
 
         mine = self.account_fingerprint()
+        exists = os.path.exists(session_path)
         try:
             with open(session_path, encoding="utf-8") as handle:
                 saved = json.load(handle).get("account")
         except (OSError, ValueError):
             saved = None
+
+        if not exists:
+            # Said plainly, because "does not belong to the account configured
+            # now" about a file that is not there sends you looking for a
+            # session mix-up that never happened.
+            self.log.info("No session saved here yet; logging in.")
+            return False
 
         if saved != mine:
             # Unstamped sessions are from a build before this existed. Refuse

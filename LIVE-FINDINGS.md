@@ -529,3 +529,109 @@ units conversion working.
 The two month roll is further out than the recorded day suggested. The **one
 month roll is close** -- 2.9 bps -- and the recorded day agrees: Sep into Oct
 sat at a median of 31.3 bps and spent 7.4% of that day at or below 30.
+
+---
+
+## 22 September 2026: why the screen kept saying it had no quotes
+
+Reported as "the No live quotes error". Two faults, both measured against the
+live socket rather than reasoned about, and one of them was not ours.
+
+### The websocket kills itself every ninety seconds
+
+`choice_api.PriceFeedSocketClient._ws_run` calls
+
+```python
+self.ws.run_forever(ping_interval=30, ping_timeout=10)
+```
+
+The Choice broadcast server **never answers a WebSocket PING**. So
+`websocket-client` decides the connection is dead and closes it — while it is
+delivering ticks. Measured twice on the live socket, 11:02 and 10:54 IST:
+
+```
+WEBSOCKET ERROR => ping/pong timed out
+WEBSOCKET CLOSED => Code=None | Msg=None
+Reconnecting websocket in 3 seconds...
+```
+
+Closes came **91 seconds apart**, and the app's own log shows the same cadence
+all morning (reconnects at 09:25:41, 09:27:14; 10:09:57, 10:11:31 — 93 and 94
+seconds). Driving the same vendor callbacks with `ping_timeout=None` ran
+without a single close in the same window; the pings still go out, only the
+demand for an answer is dropped.
+
+Fixed in `LiveFeed._keep_alive`, which runs the loop itself. It checks the
+vendor client's shape first and leaves it alone if a future version does not
+match, so an upgrade cannot break the feed.
+
+### One failed REST poll took every price off the screen
+
+Each drop put the app on the REST touchline for a few seconds, and that
+endpoint fails often — three distinct ways, all seen today:
+
+| What came back | Seen |
+|---|---|
+| `HTTP 500 Internal Server Error` | 10:49:46, 10:55:31 |
+| `Timeout performing HGET MarketData ... StackExchange.Redis` | 10:11:46 |
+| `{"Status":"Success","Response":{"MultipleTouchline":None}}` | repeatedly on 21 Sep |
+
+`_read_quotes` let that raise, the whole tick was abandoned, and both leg
+cards went to "no quote" with the roll cost blank. Roughly once every two to
+five minutes.
+
+Now: a tick that arrived moments ago is preferred over a poll, and if the poll
+does fail the last feed prices stay on screen. **That cannot cause a trade on a
+stale price** — a held quote is dated from when the tick *arrived*, not from
+when it was read, so the freshness gate refuses it the moment it passes
+`max_quote_age_sec`. Asserted in
+[tests/test_feed_survives_and_quotes_persist.py](tests/test_feed_survives_and_quotes_persist.py).
+
+Also fixed: `_set_source` was never reached when the poll raised, so the screen
+kept claiming "live feed" while it was in fact polling and failing.
+
+---
+
+## 22 September 2026: the account now reads empty
+
+`roll_app --preflight` (new, read-only) against the live broker at 11:28 IST.
+
+**The order path itself is sound.** On the live book, both legs passed every
+check the exchange enforces:
+
+```
+near leg (SELL USDINR26OCTFUT) 1,000 units = 1 lot of 1,000
+  price 96.0825 sent as 960825000 (divisor 10000000, tick 0.0025)
+  inside the circuit band 93.2425..99.0075
+far leg  (BUY USDINR26NOVFUT) 1,000 units = 1 lot of 1,000
+  price 96.4175 sent as 964175000, inside 93.5275..99.3125
+order_type=RL_LIMIT product_type=D validity=1
+```
+
+Order book and trade book both readable and both empty. `get_margin` answers,
+so segment 13 is still entitled: one lot of the roll needs **Rs 4,594**.
+
+**But the account has nothing in it.** Not a read failure — every call returns
+`"Status": "Success"` with a fully-formed body:
+
+```json
+"FundsView": {"CashAvailable": 0.0, "MarginAvailable": 0.0, "MarginUsed": 0.0,
+              "Collateral": 0.0, "Deposit": 0.0, ...}
+"NetPositions": []
+```
+
+Yesterday the same app read Rs 61.5 lakh cash, Rs 1.62 crore margin available,
+and **long 4 lots of October**. Today: zero, and no positions at all.
+
+The `vendor_id` and mobile number in `config.json` are unchanged; the
+**`api_key` is different** from the one in `config.json.bak`. So either the new
+key is registered against a different trading account, or the funds and the
+October position left this one overnight. That is a question for Choice, not
+one this app can answer.
+
+**Phase 3 cannot start in this state**: 3.1's probe needs margin, and 3.2 and
+3.3 need a near-month position to roll.
+
+Unchanged and still outstanding: `max_leg_spread` is 0.05 while November's
+spread read **0.1050** today, which remains the one gate blocking an
+otherwise-ready roll.
