@@ -1,3 +1,3 @@
 """USDINR rollover watcher."""
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"

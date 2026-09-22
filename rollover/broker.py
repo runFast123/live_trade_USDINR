@@ -424,26 +424,46 @@ class Broker:
         client = self.client
         if client is None or not getattr(client, "session_id", None):
             return False, "no session"
-        try:
-            resp = client.funds.get_funds_view()
-        except Exception as exc:
-            text = str(exc)
-            lowered = text.lower()
-            if "401" in text or "unauthor" in lowered or "vendorid" in lowered:
-                self._session_ok = False
-                return False, text.splitlines()[-1][:120]
-            self._session_ok = None
-            return None, text.splitlines()[-1][:120]
-        if call_failed(resp):
-            why = str(call_failed(resp))
-            if "unauthor" in why.lower() or "session" in why.lower():
-                self._session_ok = False
-                return False, why[:120]
-            # A refusal that is about the data, not about who is asking.
+
+        # More than one endpoint, because one of them being unhappy is not
+        # the same as the session being dead, and declaring a live session
+        # dead is how an operator gets locked out of a working account.
+        # Any one of these succeeding means the broker knows who we are.
+        attempts = (
+            ("funds", lambda: client.funds.get_funds_view()),
+            ("positions", lambda: client.portfolio.get_net_position()),
+            ("order book", lambda: client.orders.get_order_book()),
+        )
+
+        refusals, unreachable = [], []
+        for name, call in attempts:
+            try:
+                resp = call()
+            except Exception as exc:
+                text = str(exc).splitlines()[-1][:120]
+                lowered = text.lower()
+                if ("401" in text or "unauthor" in lowered
+                        or "vendorid" in lowered or "not authenticated" in lowered):
+                    refusals.append(f"{name}: {text}")
+                else:
+                    unreachable.append(f"{name}: {text}")
+                continue
+            why = call_failed(resp)
+            if why and ("unauthor" in str(why).lower()
+                        or "session" in str(why).lower()):
+                refusals.append(f"{name}: {str(why)[:120]}")
+                continue
+            # Either a clean answer, or a refusal about the data rather than
+            # about who is asking. Both mean the session is honoured.
             self._session_ok = True
-            return True, why[:120]
-        self._session_ok = True
-        return True, "accepted"
+            return True, f"accepted by {name}"
+
+        if unreachable and not refusals:
+            self._session_ok = None
+            return None, "; ".join(unreachable)[:200]
+
+        self._session_ok = False
+        return False, "; ".join(refusals)[:200]
 
     def request_otp(self) -> Optional[str]:
         """Start the login and return the OTP if the broker supplies it.
@@ -509,15 +529,23 @@ class Broker:
             raise BrokerError("the login succeeded but no SessionId came back")
 
     def _after_login(self, session_path: str) -> None:
-        # A fresh login that the broker will not honour is worth knowing
-        # about now, while somebody is standing at the screen, rather than
-        # at the first order.
+        # Checked, and SAID, but never refused.
+        #
+        # Refusing a resumed session is fair: the remedy is to log in again,
+        # and the operator can do that. Refusing a FRESH login leaves no
+        # remedy at all -- it locks them out of their own screen over a check
+        # that is not itself the safety. The safety is the session gate, and
+        # it reads logged_in, which verify_session has just set. So let them
+        # in to a screen that says plainly it cannot trade, rather than a
+        # dialog they cannot get past.
         ok, why = self.verify_session()
         if ok is False:
-            raise BrokerError(
-                f"the login returned a session the broker will not accept: "
-                f"{why}. Check vendor_id and api_key in config.json.")
-        if ok is None:
+            self.log.alert(
+                "Logged in, but the broker will not accept the session for "
+                f"data: {why}. Nothing can trade until this is resolved. "
+                "Check vendor_id and api_key with Choice; the screen will "
+                "show 'not logged in' on the session gate until it clears.")
+        elif ok is None:
             self.log.warn(f"The new session could not be checked ({why}); "
                           "carrying on.")
         self.client.save_session(session_path)

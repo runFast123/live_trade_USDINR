@@ -227,41 +227,111 @@ class TestTheBrokerHasToHonourIt(SessionCase):
         broker.client.session_id = None
         self.assertFalse(broker.logged_in)
 
-    def test_an_unauthorised_reply_is_a_rejection(self):
+    def answering(self, broker, funds=None, positions=None, orders=None):
+        """Point every endpoint verify_session tries at a given behaviour."""
+        def endpoint(behaviour, method):
+            class Stub:
+                pass
+            stub = Stub()
+            setattr(stub, method,
+                    behaviour if behaviour is not None
+                    else (lambda *a, **kw: (_ for _ in ()).throw(
+                        OSError("connection reset by peer"))))
+            return stub
+        broker.client.funds = endpoint(funds, "get_funds_view")
+        broker.client.portfolio = endpoint(positions, "get_net_position")
+        broker.client.orders = endpoint(orders, "get_order_book")
+
+    def refuse(self):
+        def call(*a, **kw):
+            raise Exception("HTTP Request failed: 401 Client Error. "
+                            "Response: Unauthorized, VendorId doesn't exists")
+        return call
+
+    def unreachable(self):
+        def call(*a, **kw):
+            raise OSError("connection reset by peer")
+        return call
+
+    def test_an_unauthorised_reply_from_every_endpoint_is_a_rejection(self):
         broker, _ = self.raw_broker()
         broker.client.session_id = "SID"
-
-        class Funds:
-            def get_funds_view(self):
-                raise Exception(
-                    "HTTP Request failed: 401 Client Error. Response: "
-                    "Unauthorized, VendorId doesn't exists")
-        broker.client.funds = Funds()
+        r = self.refuse()
+        self.answering(broker, funds=r, positions=r, orders=r)
         ok, why = broker.verify_session()
         self.assertFalse(ok)
         self.assertIn("Unauthorized", why)
 
-    def test_a_connection_failure_is_not(self):
+    def test_one_endpoint_refusing_is_not_a_dead_session(self):
+        """Declaring a live session dead locks the operator out of a working
+        account, so any endpoint honouring it is enough."""
         broker, _ = self.raw_broker()
         broker.client.session_id = "SID"
+        self.answering(broker, funds=self.refuse(),
+                       positions=lambda *a, **kw: {"Status": "Success"},
+                       orders=self.refuse())
+        ok, why = broker.verify_session()
+        self.assertTrue(ok)
+        self.assertIn("positions", why)
 
-        class Funds:
-            def get_funds_view(self):
-                raise OSError("connection reset by peer")
-        broker.client.funds = Funds()
+    def test_a_connection_failure_is_not_a_rejection(self):
+        broker, _ = self.raw_broker()
+        broker.client.session_id = "SID"
+        u = self.unreachable()
+        self.answering(broker, funds=u, positions=u, orders=u)
         ok, _ = broker.verify_session()
         self.assertIsNone(ok)
 
     def test_a_good_reply_is_acceptance(self):
         broker, _ = self.raw_broker()
         broker.client.session_id = "SID"
-
-        class Funds:
-            def get_funds_view(self):
-                return {"Status": "Success", "Response": {"FundsView": {}}}
-        broker.client.funds = Funds()
+        self.answering(
+            broker,
+            funds=lambda *a, **kw: {"Status": "Success",
+                                    "Response": {"FundsView": {}}},
+            positions=self.refuse(), orders=self.refuse())
         ok, _ = broker.verify_session()
         self.assertTrue(ok)
+
+
+class TestAFreshLoginIsNeverBlocked(SessionCase):
+    """A check whose failure has no remedy must not block.
+
+    Refusing a RESUMED session is fair -- the remedy is to log in again, and
+    the operator can do that. Refusing a FRESH login leaves no remedy at all:
+    it locks them out of their own screen over a check that is not itself the
+    safety. The safety is the session gate, which reads logged_in. So they
+    are let in to a screen that says plainly it cannot trade, rather than a
+    dialog they cannot get past. Reported as exactly that: a login dialog
+    refusing to proceed.
+    """
+
+    def after_login(self, verdict):
+        broker, log = self.broker(verified=None)
+        broker.verify_session = lambda: verdict
+        saved = {}
+        broker.client.save_session = lambda p: saved.setdefault("path", p)
+        broker._after_login(self.path)
+        return broker, log, saved
+
+    def test_a_refused_session_does_not_raise(self):
+        _, log, saved = self.after_login((False, "status=401"))
+        self.assertIn("path", saved)          # the session was still saved
+        self.assertIn("will not accept the session", log.text())
+
+    def test_and_it_says_nothing_can_trade(self):
+        _, log, _ = self.after_login((False, "status=401"))
+        self.assertIn("Nothing can trade", log.text())
+
+    def test_an_unchecked_session_is_only_a_warning(self):
+        _, log, saved = self.after_login((None, "connection reset"))
+        self.assertIn("path", saved)
+        self.assertIn("could not be checked", log.text())
+
+    def test_a_good_session_says_nothing_alarming(self):
+        _, log, saved = self.after_login((True, "accepted"))
+        self.assertIn("path", saved)
+        self.assertNotIn("will not accept", log.text())
 
 
 class TestStampingIt(SessionCase):

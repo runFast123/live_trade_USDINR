@@ -557,6 +557,17 @@ class RollEngine:
 
     def _slow_refresh(self) -> None:
         """Position, market status, and the day's scrip master."""
+        # A session the broker has refused can start working again -- an
+        # entitlement being switched on, a vendor record being fixed. Asked
+        # on the slow beat so the screen recovers by itself instead of
+        # needing a restart to notice.
+        if getattr(self.broker, "_session_ok", None) is False:
+            try:
+                ok, why = self.broker.verify_session()
+                if ok:
+                    self.log.info("The broker is accepting the session again.")
+            except Exception:
+                pass
         try:
             if self.broker.refresh_scrip_master_if_stale():
                 # New day, new file: the contracts must be read again, since
