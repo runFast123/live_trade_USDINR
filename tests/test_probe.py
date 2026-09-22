@@ -106,15 +106,17 @@ class TestItAsksFirst(unittest.TestCase):
 
         return FakeBroker
 
-    def run_probe(self, answer):
+    def run_probe(self, answer, qty=None, capture=False):
         original = probe.Broker
         probe.Broker = self.fake_broker()
+        said = io.StringIO()
         try:
             # The probe talks to the operator on stdout; keep it out of the
-            # test report.
-            with contextlib.redirect_stdout(io.StringIO()):
-                return probe.run(self.cfg, StubLog(), self.dir,
+            # test report unless a test wants to read what it said.
+            with contextlib.redirect_stdout(said):
+                code = probe.run(self.cfg, StubLog(), self.dir, qty=qty,
                                  confirm=lambda _prompt: answer)
+            return said.getvalue() if capture else code
         finally:
             probe.Broker = original
 
@@ -130,13 +132,27 @@ class TestItAsksFirst(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(code, 0)
 
-    def test_what_it_sends_is_a_buy_of_the_asked_quantity(self):
+    def test_what_it_sends_is_a_buy_of_one_whole_lot(self):
+        """Not qty 1. The broker rejects a quantity that is not a whole
+        multiple of the lot, so an order of 1 never rests -- and the
+        read-back and cancel this exists to test never happen."""
         self.run_probe(CONFIRM)
         order = self.sent[0]
         self.assertEqual(order["bs"], 1)              # BUY
-        self.assertEqual(order["qty"], 1)
+        self.assertEqual(order["qty"], 1000)          # one lot of USDINR
         self.assertEqual(order["price"], 930800000)
         self.assertEqual(order["trigger_price"], 0)
+
+    def test_an_explicit_quantity_is_still_honoured(self):
+        self.run_probe(CONFIRM, qty=2000)
+        self.assertEqual(self.sent[0]["qty"], 2000)
+
+    def test_a_part_lot_quantity_is_warned_about_not_refused(self):
+        """Choice suggest it themselves as a negative test: it proves the
+        lot-multiple rule. It just cannot rest, so say so."""
+        out = self.run_probe(CONFIRM, qty=1, capture=True)
+        self.assertIn("not a whole multiple", out)
+        self.assertEqual(self.sent[0]["qty"], 1)
 
     def test_it_writes_down_everything_it_saw(self):
         self.run_probe(CONFIRM)

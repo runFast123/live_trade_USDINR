@@ -92,9 +92,18 @@ def describe(info, price: Decimal, qty: int, bid: Optional[Decimal],
     return "\n".join(lines)
 
 
-def run(cfg, log, base_dir: str, token: Optional[str] = None, qty: int = 1,
-        confirm=input) -> int:
-    """Place, read back, and cancel one resting order. Returns an exit code."""
+def run(cfg, log, base_dir: str, token: Optional[str] = None,
+        qty: Optional[int] = None, confirm=input) -> int:
+    """Place, read back, and cancel one resting order. Returns an exit code.
+
+    `qty` defaults to ONE LOT of the contract chosen, which is 1000 units of
+    USDINR. It used to default to 1, from when nobody knew whether a
+    quantity meant contracts or units and 1 was the cautious guess. The
+    broker has since confirmed in writing that a quantity is in units and
+    must be an exact multiple of the lot -- so 1 is rejected outright, the
+    order never rests, and the read-back and cancel this exists to test
+    never happen.
+    """
     broker = Broker(cfg, log)
     broker.build_client()
 
@@ -110,6 +119,22 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None, qty: int = 1,
         print("No contract. Set near_token in config.json, or pass --probe-token.")
         return 2
     info = broker.instrument(token)
+
+    lot = int(getattr(info, "lot_size", 0) or 0)
+    if qty is None:
+        qty = lot or 1
+        print(f"  Quantity not given, so one lot of {info.sec_desc}: {qty:,} "
+              "units.")
+    elif lot > 1 and qty % lot:
+        # Choice's own words: "any order where Qty is not divisible by 1000
+        # will be rejected with an Invalid Order Quantity error". Worth
+        # saying rather than letting the rejection explain it, but not worth
+        # refusing -- it is a legitimate negative test.
+        print(f"  NOTE: {qty:,} is not a whole multiple of the {lot:,} lot, "
+              "so the broker will reject it as an invalid quantity. That is "
+              "a useful thing to confirm, but it will not rest in the book, "
+              "so the read-back and cancel below will have nothing to work "
+              "on.")
 
     # Where is the market? Needed only to prove the price is far from it.
     bid = None

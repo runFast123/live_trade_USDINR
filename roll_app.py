@@ -394,8 +394,9 @@ def main(argv=None) -> int:
                              "back, and cancel it. Asks before sending.")
     parser.add_argument("--probe-token", metavar="TOKEN",
                         help="contract for --probe (default: near_token)")
-    parser.add_argument("--probe-qty", type=int, default=1, metavar="N",
-                        help="quantity for --probe (default 1)")
+    parser.add_argument("--probe-qty", type=int, default=None, metavar="N",
+                        help="quantity for --probe, in units of the "
+                             "underlying (default: one lot, 1000)")
     args = parser.parse_args(argv)
 
     # Anything other than opening the windows needs somewhere to talk.
