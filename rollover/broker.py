@@ -302,6 +302,9 @@ class Broker:
     def __init__(self, cfg, log):
         self.cfg = cfg
         self.log = log
+        # None until asked, True once the broker has honoured the session,
+        # False once it has refused it.
+        self._session_ok: Optional[bool] = None
         self.client = None
         # Which day's scrip master is in memory. The file changes every trading
         # day: contracts expire out of it, new ones appear, and every circuit
@@ -379,10 +382,68 @@ class Broker:
                 pass
             return False
 
-        if self.client.load_session(session_path):
-            self.log.info("Reused today's saved session.")
-            return True
-        return False
+        if not self.client.load_session(session_path):
+            return False
+
+        # A session id is a string. Whether the broker still honours it is a
+        # different question, and only the broker can answer it.
+        ok, why = self.verify_session()
+        if ok is False:
+            self.log.warn(f"The saved session is not accepted by the broker "
+                          f"({why}). Logging in again.")
+            try:
+                os.remove(session_path)
+            except OSError:
+                pass
+            # Drop the dead session off the client too. load_session put it
+            # there, and leaving it means logged_in keeps saying yes about a
+            # session we have just been told is worthless.
+            self.client.session_id = None
+            self.client.access_token = None
+            self._session_ok = False
+            return False
+
+        self.log.info("Reused today's saved session."
+                      if ok else "Reused today's saved session (the broker "
+                                 f"could not be reached to check it: {why}).")
+        return True
+
+    def verify_session(self) -> Tuple[Optional[bool], str]:
+        """Ask the broker whether it still honours this session.
+
+        True, False, or None when the question could not be put -- a network
+        blip is not a rejection, and forcing a fresh login every time the
+        line wobbles would be its own kind of wrong.
+
+        This exists because `logged_in` used to be `bool(session_id)`: a
+        string being present. A session that every endpoint refused with
+        "Unauthorized, VendorId doesn't exists" still reported itself logged
+        in, so the session gate -- one of the checks standing between the app
+        and a live order -- passed while nothing worked at all.
+        """
+        client = self.client
+        if client is None or not getattr(client, "session_id", None):
+            return False, "no session"
+        try:
+            resp = client.funds.get_funds_view()
+        except Exception as exc:
+            text = str(exc)
+            lowered = text.lower()
+            if "401" in text or "unauthor" in lowered or "vendorid" in lowered:
+                self._session_ok = False
+                return False, text.splitlines()[-1][:120]
+            self._session_ok = None
+            return None, text.splitlines()[-1][:120]
+        if call_failed(resp):
+            why = str(call_failed(resp))
+            if "unauthor" in why.lower() or "session" in why.lower():
+                self._session_ok = False
+                return False, why[:120]
+            # A refusal that is about the data, not about who is asking.
+            self._session_ok = True
+            return True, why[:120]
+        self._session_ok = True
+        return True, "accepted"
 
     def request_otp(self) -> Optional[str]:
         """Start the login and return the OTP if the broker supplies it.
@@ -448,6 +509,17 @@ class Broker:
             raise BrokerError("the login succeeded but no SessionId came back")
 
     def _after_login(self, session_path: str) -> None:
+        # A fresh login that the broker will not honour is worth knowing
+        # about now, while somebody is standing at the screen, rather than
+        # at the first order.
+        ok, why = self.verify_session()
+        if ok is False:
+            raise BrokerError(
+                f"the login returned a session the broker will not accept: "
+                f"{why}. Check vendor_id and api_key in config.json.")
+        if ok is None:
+            self.log.warn(f"The new session could not be checked ({why}); "
+                          "carrying on.")
         self.client.save_session(session_path)
         self._stamp_session(session_path)
         self.log.info("Login complete.")
@@ -540,7 +612,16 @@ class Broker:
 
     @property
     def logged_in(self) -> bool:
-        return bool(self.client and self.client.session_id)
+        """A session the broker has not refused.
+
+        Not merely "a session id exists". False only when the broker has
+        actually rejected it: an unverified or unreachable session still
+        counts, because the gates that follow will fail on their own if
+        nothing can be read.
+        """
+        if not (self.client and self.client.session_id):
+            return False
+        return self._session_ok is not False
 
     # ------------------------------------------------------------ instruments
     def _scaled(self, row: Dict[str, Any], column: str,

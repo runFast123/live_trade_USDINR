@@ -48,11 +48,21 @@ class SessionCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "session.json")
 
-    def broker(self, **kw):
+    def broker(self, verified=True, **kw):
         log = Log()
         broker = Broker(config(**kw), log)
         broker.build_client()
+        # Whether the broker HONOURS the session is a separate question with
+        # its own tests below; these are about which account it belongs to,
+        # and they must not reach the network to find out.
+        if verified is not None:
+            broker.verify_session = lambda: ((True, "stubbed") if verified
+                                             else (False, "rejected"))
         return broker, log
+
+    def raw_broker(self, **kw):
+        """Unstubbed, for the tests that exercise verify_session itself."""
+        return self.broker(verified=None, **kw)
 
     def save_for(self, broker, stamped=True, day=None):
         payload = {"date": (day or datetime.date.today()).isoformat(),
@@ -148,6 +158,110 @@ class TestResumingIt(SessionCase):
             fh.write("{ this is not json")
         broker, _ = self.broker()
         self.assertFalse(broker.resume(self.path))
+
+
+class TestTheBrokerHasToHonourIt(SessionCase):
+    """logged_in used to be bool(session_id) -- a string being present.
+
+    A session that every endpoint refused with "Unauthorized, VendorId
+    doesn't exists" still reported itself logged in, so the session gate --
+    one of the checks standing between the app and a live order -- passed
+    while nothing worked at all. Seen on a real account.
+    """
+
+    def test_a_session_the_broker_refuses_is_not_resumed(self):
+        broker, log = self.broker(verified=False)
+        self.save_for(broker)
+        self.assertFalse(broker.resume(self.path))
+        self.assertIn("not accepted by the broker", log.text())
+
+    def test_and_it_no_longer_claims_to_be_logged_in(self):
+        """load_session put the dead id on the client; leaving it there
+        meant logged_in kept saying yes about a session the broker had just
+        called worthless."""
+        broker, _ = self.broker(verified=False)
+        self.save_for(broker)
+        broker.resume(self.path)
+        self.assertFalse(broker.logged_in)
+
+    def test_and_the_dead_session_file_is_removed(self):
+        broker, _ = self.broker(verified=False)
+        self.save_for(broker)
+        broker.resume(self.path)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_session_it_honours_is_resumed(self):
+        broker, _ = self.broker(verified=True)
+        self.save_for(broker)
+        self.assertTrue(broker.resume(self.path))
+
+    def test_an_unreachable_broker_is_not_a_rejection(self):
+        """A network blip must not force a fresh login every time."""
+        broker, log = self.broker()
+        broker.verify_session = lambda: (None, "connection reset")
+        self.save_for(broker)
+        self.assertTrue(broker.resume(self.path))
+        self.assertIn("could not be reached", log.text())
+
+    def test_logged_in_is_false_once_the_broker_has_refused(self):
+        broker, _ = self.broker()
+        broker.client.session_id = "SID"
+        broker._session_ok = False
+        self.assertFalse(broker.logged_in)
+
+    def test_logged_in_is_true_when_it_has_been_honoured(self):
+        broker, _ = self.broker()
+        broker.client.session_id = "SID"
+        broker._session_ok = True
+        self.assertTrue(broker.logged_in)
+
+    def test_an_unchecked_session_still_counts_as_logged_in(self):
+        """The gates that follow fail on their own if nothing can be read."""
+        broker, _ = self.broker()
+        broker.client.session_id = "SID"
+        broker._session_ok = None
+        self.assertTrue(broker.logged_in)
+
+    def test_no_session_id_is_never_logged_in(self):
+        broker, _ = self.broker()
+        broker.client.session_id = None
+        self.assertFalse(broker.logged_in)
+
+    def test_an_unauthorised_reply_is_a_rejection(self):
+        broker, _ = self.raw_broker()
+        broker.client.session_id = "SID"
+
+        class Funds:
+            def get_funds_view(self):
+                raise Exception(
+                    "HTTP Request failed: 401 Client Error. Response: "
+                    "Unauthorized, VendorId doesn't exists")
+        broker.client.funds = Funds()
+        ok, why = broker.verify_session()
+        self.assertFalse(ok)
+        self.assertIn("Unauthorized", why)
+
+    def test_a_connection_failure_is_not(self):
+        broker, _ = self.raw_broker()
+        broker.client.session_id = "SID"
+
+        class Funds:
+            def get_funds_view(self):
+                raise OSError("connection reset by peer")
+        broker.client.funds = Funds()
+        ok, _ = broker.verify_session()
+        self.assertIsNone(ok)
+
+    def test_a_good_reply_is_acceptance(self):
+        broker, _ = self.raw_broker()
+        broker.client.session_id = "SID"
+
+        class Funds:
+            def get_funds_view(self):
+                return {"Status": "Success", "Response": {"FundsView": {}}}
+        broker.client.funds = Funds()
+        ok, _ = broker.verify_session()
+        self.assertTrue(ok)
 
 
 class TestStampingIt(SessionCase):
