@@ -384,6 +384,12 @@ it sees is written verbatim to `data/probe-<timestamp>.json`.
 
 ## Things worth knowing
 
+- **Log in on `finxomne`.** The login window offers two Choice servers, and
+  both show the same funds, positions and prices. They do not both place
+  orders. On 28 Sep 2026, `finx` answered two orders with "Success" and
+  created neither. `finxomne` created, listed and cancelled one the same
+  afternoon. The app now checks this at login: on a server that answers the
+  order book with nothing, it raises an alert and refuses to go live.
 - **The REST touchline is cached.** Polled three seconds apart it returns an
   identical payload, server timestamp included, and a quiet far month has been
   seen thirteen minutes behind. The websocket feed is the real source; polling

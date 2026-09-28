@@ -18,9 +18,11 @@ from rollover.money import D
 
 
 class FakeBroker:
-    def __init__(self, logged_in=True, scrip=None):
+    def __init__(self, logged_in=True, scrip=None,
+                 route=(True, "finxomne answers the order book")):
         self.logged_in = logged_in
         self.scrip_file_date = date.today() if scrip is None else scrip
+        self.order_route = route
 
 
 class FakeSession:

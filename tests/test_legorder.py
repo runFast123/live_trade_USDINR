@@ -19,7 +19,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 
 from rollover import rule
 from rollover.broker import BUY, InstrumentInfo, OrderOutcome
@@ -80,7 +80,8 @@ class LegOrderCase(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="legorder_")
         self.addCleanup(shutil.rmtree, self.dir, True)
 
-    def roll(self, far_depth, fills=(None, None), near_depth=DEEP, **kw):
+    def roll(self, far_depth, fills=(None, None), near_depth=DEEP,
+             when=datetime(2026, 9, 21, 11, 0), **kw):
         from rollover.engine import RollEngine
 
         kw.setdefault("lots", 25)
@@ -94,6 +95,10 @@ class LegOrderCase(unittest.TestCase):
         self.log = StubLog()
         self.broker = StubBroker(fills)
         engine = RollEngine(cfg, self.log, self.dir, broker=self.broker)
+        # An ordinary trading morning, a week before this contract expires,
+        # unless a test says otherwise. On the real 28 Sep these ran under
+        # the expiry-day rule, which sends the far leg first, and failed.
+        engine.clock = lambda: when
         section = engine.sections[0]
         section.near = contract("1769", date(2026, 9, 28))
         section.far = contract("1584", date(2026, 11, 26))
@@ -135,6 +140,20 @@ class TestWhichLegGoesOut(LegOrderCase):
         self.roll(THIN, leg_order="near_first")
         self.assertTrue(self.sequence.near_first)
         self.assertEqual(self.order()[0][:2], ("SELL", "1769"))
+
+    def test_on_expiry_day_the_far_leg_goes_first_whatever_is_configured(self):
+        """The same roll, on the day the near contract expires. Proves the
+        engine reads the day it is given, which is what keeps every test
+        above from depending on the calendar."""
+        self.roll(THIN, leg_order="near_first",
+                  when=datetime(2026, 9, 28, 11, 0))
+        self.assertTrue(self.sequence.far_first)
+        self.assertEqual(self.order()[0][:2], ("BUY", "1584"))
+
+    def test_the_engine_reads_the_real_clock_by_default(self):
+        from rollover.engine import RollEngine
+        drift = abs(RollEngine.clock() - datetime.now())
+        self.assertLess(drift.total_seconds(), 5)
 
     def test_the_order_is_logged(self):
         self.roll(THIN)

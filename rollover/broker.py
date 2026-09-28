@@ -8,9 +8,11 @@ gates as a failure. Nothing here guesses.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -58,6 +60,17 @@ _ORDER_NO_KEYS = ("GatewayOrderNo", "ExchangeOrderNo", "ClientOrderNo",
 # behaviour rather than collapsing every order onto one identity.
 _IDENTITY_KEYS = ("ClientOrderNo",)
 VENDOR_CLIENT_ORDER_NO = "123456"
+
+# Where a new order goes. The vendor's place_order posts here as well; the
+# app only posts here itself when the installed choice_api cannot be handed a
+# ClientOrderNo of our own. See send_order.
+NEW_ORDER_ENDPOINT = "api/OpenAPI/V2/NewOrder"
+
+# A ClientOrderNo has to fit the broker's integer field. The newer choice_api
+# keeps it inside a signed 32-bit integer the same way.
+CLIENT_NO_CEILING = 2_000_000_000
+_client_no_lock = threading.Lock()
+_last_client_no = 0
 
 _FILLED_KEYS = ("FilledQty", "TradedQty", "FilledQuantity", "ExecutedQty",
                 "TradedQuantity", "FillQty", "FilledShares")
@@ -239,6 +252,137 @@ def call_failed(resp: Any) -> Optional[str]:
     return str(detail).strip() if detail else f"the broker returned {status!r}"
 
 
+def order_book_is_live(resp: Any) -> Optional[bool]:
+    """Whether an order-book answer comes from a server that places orders.
+
+    28 Sep 2026: one account, one session, both of Choice's servers. finxomne
+    answered {"Orders": []}, then created, listed and cancelled the probe's
+    order. finx answered null, and acknowledged two orders with "Success"
+    without creating either. So a Success carrying nothing at all, where a
+    list belongs, is the mark of the server that swallows orders.
+
+    None when the answer says nothing either way: a refusal, an error, or a
+    shape never seen.
+    """
+    if not isinstance(resp, dict) or "Response" not in resp:
+        return None
+    status = str(resp.get("Status", "")).strip().lower()
+    if status not in ("success", "ok", "true"):
+        return None
+    return resp["Response"] is not None
+
+
+def next_client_order_no() -> int:
+    """A reference number no earlier order from this machine has carried.
+
+    choice_api up to 1.3.x sends "ClientOrderNo": 123456 with every order.
+    The finxomne host ignored it and numbered orders itself (100000014 on
+    18 Sep). On 28 Sep the funded account, on the finx host, answered an
+    order with {"Status": "Success", "Response": ""} and created nothing: it
+    was not in the API's order books and not in the broker's terminal. A
+    reference the broker has already seen is a standard cause of exactly that
+    answer, the request being taken as a repeat and acknowledged without a
+    new order. That is not proven here, but a fixed reference is a defect
+    either way, and the newer choice_api fixed it the same way.
+
+    Milliseconds since the epoch, wrapped inside the ceiling, one higher than
+    the last whenever two orders land in the same millisecond. Never the
+    vendor's placeholder.
+    """
+    global _last_client_no
+    with _client_no_lock:
+        candidate = int(time.time() * 1000) % CLIENT_NO_CEILING
+        if candidate <= _last_client_no:
+            candidate = _last_client_no + 1
+        if str(candidate) == VENDOR_CLIENT_ORDER_NO:
+            candidate += 1
+        if candidate >= CLIENT_NO_CEILING:
+            candidate = 1
+        _last_client_no = candidate
+        return candidate
+
+
+def reply_order_no(resp: Any) -> Optional[str]:
+    """The order number the broker's answer to a new order carried, or None.
+
+    18 Sep: {"Status": "Success", "Response": "260918000069382"}, and the order
+    was in the book. 28 Sep: {"Status": "Success", "Response": ""}, and there
+    was no order anywhere. An answer with nothing in it is the thing to notice.
+    """
+    if not isinstance(resp, dict):
+        return None
+    inner = resp.get("Response")
+    if isinstance(inner, dict):
+        value = _first(inner, _ORDER_NO_KEYS)
+        return str(value).strip() if value is not None else None
+    if inner is None or isinstance(inner, bool):
+        return None
+    text = str(inner).strip()
+    return text or None
+
+
+def order_payload(cfg, token, side: int, qty: int, price_units,
+                  client_order_no: int) -> Dict[str, Any]:
+    """The new-order request, field for field as choice_api 1.3.0 builds it,
+    carrying our own ClientOrderNo in place of its fixed 123456."""
+    return {
+        "SegmentId": cfg.segment_id,
+        "Token": int(token),
+        "OrderType": cfg.order_type,
+        "BS": side,
+        "Qty": qty,
+        "DisclosedQty": 0,
+        "Price": int(price_units),
+        "TriggerPrice": 0,
+        "Validity": cfg.validity,
+        "ProductType": cfg.product_type,
+        "IsEdisReq": False,
+        "Remarks": "API",
+        "ModeTyp": "WEBAPI",
+        "Mode": 1,
+        "DeviceId": "MAC",
+        "ClientOrderNo": client_order_no,
+    }
+
+
+def _accepts(function, name: str) -> bool:
+    """Whether a callable takes this keyword, by name or through **kwargs."""
+    try:
+        params = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is p.VAR_KEYWORD for p in params)
+
+
+def send_order(client, cfg, token, side: int, qty: int, price_units,
+               client_order_no: Optional[int] = None) -> Tuple[Any, int]:
+    """Place one order carrying a ClientOrderNo of our own.
+
+    Returns (the broker's answer, the number sent). Goes through the vendor's
+    place_order whenever that can be handed the number, as choice_api 1.3.1
+    onwards can. The installed 1.3.0 cannot, so the identical request is
+    built here and posted to the same endpoint.
+
+    Raises whatever the transport raises. Nothing is caught here, so the
+    caller decides what an exception means for an order that may or may not
+    have been sent.
+    """
+    number = (next_client_order_no() if client_order_no is None
+              else int(client_order_no))
+    place = client.orders.place_order
+    if _accepts(place, "client_order_no"):
+        reply = place(segment_id=cfg.segment_id, token=int(token),
+                      order_type=cfg.order_type, bs=side, qty=qty,
+                      price=int(price_units), trigger_price=0,
+                      validity=cfg.validity, product_type=cfg.product_type,
+                      client_order_no=number)
+    else:
+        reply = client.request(
+            "POST", NEW_ORDER_ENDPOINT,
+            order_payload(cfg, token, side, qty, price_units, number))
+    return reply, number
+
+
 def order_identity(record: Dict[str, Any]) -> Optional[str]:
     """A reference for this order that will not change between two polls."""
     value = _first(record, _IDENTITY_KEYS)
@@ -311,6 +455,9 @@ class Broker:
         # band moves. An app left running overnight must not keep yesterday's.
         self.scrip_loaded_on: Optional[date] = None
         self.scrip_file_date: Optional[date] = None
+        # Whether orders sent to this server are created, and why. Read at
+        # login; going live is refused until it is True.
+        self.order_route: Tuple[Optional[bool], str] = (None, "not checked yet")
 
     # ------------------------------------------------------------- connection
     #
@@ -414,7 +561,42 @@ class Broker:
         self.log.info("Reused today's saved session."
                       if ok else "Reused today's saved session (the broker "
                                  f"could not be reached to check it: {why}).")
+        self.check_order_route()
         return True
+
+    def check_order_route(self) -> Tuple[Optional[bool], str]:
+        """Whether orders sent to this server will be created. Never raises.
+
+        Read from the order book's answer (see order_book_is_live) at login,
+        and again from the watch loop for as long as it is unknown. Going
+        live is refused unless it is True: on finx, on 28 Sep, every order
+        was acknowledged and none was created, and nothing else said so.
+        """
+        host = (str(getattr(self.cfg, "base_url", "") or "")
+                .split("//")[-1].strip("/") or "this server")
+        try:
+            resp = self.client.orders.get_order_book()
+        except Exception as exc:
+            self.order_route = (None, f"the order book on {host} could not be "
+                                      f"read ({str(exc).splitlines()[0][:100]})")
+            return self.order_route
+
+        verdict = order_book_is_live(resp)
+        if verdict is True:
+            self.order_route = (True, f"{host} answers the order book, so "
+                                      "orders sent there are created")
+        elif verdict is False:
+            self.order_route = (False, (
+                f"{host} answers the order book with nothing at all. On "
+                "28 Sep that server acknowledged orders for this account and "
+                "created none. Log in again and choose finxomne, which "
+                "placed and cancelled an order for it the same day"))
+            self.log.alert(f"Orders will not work on this server: "
+                           f"{self.order_route[1]}.")
+        else:
+            self.order_route = (None, f"the order book answer from {host} was "
+                                      f"not recognised: {str(resp)[:100]}")
+        return self.order_route
 
     def verify_session(self) -> Tuple[Optional[bool], str]:
         """Ask the broker whether it still honours this session.
@@ -556,6 +738,8 @@ class Broker:
         elif ok is None:
             self.log.warn(f"The new session could not be checked ({why}); "
                           "carrying on.")
+        if ok is not False:
+            self.check_order_route()
         self.client.save_session(session_path)
         self._stamp_session(session_path)
         self.log.info("Login complete.")
@@ -1031,9 +1215,15 @@ class Broker:
                 refs.add(ref)
         return refs
 
-    def _find_order(self, token: str, side: int, known_before: set) -> Optional[Dict[str, Any]]:
-        """Locate our order in the book. place_order hard-codes ClientOrderNo, so
-        the order is identified as the new one on this token and side."""
+    def _find_order(self, token: str, side: int, known_before: set,
+                    client_order_no: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Locate our order in the book.
+
+        By its ClientOrderNo when the broker echoes ours back: it is unique
+        now, so a row carrying it is certainly ours. Otherwise as the new row
+        on this token and side, which was the only way while every order went
+        out as 123456 and the finxomne host replaced it with its own number.
+        """
         try:
             resp = self.client.orders.get_order_book()
         except Exception as exc:
@@ -1041,11 +1231,16 @@ class Broker:
             return None
 
         token = str(token).strip()
+        wanted = str(client_order_no) if client_order_no is not None else None
         best = None
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
                 continue
+            if wanted is not None:
+                echoed = _first(record, _IDENTITY_KEYS)
+                if echoed is not None and str(echoed).strip() == wanted:
+                    return record
             ref = order_identity(record)
             if ref is None or ref in known_before:
                 continue
@@ -1128,19 +1323,11 @@ class Broker:
                                 order_ref=None, certain=True, detail="dry run")
 
         before = self._order_snapshot()
-        self.log.info(f"Sending {summary}")
+        number = next_client_order_no()
+        self.log.info(f"Sending {summary}, client order no {number}")
         try:
-            resp = self.client.orders.place_order(
-                segment_id=self.cfg.segment_id,
-                token=int(token),
-                order_type=self.cfg.order_type,
-                bs=side,
-                qty=qty,
-                price=int(units),
-                trigger_price=0,
-                validity=self.cfg.validity,
-                product_type=self.cfg.product_type,
-            )
+            resp, number = send_order(self.client, self.cfg, token, side, qty,
+                                      units, client_order_no=number)
         except Exception as exc:
             return OrderOutcome(sent=False, filled_qty=0, requested_qty=qty,
                                 order_ref=None, certain=True,
@@ -1157,10 +1344,12 @@ class Broker:
                                 order_ref=None, certain=True, raw=resp,
                                 detail=f"the broker refused the order: {problem}")
 
+        acknowledged = reply_order_no(resp)
+
         deadline = time.monotonic() + self.cfg.fill_timeout_sec
         record, filled, status = None, None, "not seen in the order book"
         while time.monotonic() < deadline:
-            record = self._find_order(token, side, before)
+            record = self._find_order(token, side, before, client_order_no=number)
             if record is not None:
                 filled, status = self.read_fill(record, qty)
                 if filled is not None and filled >= qty:
@@ -1176,10 +1365,23 @@ class Broker:
         ref = str(_first(record, _ORDER_NO_KEYS)) if record else None
 
         if record is None:
-            return OrderOutcome(sent=True, filled_qty=0, requested_qty=qty, order_ref=None,
-                                certain=False, raw=resp,
-                                detail="order was accepted but never appeared in the order "
-                                       "book; check the terminal before doing anything else")
+            # Still uncertain, and so still a halt, either way. An answer with
+            # no order number in it meant no order at all on 28 Sep, but that
+            # is one observation; a leg that did reach the exchange and cannot
+            # be seen is the half roll this app exists to prevent.
+            if acknowledged is None:
+                detail = ("the broker answered Success but gave no order number, and "
+                          "the order never appeared in the order book. On 28 Sep "
+                          "that meant the broker had not created it at all. It was "
+                          f"sent as client order no {number}; check the terminal "
+                          "before doing anything else")
+            else:
+                detail = (f"order was accepted (the broker answered {acknowledged}) "
+                          "but never appeared in the order book; check the terminal "
+                          "before doing anything else")
+            return OrderOutcome(sent=True, filled_qty=0, requested_qty=qty,
+                                order_ref=acknowledged, certain=False, raw=resp,
+                                detail=detail)
 
         if filled is None:
             return OrderOutcome(sent=True, filled_qty=0, requested_qty=qty, order_ref=ref,
@@ -1204,7 +1406,7 @@ class Broker:
             # roll gets manufactured. At one lot this never bites; at twenty it
             # does. Re-read once the order has settled and use that.
             settled, settled_status = self._settle_after_cancel(
-                token, side, before, qty)
+                token, side, before, qty, client_order_no=number)
 
             if settled is None:
                 return OrderOutcome(
@@ -1225,7 +1427,9 @@ class Broker:
                             detail=f"filled {filled} of {qty} ({status})")
 
     def _settle_after_cancel(self, token: str, side: int, before: set, qty: int,
-                             wait: float = 2.0) -> Tuple[Optional[int], str]:
+                             wait: float = 2.0,
+                             client_order_no: Optional[int] = None
+                             ) -> Tuple[Optional[int], str]:
         """Read the order's final filled quantity once the cancel has landed.
 
         Returns (None, reason) when it cannot be established, which the caller
@@ -1237,7 +1441,8 @@ class Broker:
         last_status = "the order could not be found after cancelling"
 
         while time.monotonic() < deadline:
-            record = self._find_order(token, side, before)
+            record = self._find_order(token, side, before,
+                                      client_order_no=client_order_no)
             if record is not None:
                 value, status = self.read_fill(record, qty)
                 if value is not None:

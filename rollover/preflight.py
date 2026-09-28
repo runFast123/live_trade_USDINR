@@ -214,6 +214,10 @@ def run(cfg, log, base_dir: str) -> int:
     else:
         report.add(PASS, "order book", "readable, nothing working")
 
+    verdict, why = broker.check_order_route()
+    report.add(PASS if verdict else (FAIL if verdict is False else WARN),
+               "order route", why)
+
     trades = broker._trade_snapshot()
     report.add(FAIL if trades is None else PASS, "trade book",
                "could not be read" if trades is None

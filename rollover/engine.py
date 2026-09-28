@@ -571,6 +571,13 @@ class RollEngine:
                     self.log.info("The broker is accepting the session again.")
             except Exception:
                 pass
+        # Whether orders sent to this server are created is read at login. A
+        # failed read then leaves it unknown, which refuses going live, so it
+        # is asked again here until there is an answer.
+        route = getattr(self.broker, "order_route", None)
+        check = getattr(self.broker, "check_order_route", None)
+        if isinstance(route, tuple) and route[0] is None and callable(check):
+            check()
         try:
             if self.broker.refresh_scrip_master_if_stale():
                 # New day, new file: the contracts must be read again, since
@@ -1139,6 +1146,13 @@ class RollEngine:
                 return f"near contract {token}: {why}"
         return None
 
+    #: The time as the engine sees it, for the expiry-day rule and for every
+    #: gate that reads the clock. Replaceable so a test can say when it is.
+    #: Twenty-two tests written for an ordinary afternoon turned red at 16:00
+    #: on 28 Sep 2026, the day their September contract expired: the leg
+    #: order reversed, and the 12:25 expiry-day cutoff closed every gate.
+    clock = staticmethod(datetime.now)
+
     def _expiry_day(self, section=None) -> bool:
         """True when the near contract of any section expires today.
 
@@ -1146,7 +1160,7 @@ class RollEngine:
         contention are the ones selling the same near month, and it is that
         month running out that changes what matters.
         """
-        today = date.today()
+        today = self.clock().date()
         wanted = self.sections if section is None else [section]
         for candidate in wanted:
             near = candidate.near
@@ -1229,7 +1243,7 @@ class RollEngine:
             # could ever be sent.
             sequence = self._choose_sequence(decision, near_q, far_q, section)
             report = gatelib.evaluate(cfg, section, quotes, decision,
-                                      sequence=sequence)
+                                      now=self.clock(), sequence=sequence)
             section.report = report
             section.sequence = sequence
 

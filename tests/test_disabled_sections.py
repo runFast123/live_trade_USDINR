@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 
 from rollover.broker import InstrumentInfo
 from rollover.config import RollConfig
@@ -83,13 +83,18 @@ class DisabledCase(unittest.TestCase):
             sections=sections, use_live_feed=False, record_market=False,
             update_check=False, journal=False, dry_run=True)
         engine = RollEngine(cfg, self.log, self.dir, broker=Broker())
+        # A trading morning a week before September expires. The window
+        # above covers the time of day; this covers the date, because on
+        # the real 28 Sep the 12:25 expiry-day cutoff closed every gate
+        # and no clip could fire.
+        engine.clock = lambda: datetime(2026, 9, 21, 11, 0)
         for s in engine.sections:
             s.near = contract(s.cfg.near_token)
             s.far = contract(s.cfg.far_token)
         engine.near_positions = {"1769": 100000}
         engine.account.logged_in = True
         engine.account.market_open = True
-        engine.account.scrip_file_date = date.today()
+        engine.account.scrip_file_date = engine.clock().date()
 
         # Record what would have been sent instead of sending it.
         engine._execute = lambda *a, **kw: self.sent.append(
@@ -253,13 +258,18 @@ class TestTheAccountWideDayBudget(DisabledCase):
             sections=sections, use_live_feed=False, record_market=False,
             update_check=False, journal=False, dry_run=True)
         engine = RollEngine(cfg, self.log, self.dir, broker=Broker())
+        # A trading morning a week before September expires. The window
+        # above covers the time of day; this covers the date, because on
+        # the real 28 Sep the 12:25 expiry-day cutoff closed every gate
+        # and no clip could fire.
+        engine.clock = lambda: datetime(2026, 9, 21, 11, 0)
         for s in engine.sections:
             s.near = contract(s.cfg.near_token)
             s.far = contract(s.cfg.far_token)
         engine.near_positions = {"1769": 100000}
         engine.account.logged_in = True
         engine.account.market_open = True
-        engine.account.scrip_file_date = date.today()
+        engine.account.scrip_file_date = engine.clock().date()
 
         def fake(dec, nq, fq, section=None, sequence=None):
             self.sent.append(section.name)

@@ -107,8 +107,11 @@ class TestItAsksFirst(unittest.TestCase):
         return FakeBroker
 
     def run_probe(self, answer, qty=None, capture=False):
-        original = probe.Broker
+        original, original_wait = probe.Broker, probe.BOOK_WAIT
         probe.Broker = self.fake_broker()
+        # The fake book never shows the order, so the probe would otherwise
+        # sit out its whole wait in every test.
+        probe.BOOK_WAIT = 0
         said = io.StringIO()
         try:
             # The probe talks to the operator on stdout; keep it out of the
@@ -118,7 +121,7 @@ class TestItAsksFirst(unittest.TestCase):
                                  confirm=lambda _prompt: answer)
             return said.getvalue() if capture else code
         finally:
-            probe.Broker = original
+            probe.Broker, probe.BOOK_WAIT = original, original_wait
 
     def test_the_wrong_word_sends_nothing(self):
         for answer in ("yes", "y", "", "place real order", "PLACE REAL ORDERS"):
@@ -167,6 +170,34 @@ class TestItAsksFirst(unittest.TestCase):
                     "order_book_v2", "trade_book"):
             self.assertIn(key, record)
         self.assertEqual(record["sent"]["side"], "BUY")
+
+    def test_it_records_the_number_it_sent(self):
+        """So the order can be quoted to the broker by its own reference."""
+        self.run_probe(CONFIRM)
+        folder = os.path.join(self.dir, "data")
+        name = [n for n in os.listdir(folder) if n.startswith("probe-")][0]
+
+        import json
+        with open(os.path.join(folder, name), encoding="utf-8") as fh:
+            record = json.load(fh)
+        sent = self.sent[0]["client_order_no"]
+        self.assertEqual(record["client_order_no"], sent)
+        self.assertNotEqual(str(sent), "123456")
+        self.assertIn("reply_order_no", record)
+
+    def test_it_says_when_the_answer_had_no_order_number(self):
+        """28 Sep: Success, an empty Response, and no order anywhere."""
+        out = self.run_probe(CONFIRM, capture=True)
+        self.assertIn("without an order number", out)
+        self.assertIn("client order no", out)
+
+    def test_it_looks_more_than_once(self):
+        """One read straight after placing cannot tell "never created" from
+        "not listed yet"."""
+        import inspect
+        source = inspect.getsource(probe.run)
+        self.assertIn("BOOK_WAIT", source)
+        self.assertIn("while True", source)
 
     def test_it_stops_without_a_session(self):
         base = self.fake_broker()
@@ -264,6 +295,23 @@ class TestItKnowsWhichOrderIsOurs(unittest.TestCase):
         found, problem = probe._find_ours(after, "1769", before)
         self.assertIsNone(found)
         self.assertIn("no NEW order", problem)
+
+    def test_our_own_number_settles_it_even_among_new_rows(self):
+        """Two new rows used to be refused as ambiguous. A row carrying the
+        number we sent is ours, whatever else arrived alongside it."""
+        before = probe._identities(self.book(self.row(1)))
+        after = self.book(self.row(1), self.row(2), self.row(555))
+        found, problem = probe._find_ours(after, "1769", before,
+                                          client_order_no=555)
+        self.assertIsNone(problem)
+        self.assertEqual(found["ClientOrderNo"], 555)
+
+    def test_our_number_on_another_token_is_not_taken(self):
+        before = probe._identities(self.book(self.row(1)))
+        after = self.book(self.row(1), self.row(555, token="1584"))
+        found, _ = probe._find_ours(after, "1769", before,
+                                    client_order_no=555)
+        self.assertIsNone(found)
 
     def test_an_empty_book_says_it_never_appeared(self):
         found, problem = probe._find_ours(self.book(), "1769", set())

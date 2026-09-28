@@ -30,7 +30,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 
 try:
     import tkinter as tk
@@ -121,6 +121,10 @@ class WorkflowCase(unittest.TestCase):
 
         self.engine = RollEngine(self.cfg, self.log, self.dir,
                                  broker=StubBroker())
+        # A trading morning a week before September expires; the window
+        # above covers the time of day, this covers the date. On the real
+        # 28 Sep the expiry-day cutoff closed every gate after 12:25.
+        self.engine.clock = lambda: datetime(2026, 9, 21, 11, 0)
         self.window = RollWindow(_root, self.engine, self.log,
                                  config_path=self.path)
         self.window.withdraw()
@@ -141,7 +145,7 @@ class WorkflowCase(unittest.TestCase):
                   for t, (b, a, bq, aq) in PRICES.items()}
         self.engine.account.logged_in = True
         self.engine.account.market_open = True
-        self.engine.account.scrip_file_date = date.today()
+        self.engine.account.scrip_file_date = self.engine.clock().date()
         self.engine.near_positions = {"1769": 100000}
         for s in self.engine.sections:
             for role in ("near", "far"):

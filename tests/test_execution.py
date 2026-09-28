@@ -13,7 +13,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 
 from rollover import rule
 from rollover.broker import BUY, SELL, InstrumentInfo, OrderOutcome
@@ -186,6 +186,10 @@ class ExecutionCase(unittest.TestCase):
 
         engine = RollEngine(self.cfg, self.log, self.state_dir,
                             broker=self.broker)
+        # An ordinary trading morning, a week before the near contract
+        # expires. On the real 28 Sep these ran under the expiry-day rule
+        # and failed.
+        engine.clock = lambda: datetime(2026, 9, 21, 11, 0)
         engine.session.near = instrument("1769", "USDINR26SEPFUT")
         engine.session.far = instrument("1584", "USDINR26NOVFUT")
 

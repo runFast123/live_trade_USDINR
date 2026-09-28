@@ -635,3 +635,130 @@ one this app can answer.
 Unchanged and still outstanding: `max_leg_spread` is 0.05 while November's
 spread read **0.1050** today, which remains the one gate blocking an
 otherwise-ready roll.
+
+---
+
+## 28 September 2026: Phase 3.1 — the order was acknowledged and then vanished
+
+The account came back funded (Rs 1.17 crore available) and long 4 lots of
+October, and `--preflight` passed every check. The probe was then run by the
+operator at **15:36:08 IST**:
+
+```
+sent      BUY 1000 of USDINR26OCTFUT (1284) at 93.4325 (934325000)
+          market bid 96.4325, circuit 93.2350 .. 99.0000
+place     {"Status": "Success", "Response": "", "Reason": ""}
+book      OrderBook   -> {"Status": "Success", "Response": null}
+          OrderBookV2 -> {"Status": "Success", "Response": null}
+trades    {"Trades": []}
+```
+
+Raw capture: `dist/data/probe-2026-09-28_153608.json`.
+
+**The place call returned Success with an empty body, and no order appeared
+anywhere.** Compare 18 September, where the same call returned an order number
+(`"Response": "260918000069382"`) and the order was listed in the book, even
+though the exchange had rejected it. A rejected order still leaves a row; this
+left nothing.
+
+Re-read at 15:38:40: both order books still `null`, trade book empty, and the
+position unchanged at 4,000 October and 4,000 November. So nothing filled.
+
+What this does **not** settle: whether an order was created that this API
+cannot show. The order books return `null` for this account even when idle,
+where the account used on 22 September returned `{"Orders": []}`. If the book
+endpoint is blind for this account, a resting order would be invisible to the
+app. The broker terminal is the only authority on that.
+
+**Why it blocks Phase 3.2.** The app treats "accepted but never appeared in the
+book" as uncertain and halts — correct if the order was never created. But if
+the order *was* created and the book simply cannot show it, a near leg priced at
+the touch would fill, the app would halt without buying the far leg, and the
+account would be left half rolled. That is the one outcome this app must never
+produce, so no live roll until Choice explains the empty response.
+
+Questions for Choice, with the timestamp above:
+
+1. `POST api/OpenAPI/V2/NewOrder` returned `{"Status":"Success","Response":""}`.
+   Was an order created? If not, why Success?
+2. Does this account's API key have order-placement permission, and is the IP
+   the order came from registered for placing orders?
+3. Why do `OrderBook` and `OrderBookV2` return `"Response": null` for this
+   account, rather than `{"Orders": []}`?
+4. Should `V2/NewOrder` return an order number, as it did on 18 September?
+
+### Later on 28 September: what the probe's failure narrowed down to
+
+**The account and the host both changed at 15:31.** Before then the app ran as
+the old account on `finxomne.choiceindia.com`, which reads Rs 0 and no
+positions. At 15:31 the login window switched to a different account on
+`finx.choiceindia.com`, which holds the funds and the 4 + 4 lots. The probe
+ran on that account, on `finx`. (Earlier in the day the empty reading was
+taken to mean the account had been emptied. It was a different account.)
+
+**The order route did not change.** Every copy of choice_api on this machine,
+including the 1.2.0 that ran the 18 September probe, posts to
+`api/OpenAPI/V2/NewOrder`.
+
+**What every order carried: `"ClientOrderNo": 123456`.** choice_api 1.3.0
+hard-codes it and has no parameter to change it. The newer choice_api
+(1.5.2, in `indicator_lib`) lists that as a bug fixed in 1.3.1. On
+18 September `finxomne` ignored it and numbered the order itself
+(`100000014`). A broker that honours a client's reference will typically
+answer a repeated one with Success and create nothing, which is exactly what
+`finx` did. Not proven, because testing it means placing another order.
+
+**Fixed:** every order now carries its own `ClientOrderNo`, unique and
+increasing, inside a 32-bit integer and never `123456`. The request is
+otherwise field-for-field what choice_api builds (pinned by a test against
+the installed library). The probe records the number, looks for the order for
+up to 5 seconds rather than once, and says in words when the broker's answer
+had no order number. The execution path does the same, and still halts on it.
+
+**If the order still does not appear with a unique number**, the reference
+number is ruled out, and the question for Choice becomes: does this
+account's API key have order-placement permission on `finx`,
+and is the IP it was sent from registered for orders?
+
+### 28 September, 16:21: Phase 3.1 passed, on finxomne
+
+The unique reference number did not change finx's answer: at 16:16 it
+acknowledged the order with `"Response": ""` again, and the order book stayed
+`null` through 11 reads over 5.5 seconds. So the reference number was not the
+cause. Nor was the IP: the API key records the IP it was issued for, and this
+machine's public IP matched it.
+
+What did differ was the server. With the same session, both servers returned
+identical funds and positions, but the order book differed: finx answered
+`null`, finxomne answered `{"Orders": []}`. The operator logged in again
+choosing finxomne and ran the probe (`dist/data/probe-2026-09-28_162129.json`):
+
+```
+place           {"Status": "Success", "Response": "260928000166352"}
+book, 0.09 s    BUY 1000 at 93.405, OrderStatus PENDING,
+                ExchangeOrderNo 1000000000383113, TradedQty 0
+cancel          {"Status": "Success", "Response": 100000102}
+book after      OrderStatus CANCELLED, TradedQty 0
+trade book      empty; position unchanged at 4,000 Oct and 4,000 Nov
+```
+
+**For this account, finx acknowledges orders and never creates them;
+finxomne creates, lists and cancels them.** Everything else was the same:
+account, key, IP and the request itself.
+
+Confirmed along the way:
+
+- The broker again replaced our ClientOrderNo with its own sequence
+  (`100000102`), and the order was identified as the one new row, which is how
+  the execution path finds its orders.
+- `OrderBook` gives the price in rupees and the LTP in exchange units;
+  `OrderBookV2` gives them the other way round. The app reads `OrderBook`.
+- `OrderBookByOrderNo` with the exchange order number found nothing, so it is
+  not a usable lookup for this account.
+
+**Guard added.** The order book's answer is read at login. On a server that
+answers it with nothing, the app raises an alert straight away and refuses
+Go Live, the probe refuses to send, and `--preflight` fails the "order route"
+line. If the read itself fails (finxomne answered 500s for ten minutes that
+afternoon), the verdict is unknown, which also refuses Go Live, and the watch
+loop asks again every 15 seconds until it has an answer.

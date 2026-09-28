@@ -66,6 +66,8 @@ class StubSession:
 class StubBroker:
     logged_in = True
     scrip_file_date = date.today()
+    # A server that places orders, as finxomne did on 28 Sep.
+    order_route = (True, "finxomne answers the order book")
 
 
 class StubEngine:

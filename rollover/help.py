@@ -127,6 +127,11 @@ TOPICS: List[Topic] = [
         "across every enabled section.",
 
         "Going back to dry run is instant and asks nothing.",
+
+        "Log in on finxomne. The other server, finx, shows the same account "
+        "but did not place orders for it: it answered Success and created "
+        "nothing. The app checks this when you log in, and Go live stays "
+        "refused on a server that does not place orders.",
     ]),
 
     ("Where the prices are coming from", [

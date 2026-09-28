@@ -26,17 +26,27 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from .broker import BUY, Broker, _first, _ORDER_NO_KEYS
+from .broker import (BUY, Broker, _first, _IDENTITY_KEYS, _ORDER_NO_KEYS,
+                     next_client_order_no, order_book_is_live, reply_order_no,
+                     send_order)
 from .money import D, floor_tick, money
 
 CONFIRM = "PLACE REAL ORDER"
 
 # How far beneath the market to rest, before the circuit limit is applied.
 CLEARANCE = D("3.00")
+
+# How long to keep looking for the order in the book, and how often. It was
+# read once, straight after placing, on 28 Sep. The order was not there, and
+# a single read cannot tell "never created" from "not listed yet". It rests at
+# the floor, so waiting a few seconds for it costs nothing.
+BOOK_WAIT = 5.0
+BOOK_POLL = 0.5
 
 
 class ProbeError(RuntimeError):
@@ -180,33 +190,69 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None,
               "could not be told from any other on this contract -- and it "
               "would have to be cancelled by hand. Nothing was sent.")
         return 2
+    if order_book_is_live(record["order_book_before"].get("response")) is False:
+        # finx, 28 Sep: this exact answer, then two orders acknowledged with
+        # "Success" and never created. Sending one more proves nothing.
+        print("  This server answers the order book with nothing at all. On "
+              "28 Sep that server acknowledged orders for this account and "
+              "created none. Log in again, choose finxomne, and run this "
+              "again. Nothing was sent.")
+        return 2
     before = _identities(record["order_book_before"])
     print(f"  {len(before)} order(s) already in the book")
 
-    log.info(f"PROBE: BUY {qty} of {info.label()} at {money(price)} ({units})")
+    # Our own reference, so the order can be found by it and quoted to the
+    # broker. Every order used to go out as 123456.
+    number = next_client_order_no()
+    record["client_order_no"] = number
+    log.info(f"PROBE: BUY {qty} of {info.label()} at {money(price)} ({units}), "
+             f"client order no {number}")
 
-    record["place_order"] = _capture("place", lambda: orders.place_order(
-        segment_id=cfg.segment_id, token=int(info.token),
-        order_type=cfg.order_type, bs=BUY, qty=qty, price=int(units),
-        trigger_price=0, validity=cfg.validity, product_type=cfg.product_type))
+    record["place_order"] = _capture("place", lambda: send_order(
+        broker.client, cfg, info.token, BUY, qty, units,
+        client_order_no=number)[0])
     print(f"  placed -> {str(record['place_order'])[:160]}")
+    print(f"  sent as client order no {number}")
 
-    # Everything the broker can tell us about it.
-    record["order_book"] = _capture("order_book", orders.get_order_book)
+    answer_no = (reply_order_no(record["place_order"].get("response"))
+                 if record["place_order"].get("ok") else None)
+    record["reply_order_no"] = answer_no
+    if record["place_order"].get("ok") and answer_no is None:
+        print("  the broker answered without an order number")
+
+    # Everything the broker can tell us about it, read until the order shows
+    # up or BOOK_WAIT runs out.
+    started = time.monotonic()
+    polls = 0
+    while True:
+        polls += 1
+        record["order_book"] = _capture("order_book", orders.get_order_book)
+        ours, problem = _find_ours(record["order_book"], info.token, before,
+                                   client_order_no=number)
+        if ours is not None or time.monotonic() - started >= BOOK_WAIT:
+            break
+        time.sleep(BOOK_POLL)
+    record["book_polls"] = polls
+    record["book_waited_sec"] = round(time.monotonic() - started, 2)
+
     record["order_book_v2"] = _capture("order_book_v2", orders.get_order_book_v2)
     record["trade_book"] = _capture("trade_book", orders.get_trade_book)
 
-    ours, problem = _find_ours(record["order_book"], info.token, before)
     if ours is None:
         ours, problem_v2 = _find_ours(record["order_book_v2"], info.token,
-                                      before)
+                                      before, client_order_no=number)
         problem = None if ours is not None else (problem or problem_v2)
     record["matched_order"] = ours
     record["match_problem"] = problem
     if problem:
-        print(f"  COULD NOT IDENTIFY OUR ORDER: {problem}")
+        print(f"  COULD NOT IDENTIFY OUR ORDER: {problem} "
+              f"(looked {polls} time(s) over {record['book_waited_sec']}s)")
 
+    # By the book's number when the order was found, otherwise by the one
+    # the broker's answer carried, if it carried one.
     order_no = _first(ours, _ORDER_NO_KEYS) if ours else None
+    if order_no is None and answer_no and answer_no.isdigit():
+        order_no = answer_no
     if order_no is not None:
         record["order_by_no"] = _capture(
             "order_by_no", lambda: orders.get_order_by_no(int(D(order_no))))
@@ -264,14 +310,15 @@ def _identities(captured: Dict[str, Any]) -> set:
 
 
 def _find_ours(captured: Dict[str, Any], token: str,
-               before: Optional[set] = None):
+               before: Optional[set] = None,
+               client_order_no: Optional[int] = None):
     """Our order, or a reason we cannot say which one it is.
 
-    Returns (row, problem). It used to return the most recent row on the
-    token, which is only right on an account with nothing else working. The
-    order this places cannot be tied to the id place_order returns -- that
-    id appears nowhere in the order book -- so ours is identified as the row
-    that was NOT there before, exactly as the execution path does it.
+    Returns (row, problem). A row carrying our own ClientOrderNo is ours for
+    certain, because that number is unique now. Otherwise ours is the row
+    that was NOT there before, exactly as the execution path does it: the id
+    place_order returned on 18 Sep appears nowhere in the order book, and the
+    finxomne host replaced our ClientOrderNo with its own.
 
     If that is ambiguous it refuses rather than guesses, because the next
     thing done with this row is to cancel it.
@@ -281,6 +328,11 @@ def _find_ours(captured: Dict[str, Any], token: str,
     rows = _rows_on(captured, token)
     if not rows:
         return None, "the order never appeared in the book"
+    if client_order_no is not None:
+        for row in rows:
+            echoed = _first(row, _IDENTITY_KEYS)
+            if echoed is not None and str(echoed).strip() == str(client_order_no):
+                return row, None
     if before is None:
         return rows[-1], None
 
@@ -311,7 +363,15 @@ def _report(record: Dict[str, Any], info, qty: int, path: str) -> None:
     print("  WHAT WE LEARNED")
     print("  " + "-" * 68)
 
-    if not ours:
+    if not ours and record.get("place_order", {}).get("ok") \
+            and record.get("reply_order_no") is None:
+        print("  The broker answered Success without an order number, and the")
+        print("  order never appeared in the book. On 28 Sep that meant the")
+        print("  broker had not created it. Check the terminal, and if it is not")
+        print("  there, quote this to Choice:")
+        print(f"    client order no {record.get('client_order_no')}, "
+              f"sent {record.get('when')}")
+    elif not ours:
         print("  The order never appeared in the order book, so the field names")
         print("  are still unknown. Check the response above and the broker")
         print("  terminal before drawing any conclusion.")

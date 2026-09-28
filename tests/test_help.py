@@ -150,6 +150,18 @@ class TestItStillDescribesTheRealSystem(unittest.TestCase):
             self.assertIn(f'_set_source("{name}")', source, name)
             self.assertIn(name, self.text())
 
+    def test_going_live_is_still_refused_on_a_server_that_swallows_orders(self):
+        """The guide tells the operator to log in on finxomne and that Go
+        live stays refused otherwise. That rests on the Go Live check."""
+        import inspect
+
+        from rollover import livemode
+
+        self.assertIn("log in on finxomne", self.text())
+        self.assertIn("go live stays refused", self.text())
+        source = inspect.getsource(livemode.preflight)
+        self.assertIn('"orders reach the exchange", verdict is True', source)
+
     def test_a_held_price_still_cannot_be_traded(self):
         """The guide promises the freshness limit still applies to prices
         held through an outage. That promise rests on the held quote being

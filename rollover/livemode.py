@@ -70,6 +70,16 @@ def preflight(cfg, engine=None, feed_healthy: Optional[bool] = None) -> List[Che
                         "signed in to Choice" if logged_in else
                         "not signed in, so nothing can be sent"))
 
+    # Signed in is not the same as able to place orders. On 28 Sep the finx
+    # server answered every order with "Success" and created none of them.
+    route = getattr(broker, "order_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        route = (None, "the server's order handling has not been checked")
+    verdict, why = route
+    checks.append(Check(
+        "orders reach the exchange", verdict is True,
+        why if verdict is not None else f"not known yet: {why}"))
+
     session = getattr(engine, "session", None)
     halted = bool(getattr(session, "halted_reason", None))
     checks.append(Check(
