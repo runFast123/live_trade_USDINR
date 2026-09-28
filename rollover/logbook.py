@@ -7,10 +7,36 @@ record of what the app saw and what it did.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections import deque
 from datetime import datetime
 from typing import Deque, List, Tuple
+
+_HTML_START = re.compile(r"<!doctype html|<html\b|<head\b|<body\b|<title>", re.I)
+_TITLE = re.compile(r"<title[^>]*>\s*(.*?)\s*</title>", re.I | re.S)
+_HEADING = re.compile(r"<h1[^>]*>\s*(.*?)\s*</h1>", re.I | re.S)
+
+
+def without_html(message: str) -> str:
+    """A broker error page, reduced to the words on it.
+
+    The vendor client puts the whole response body into its exceptions, and
+    when one of Choice's gateways fails the body is an HTML page. Fifteen of
+    them on 28 Sep wrote their stylesheets into this file and into the log
+    pane, where they pushed the lines that mattered out of view. What came
+    before the page -- the call, the status code, the URL -- is kept.
+    """
+    found = _HTML_START.search(message)
+    if not found:
+        return message
+    page = message[found.start():]
+    head = " ".join(message[:found.start()].split())
+    head = re.sub(r"\s*Response:\s*$", "", head)
+    words = [m.group(1).strip() for m in (_TITLE.search(page),
+                                          _HEADING.search(page)) if m]
+    said = "; ".join(w for w in words if w) or "nothing readable on it"
+    return f"{head} [the broker sent an HTML error page: {said}]".strip()
 
 
 class Logbook:
@@ -30,6 +56,7 @@ class Logbook:
         self._last_alert = ""
 
     def _write(self, level: str, message: str) -> None:
+        message = without_html(str(message))
         stamp = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         line = f"{stamp} [{level:5}] {message}"
         with self._lock:
