@@ -449,7 +449,7 @@ class RollWindow(tk.Toplevel):
         stats.pack(side="left", padx=T.PAD_M)
         self.stat_labels = {}
         for i, (key, caption) in enumerate((("worst", "WORST CASE"),
-                                            ("qty", "QTY"),
+                                            ("qty", "CLIP SIZE"),
                                             ("sell", "SELL LIMIT"),
                                             ("buy", "BUY LIMIT"))):
             cell = tk.Frame(stats, bg=T.SURFACE)
@@ -1241,7 +1241,7 @@ class RollWindow(tk.Toplevel):
         # ---- what it would trade ------------------------------------------
         size_row = tk.Frame(inner, bg=T.SURFACE)
         size_row.pack(fill="x")
-        tk.Label(size_row, text="QTY", bg=T.SURFACE, fg=T.FAINT,
+        tk.Label(size_row, text="UNITS (1000 = 1 lot)", bg=T.SURFACE, fg=T.FAINT,
                  font=self.fonts.label).pack(side="left")
         row["qty_box"] = T.entry(size_row, self.fonts, textvariable=row["qty"],
                                  width=8)
@@ -1503,9 +1503,10 @@ class RollWindow(tk.Toplevel):
 
         if total:
             left = max(0, total - done)
+            clip_lots = self.cfg.clip_qty // lot_size if lot_size else 0
             self.ladder_total.configure(
                 text=f"{done:,} of {total:,} rolled, {left:,} left"
-                     f"   clip {self.cfg.clip_qty:,}")
+                     f"   clip {self.cfg.clip_qty:,} ({clip_lots} lot{'s' if clip_lots != 1 else ''})")
         elif self.rung_rows:
             self.ladder_total.configure(text="no quantity set to trade")
         else:
@@ -2215,10 +2216,13 @@ class RollWindow(tk.Toplevel):
         self.stat_labels["worst"].configure(text=money(dec.worst_case))
         self.stat_labels["sell"].configure(text=money(dec.sell_limit))
         self.stat_labels["buy"].configure(text=money(dec.buy_limit))
-        # Zero means no clip is sized, which reads as a broken number rather
-        # than as "nothing is being sent".
-        self.stat_labels["qty"].configure(
-            text=f"{dec.qty:,}" if dec.qty else "--")
+        if dec.qty:
+            lot_size = getattr(self.cfg, "expected_lot_size", 1000) or 1000
+            lots = dec.qty // lot_size
+            qty_text = f"{lots} lot{'s' if lots != 1 else ''} ({dec.qty:,} u)" if lots else f"{dec.qty:,} u"
+        else:
+            qty_text = "--"
+        self.stat_labels["qty"].configure(text=qty_text)
 
         if ready:
             self.verdict.configure(text="READY", fg=T.SUCCESS)

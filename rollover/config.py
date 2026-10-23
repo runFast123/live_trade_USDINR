@@ -161,7 +161,7 @@ class RollConfig:
     # book report in CONTRACTS / LOTS. When true, an order for N units sends
     # N // lot_size to the broker, and fills reported in lots are scaled back to
     # units so internal tracking, reconciliation, and ladders compare like with like.
-    order_in_lots: bool = False
+    order_in_lots: bool = True
 
     max_leg_spread: str = "0.0500"       # reject a leg whose own bid/ask spread is wider
     price_band_low: str = "70"           # a USDINR price outside this band is bad data

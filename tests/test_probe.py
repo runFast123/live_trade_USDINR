@@ -74,7 +74,8 @@ class TestItAsksFirst(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="probe_")
         self.cfg = RollConfig(near_token="1769", vendor_id="V",
-                              api_key="K", mobile_no="9")
+                              api_key="K", mobile_no="9",
+                              order_in_lots=False)
         self.sent = []
 
     def tearDown(self):

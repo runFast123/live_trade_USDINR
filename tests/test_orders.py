@@ -85,6 +85,7 @@ def order_row(token="1769", side="2", filled=1000, status="Complete", ref="A1",
 def broker_with(orders, **cfg_kw):
     cfg_kw.setdefault("dry_run", False)
     cfg_kw.setdefault("fill_timeout_sec", 0.4)
+    cfg_kw.setdefault("order_in_lots", False)
     cfg = RollConfig(**cfg_kw)
     log = StubLog()
     b = Broker(cfg, log)

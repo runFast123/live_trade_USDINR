@@ -247,7 +247,7 @@ class Orders:
 
 class TestPlacingALeg(unittest.TestCase):
     def broker(self, orders):
-        b = Broker(RollConfig(dry_run=False, fill_timeout_sec=0.3), Log())
+        b = Broker(RollConfig(dry_run=False, fill_timeout_sec=0.3, order_in_lots=False), Log())
         b.client = type("Client", (), {"orders": orders})()
         return b
 
