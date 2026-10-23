@@ -155,10 +155,13 @@ class RollConfig:
     # sizes were not. Set false only if the feed ever starts reporting units.
     depth_in_lots: bool = True
     # The position book (get_net_position) is reported in CONTRACTS / LOTS;
-    # an order quantity is in units of the underlying. Multiplied by the lot
-    # size so that position checks and post-trade reconciliation compare like
-    # with like.
+    # multiplied by the lot size so that position checks return underlying units.
     position_in_lots: bool = True
+    # The order placement API (place_order), order book (TradedQty), and trade
+    # book report in CONTRACTS / LOTS. When true, an order for N units sends
+    # N // lot_size to the broker, and fills reported in lots are scaled back to
+    # units so internal tracking, reconciliation, and ladders compare like with like.
+    order_in_lots: bool = False
 
     max_leg_spread: str = "0.0500"       # reject a leg whose own bid/ask spread is wider
     price_band_low: str = "70"           # a USDINR price outside this band is bad data

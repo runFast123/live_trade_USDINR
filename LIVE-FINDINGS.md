@@ -775,3 +775,34 @@ Go Live, the probe refuses to send, and `--preflight` fails the "order route"
 line. If the read itself fails (finxomne answered 500s for ten minutes that
 afternoon), the verdict is unknown, which also refuses Go Live, and the watch
 loop asks again every 15 seconds until it has an answer.
+
+---
+
+## 23 October 2026: The First Live Execution & Order Sizing Resolution
+
+At 14:48 IST on 23 October 2026, the first live roll trade was executed on the live account:
+- **Leg 1 (Near - Oct 28 FUT, Token 1284):** SOLD 20 lots at 94.9500 (`ExchangeOrderNo: 1000000000524356`).
+- **Leg 2 (Far - Nov 26 FUT, Token 1584):** BOUGHT 20 lots at 95.4100 (`ExchangeOrderNo: 1000000000524397`).
+- **Executed Spread:** ₹0.4600 carry cost = **48.4 bps**. Both legs matched 100% with zero unhedged residual.
+- **Account Holdings:** October long reduced from 4,000 to 3,980 lots; November long increased from 4,000 to 4,020 lots.
+
+### The Finding: Choice Broking API Sizing Law
+
+Prior to this execution, the system assumed `orders.place_order(qty=...)` expected underlying units (1,000 units = 1 lot). The live test revealed the broker API's exact contract:
+1. `orders.place_order(qty=...)` expects **LOTS** (contracts). Passing `qty=1000` sent an order for 1,000 lots!
+2. `orders.get_order_book()` reports `Qty` and `FilledQty` in **LOTS**.
+3. `orders.get_trade_book()` reports `Qty` in **LOTS**.
+4. `orders.cancel_order(qty=...)` expects **LOTS**.
+5. `portfolio.get_net_position()` reports `NetQty` in **LOTS**.
+
+Because 20 lots filled in Leg 1 before the remainder was cancelled, Leg 2 sized its hedge to the fill number (20), sending `qty=20` to the broker which bought 20 lots of November, producing an exact 20-lot hedge. However, post-trade reconciliation halted because it expected a drop of 20 units (not 20 lots / 20,000 units).
+
+### The Solution: `order_in_lots: true`
+
+Added `order_in_lots: bool = True` in production configurations (`config.json`, `dist/config.json`):
+- Outgoing orders: `place_leg` converts underlying units to broker lots (`qty // lot_size`). E.g., configured clip of 1,000 units sends `qty: 1` (1 lot).
+- Incoming fills: `read_fill` scales broker lots back to units (`FilledQty * lot_size`).
+- Incoming trades: `traded_since` scales broker trade lots back to units (`Qty * lot_size`).
+- Reconciler: expects position changes matching unit amounts (e.g., 1,000 units for 1 lot).
+- Internal domain (ladder, quotes, risk gates, UI) continues operating strictly and consistently in units.
+

@@ -132,9 +132,9 @@ def run(cfg, log, base_dir: str, token: Optional[str] = None,
 
     lot = int(getattr(info, "lot_size", 0) or 0)
     if qty is None:
-        qty = lot or 1
-        print(f"  Quantity not given, so one lot of {info.sec_desc}: {qty:,} "
-              "units.")
+        qty = 1 if getattr(cfg, "order_in_lots", False) else (lot or 1)
+        unit_word = "lot(s)" if getattr(cfg, "order_in_lots", False) else "units"
+        print(f"  Quantity not given, so one lot of {info.sec_desc}: {qty:,} {unit_word}.")
     elif lot > 1 and qty % lot:
         # Choice's own words: "any order where Qty is not divisible by 1000
         # will be rejected with an Invalid Order Quantity error". Worth

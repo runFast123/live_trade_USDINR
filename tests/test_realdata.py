@@ -498,5 +498,83 @@ class TestNetPositionShape(unittest.TestCase):
         self.assertEqual(self.broker(payload).long_qty("1769"), 0)
 
 
+class TestOrderInLots(unittest.TestCase):
+    """Choice Broking API takes order placement, trade books, and fills in LOTS (contracts).
+    When order_in_lots=True, outgoing orders convert units to lots and incoming fills/trades
+    scale lots back to units so internal accounting and reconciliation stay strictly in units."""
+
+    def broker(self, order_in_lots=True):
+        class StubLog:
+            def info(self, m): pass
+            def warn(self, m): pass
+            def error(self, m): pass
+            def alert(self, m): pass
+
+        cfg = RollConfig(order_in_lots=order_in_lots, expected_lot_size=1000, dry_run=False)
+        b = Broker(cfg, StubLog())
+        return b
+
+    def test_order_qty_conversion(self):
+        b_false = self.broker(order_in_lots=False)
+        self.assertEqual(b_false._order_qty_for("1769", 1000), 1000)
+        self.assertEqual(b_false._order_qty_for("1769", 20000), 20000)
+
+        b_true = self.broker(order_in_lots=True)
+        self.assertEqual(b_true._order_qty_for("1769", 1000), 1)
+        self.assertEqual(b_true._order_qty_for("1769", 20000), 20)
+
+    def test_place_leg_sends_lots_when_enabled(self):
+        placed = []
+
+        class StubOrders:
+            def __init__(self):
+                self.calls = 0
+
+            def place_order(self, **kw):
+                placed.append(kw)
+                return {"Status": "Success"}
+
+            def get_order_book(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"Response": []}
+                return {"Response": [{
+                    "Token": "1769", "BS": "2", "GatewayOrderNo": "O1",
+                    "ExchangeOrderNo": "E1", "ClientOrderNo": "C1",
+                    "FilledQty": 1, "OrderStatus": "Complete"
+                }]}
+
+        class StubClient:
+            orders = StubOrders()
+
+        from rollover.broker import SELL
+        b = self.broker(order_in_lots=True)
+        b.client = StubClient()
+        inst = real_instrument("1769", "USDINR26SEPFUT", "28SEP26", "930800000", "988350000")
+        out = b.place_leg(inst, SELL, 1000, D("95.9400"), "leg 1")
+
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0]["qty"], 1)  # Sent 1 lot, not 1000 units
+        self.assertEqual(out.filled_qty, 1000)  # Read back scaled to 1000 units
+
+    def test_traded_since_scales_lots_to_units(self):
+        class StubOrders:
+            def get_trade_book(self):
+                return {"Response": [{
+                    "TradeNo": "T1", "Token": "1769", "BS": "2", "Qty": 20
+                }]}
+
+        class StubClient:
+            orders = StubOrders()
+
+        from rollover.broker import SELL
+        b = self.broker(order_in_lots=True)
+        b.client = StubClient()
+        total, detail = b.traded_since(set(), "1769", SELL)
+        self.assertIn("1 new trade(s) totalling 20000", detail)
+        self.assertEqual(total, 20000)  # 20 lots * 1000 lot_size = 20,000 units
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

@@ -75,8 +75,9 @@ def _leg_order_check(report: Report, broker: Broker, info, side: int,
     label = f"{role} leg ({word} {info.label()})"
 
     if lot and qty % lot == 0:
+        lots = qty // lot
         report.add(PASS, f"{label} quantity",
-                   f"{qty:,} units = {qty // lot} lot(s) of {lot:,}")
+                   f"{qty:,} units = {lots} lot(s) of {lot:,} (sent as qty {lots})")
     elif lot:
         report.add(FAIL, f"{label} quantity",
                    f"{qty:,} units is not a whole multiple of the lot {lot:,}; "

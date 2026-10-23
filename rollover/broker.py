@@ -990,10 +990,7 @@ class Broker:
         return str(normal["Status"]).strip() == self.OPEN_STATUS
 
     def _lot_size_for(self, token: str) -> int:
-        """Units in one contract for this token, so positions reported in lots
-        can be converted to units of the underlying."""
-        if not getattr(self.cfg, "position_in_lots", True):
-            return 1
+        """Units in one contract for this token."""
         try:
             info = self.instrument(token)
             lot = int(getattr(info, "lot_size", 0) or 0)
@@ -1002,6 +999,15 @@ class Broker:
         except Exception:
             pass
         return int(getattr(self.cfg, "expected_lot_size", 1000) or 1000)
+
+    def _order_qty_for(self, token: str, qty_units: int) -> int:
+        """The quantity to pass to the broker API. If orders are placed in lots,
+        converts underlying units to lots."""
+        if getattr(self.cfg, "order_in_lots", False):
+            lot = self._lot_size_for(token)
+            if lot > 0 and qty_units >= lot:
+                return qty_units // lot
+        return qty_units
 
     # -------------------------------------------------------------- positions
     def long_qty(self, token: str) -> Optional[int]:
@@ -1013,7 +1019,7 @@ class Broker:
             return None
 
         token = str(token).strip()
-        lot = self._lot_size_for(token)
+        lot = self._lot_size_for(token) if getattr(self.cfg, "position_in_lots", True) else 1
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
@@ -1053,7 +1059,7 @@ class Broker:
             return None
 
         token = str(token).strip()
-        lot = self._lot_size_for(token)
+        lot = self._lot_size_for(token) if getattr(self.cfg, "position_in_lots", True) else 1
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
@@ -1123,6 +1129,7 @@ class Broker:
             return None, f"the trade book refused: {problem}"
 
         token = str(token).strip()
+        lot = self._lot_size_for(token) if getattr(self.cfg, "order_in_lots", False) else 1
         total = 0
         counted = 0
         for record in _iter_records(resp):
@@ -1138,7 +1145,7 @@ class Broker:
             if qty is None:
                 return None, ("a new trade on this contract has no readable "
                               f"quantity; fields were {sorted(str(k) for k in record)}")
-            total += qty
+            total += qty * lot
             counted += 1
 
         return total, (f"{counted} new trade(s) totalling {total}" if counted
@@ -1279,7 +1286,8 @@ class Broker:
             best = record
         return best
 
-    def read_fill(self, record: Dict[str, Any], requested: int) -> Tuple[Optional[int], str]:
+    def read_fill(self, record: Dict[str, Any], requested: int,
+                  lot: int = 1) -> Tuple[Optional[int], str]:
         """Filled quantity and a human status, or (None, reason) when unreadable."""
         status_raw = _first(record, _STATUS_KEYS)
         status = re.sub(r"[^a-z]", "", str(status_raw).lower()) if status_raw else ""
@@ -1293,6 +1301,8 @@ class Broker:
 
         filled = _as_int(_first(record, _FILLED_KEYS))
         if filled is not None:
+            if getattr(self.cfg, "order_in_lots", False) and lot > 1:
+                filled = filled * lot
             return filled, spoken or "unknown status"
 
         if not any(word in status for word in _PARTIAL_WORDS):
@@ -1338,9 +1348,11 @@ class Broker:
         that could not be confirmed.
         """
         token = info.token
+        lot = self._lot_size_for(token)
         units = self.exchange_price(info, limit_price)
         side_word = "SELL" if side == SELL else "BUY"
-        summary = (f"{label}: {side_word} {qty} of {info.label()} "
+        order_qty = self._order_qty_for(token, qty)
+        summary = (f"{label}: {side_word} {qty} units ({order_qty} lot(s)) of {info.label()} "
                    f"at {money(limit_price)} (sent as {units})")
 
         if self.cfg.dry_run:
@@ -1352,7 +1364,7 @@ class Broker:
         number = next_client_order_no()
         self.log.info(f"Sending {summary}, client order no {number}")
         try:
-            resp, number = send_order(self.client, self.cfg, token, side, qty,
+            resp, number = send_order(self.client, self.cfg, token, side, order_qty,
                                       units, client_order_no=number)
         except Exception as exc:
             return OrderOutcome(sent=False, filled_qty=0, requested_qty=qty,
@@ -1377,7 +1389,7 @@ class Broker:
         while time.monotonic() < deadline:
             record = self._find_order(token, side, before, client_order_no=number)
             if record is not None:
-                filled, status = self.read_fill(record, qty)
+                filled, status = self.read_fill(record, qty, lot=lot)
                 if filled is not None and filled >= qty:
                     break
                 # Rejected or cancelled: nothing more is going to happen, and
@@ -1465,12 +1477,13 @@ class Broker:
         deadline = time.monotonic() + wait
         last: Optional[int] = None
         last_status = "the order could not be found after cancelling"
+        lot = self._lot_size_for(token)
 
         while time.monotonic() < deadline:
             record = self._find_order(token, side, before,
                                       client_order_no=client_order_no)
             if record is not None:
-                value, status = self.read_fill(record, qty)
+                value, status = self.read_fill(record, qty, lot=lot)
                 if value is not None:
                     last, last_status = value, status
                     if is_terminal(record) or value >= qty:
@@ -1504,7 +1517,8 @@ class Broker:
                 "It should not be able to rest. Check the terminal now.")
             return False
 
-        self.log.warn(f"{label}: cancelling the unfilled {remainder} units")
+        api_qty = self._order_qty_for(info.token, remainder)
+        self.log.warn(f"{label}: cancelling the unfilled {remainder} units ({api_qty} lot(s))")
         try:
             resp = self.client.orders.cancel_order(
                 client_order_no=_as_int(_first(record, ("ClientOrderNo",))) or 0,
@@ -1514,7 +1528,7 @@ class Broker:
                 token=int(info.token),
                 order_type=self.cfg.order_type,
                 bs=side,
-                qty=remainder,
+                qty=api_qty,
                 price=int(units),
                 trigger_price=0,
                 validity=self.cfg.validity,
@@ -1532,3 +1546,4 @@ class Broker:
             self.log.error(f"{label}: CANCEL FAILED ({exc}). A working order may still "
                            "be live at the exchange -- check the terminal now.")
             return False
+
