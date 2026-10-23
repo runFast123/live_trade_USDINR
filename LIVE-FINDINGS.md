@@ -427,15 +427,28 @@ can roll anything. A 100 lot holding read as 100 units would refuse to trade;
 100,000 units read as 100,000 lots would try to roll a thousand times too
 much.
 
-There is no evidence to settle it either way, because this account holds
-nothing. So the app now settles it by itself: a **position unit** gate refuses
-when the reported holding is not a whole multiple of the lot size. A position
-is always whole lots -- an exchange cannot fill a part contract -- so a figure
-that is not is a figure in the wrong unit. It names both readings and blocks
-until the operator confirms.
+There was initially no evidence to settle it either way, because the test
+account held nothing.
 
-Same arithmetic that settled the depth question, applied to the one field
-still open.
+### Settled 23 October 2026: the position book reports in LOTS
+
+On 23 October 2026, the live account held 4,000 lots of October and 4,000 lots
+of November (40 lakh USD quantity each). The broker's `get_net_position` returned:
+
+```json
+{"Token": 1284, "BuyQty": 4000, "Qty": 4000}
+```
+
+The mathematical proof is in `get_funds_view`: `MarginUsed` reported
+`18,290,011.0` (Rs 1.83 Crore), which matches 8,000 contracts x ~Rs 2,286 margin.
+Had the figure been units (4 lots), margin used would have been only ~Rs 18,000.
+
+**The position book reports in LOTS / CONTRACTS, not in units.**
+
+`position_in_lots` (default true) now scales reported positions by `MarketLot`
+in `broker.py` so that `long_qty` and `net_qty` return underlying units
+(4,000,000 units), matching order placement and allowing post-trade
+reconciliation to compare like with like without halting.
 
 ---
 

@@ -196,8 +196,12 @@ def run(cfg, log, base_dir: str) -> int:
         report.add(PASS, "near leg",
                    f"long {held:,} units = {held / lot:g} lot(s)")
     far_held = broker.net_qty(cfg.far_token)
-    report.add(INFO, "far leg",
-               "unknown" if far_held is None else f"net {far_held:,} units")
+    far_lot = legs["far"].lot_size or 1
+    if far_held is None:
+        report.add(INFO, "far leg", "unknown")
+    else:
+        report.add(INFO, "far leg",
+                   f"net {far_held:,} units = {far_held / far_lot:g} lot(s)")
 
     # ---- books -----------------------------------------------------------
     report.section("Order and trade books")

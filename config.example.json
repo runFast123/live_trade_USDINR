@@ -46,6 +46,7 @@
   "tenor_tolerance_days": 10,
   "quantity_unit_confirmed": false,
   "depth_in_lots": true,
+  "position_in_lots": true,
   "require_margin": true,
   "reconcile_wait_sec": 6.0,
   "max_clips_per_day_account": null,

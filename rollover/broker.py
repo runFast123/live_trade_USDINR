@@ -989,6 +989,20 @@ class Broker:
         # a status we can read but do not recognise must not let a trade through.
         return str(normal["Status"]).strip() == self.OPEN_STATUS
 
+    def _lot_size_for(self, token: str) -> int:
+        """Units in one contract for this token, so positions reported in lots
+        can be converted to units of the underlying."""
+        if not getattr(self.cfg, "position_in_lots", True):
+            return 1
+        try:
+            info = self.instrument(token)
+            lot = int(getattr(info, "lot_size", 0) or 0)
+            if lot > 0:
+                return lot
+        except Exception:
+            pass
+        return int(getattr(self.cfg, "expected_lot_size", 1000) or 1000)
+
     # -------------------------------------------------------------- positions
     def long_qty(self, token: str) -> Optional[int]:
         """Net long units held in one contract, or None when it cannot be read."""
@@ -999,6 +1013,7 @@ class Broker:
             return None
 
         token = str(token).strip()
+        lot = self._lot_size_for(token)
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
@@ -1008,12 +1023,16 @@ class Broker:
             if net is not None:
                 value = _as_int(net)
                 if value is not None:
-                    return max(value, 0)
+                    return max(value, 0) * lot
 
             buy = _as_int(_first(record, ("BuyQty", "BuyQuantity", "TotalBuyQty")) or 0)
             sell = _as_int(_first(record, ("SellQty", "SellQuantity", "TotalSellQty")) or 0)
             if buy is not None and sell is not None:
-                return max(buy - sell, 0)
+                return max(buy - sell, 0) * lot
+
+            qty = _as_int(_first(record, ("Qty", "Quantity")))
+            if qty is not None:
+                return max(qty, 0) * lot
             return None
         return 0  # the position book was readable and this contract is not in it
 
@@ -1034,6 +1053,7 @@ class Broker:
             return None
 
         token = str(token).strip()
+        lot = self._lot_size_for(token)
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
@@ -1041,12 +1061,18 @@ class Broker:
 
             net = _first(record, _NET_QTY_KEYS)
             if net is not None:
-                return _as_int(net)
+                raw = _as_int(net)
+                if raw is not None:
+                    return raw * lot
 
             buy = _as_int(_first(record, ("BuyQty", "BuyQuantity", "TotalBuyQty")) or 0)
             sell = _as_int(_first(record, ("SellQty", "SellQuantity", "TotalSellQty")) or 0)
             if buy is not None and sell is not None:
-                return buy - sell
+                return (buy - sell) * lot
+
+            qty = _as_int(_first(record, ("Qty", "Quantity")))
+            if qty is not None:
+                return qty * lot
             return None
         return 0  # readable, and this contract is simply not held
 

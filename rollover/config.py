@@ -154,6 +154,11 @@ class RollConfig:
     # price must be a multiple of it too -- and 11,092 of 11,272 observed
     # sizes were not. Set false only if the feed ever starts reporting units.
     depth_in_lots: bool = True
+    # The position book (get_net_position) is reported in CONTRACTS / LOTS;
+    # an order quantity is in units of the underlying. Multiplied by the lot
+    # size so that position checks and post-trade reconciliation compare like
+    # with like.
+    position_in_lots: bool = True
 
     max_leg_spread: str = "0.0500"       # reject a leg whose own bid/ask spread is wider
     price_band_low: str = "70"           # a USDINR price outside this band is bad data

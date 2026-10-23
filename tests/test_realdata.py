@@ -465,7 +465,7 @@ class TestMarketStatusShape(unittest.TestCase):
 class TestNetPositionShape(unittest.TestCase):
     """An account holding nothing returns an empty NetPositions list."""
 
-    def broker(self, payload):
+    def broker(self, payload, position_in_lots=True):
         class StubLog:
             def info(self, m): pass
             def warn(self, m): pass
@@ -477,7 +477,8 @@ class TestNetPositionShape(unittest.TestCase):
         class StubClient:
             portfolio = StubPortfolio()
 
-        b = Broker(RollConfig(), StubLog())
+        cfg = RollConfig(position_in_lots=position_in_lots)
+        b = Broker(cfg, StubLog())
         b.client = StubClient()
         return b
 
@@ -488,7 +489,8 @@ class TestNetPositionShape(unittest.TestCase):
     def test_a_held_contract_is_read(self):
         payload = {"Status": "Success", "Response": {"NetPositions": [
             {"Token": 1769, "NetQty": 2000, "SegmentId": 13}]}}
-        self.assertEqual(self.broker(payload).long_qty("1769"), 2000)
+        self.assertEqual(self.broker(payload, position_in_lots=False).long_qty("1769"), 2000)
+        self.assertEqual(self.broker(payload, position_in_lots=True).long_qty("1769"), 2000000)
 
     def test_a_short_position_does_not_count_as_long(self):
         payload = {"Status": "Success", "Response": {"NetPositions": [
