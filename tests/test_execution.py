@@ -227,7 +227,9 @@ class TestHappyPath(ExecutionCase):
         engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
         engine._execute(self.decision, self.near_q, self.far_q)
         self.assertEqual(self.broker.calls[0]["price"], self.decision.sell_limit)
-        self.assertEqual(self.broker.calls[1]["price"], self.decision.buy_limit)
+        # Leg 2 uses target-spread pricing bounded by the allowable limit spread
+        expected_far_buy = (self.decision.sell_limit + self.decision.limit).quantize(self.cfg.tick_d)
+        self.assertEqual(self.broker.calls[1]["price"], expected_far_buy)
 
     def test_in_flight_is_cleared_afterwards(self):
         engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
@@ -438,6 +440,29 @@ class TestNothingEscapesWithoutAHalt(ExecutionCase):
             self.Boom("x"))
         engine._execute(self.decision, self.near_q, self.far_q)
         self.assertEqual(engine.session.clips_done_today, 0)
+
+
+    def test_leg2_target_spread_pricing_near_first(self):
+        """When Near sells first, Far BUY can pay up to (Near price + limit spread)."""
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)], leg_order="near_first")
+        engine._execute(self.decision, self.near_q, self.far_q)
+        near_call, far_call = self.broker.calls
+        self.assertEqual(near_call["price"], self.decision.sell_limit)
+        expected_far_price = (near_call["price"] + self.decision.limit).quantize(self.cfg.tick_d)
+        self.assertEqual(far_call["price"], expected_far_price)
+        # Ensure the implied worst-case roll cost never exceeds the limit
+        self.assertLessEqual(far_call["price"] - near_call["price"], self.decision.limit)
+
+    def test_leg2_target_spread_pricing_far_first(self):
+        """When Far buys first, Near SELL can sell down to (Far price - limit spread)."""
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)], leg_order="far_first")
+        engine._execute(self.decision, self.near_q, self.far_q)
+        far_call, near_call = self.broker.calls
+        self.assertEqual(far_call["price"], self.decision.buy_limit)
+        expected_near_price = (far_call["price"] - self.decision.limit).quantize(self.cfg.tick_d)
+        self.assertEqual(near_call["price"], expected_near_price)
+        # Ensure the implied worst-case roll cost never exceeds the limit
+        self.assertLessEqual(far_call["price"] - near_call["price"], self.decision.limit)
 
 
 if __name__ == "__main__":

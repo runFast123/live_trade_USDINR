@@ -28,7 +28,7 @@ from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo
 from .config import RollConfig
 from .feed import LiveFeed
 from .logbook import Logbook
-from .money import ceil_tick, money
+from .money import ceil_tick, floor_tick, money
 from .quotes import Quote, QuoteError, QuoteReader
 from .recorder import Recorder
 from .state import StateStore
@@ -1453,6 +1453,24 @@ class RollEngine:
             second = _Leg("far", section.far, BUY, decision.buy_limit,
                           cfg.far_token)
 
+        # Target-spread leg 2 pricing:
+        # Whatever rate Leg 1 executed at, Leg 2 is priced dynamically
+        # using the allowed limit spread so that shallow touch depth or a
+        # 1-2 tick flicker never causes a partial fill or leg-cancellation halt.
+        leg2_price = second.price
+        if getattr(decision, "limit", None):
+            leg1_price = first.price
+            if second.side == BUY:
+                # Near sold first at leg1_price. Far BUY can pay up to (Near price + limit spread).
+                max_buy = floor_tick(leg1_price + decision.limit, cfg.tick_d)
+                if max_buy > leg2_price:
+                    leg2_price = max_buy
+            else:
+                # Far bought first at leg1_price. Near SELL can sell down to (Far price - limit spread).
+                min_sell = ceil_tick(leg1_price - decision.limit, cfg.tick_d)
+                if min_sell < leg2_price:
+                    leg2_price = min_sell
+
         try:
             self._set_state(WORKING, f"{section.label()}: sending the {first.role} leg")
             leg1 = self.broker.place_leg(first.info, first.side, decision.qty,
@@ -1466,7 +1484,7 @@ class RollEngine:
                 self.log.info(
                     f"DRY RUN, not sent -- leg 2 {second.role} "
                     f"{'BUY' if second.side == BUY else 'SELL'} {decision.qty} "
-                    f"of {second.info.token} at {money(second.price)}")
+                    f"of {second.info.token} at {money(leg2_price)}")
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
                 self._count_clip(decision.qty, section)
                 self._credit_rung(decision, decision.qty, section)
@@ -1491,12 +1509,12 @@ class RollEngine:
             # avoid.
             self._set_state(WORKING, f"{section.label()}: sending the {second.role} leg")
             leg2 = self.broker.place_leg(second.info, second.side,
-                                         leg1.filled_qty, second.price,
+                                         leg1.filled_qty, leg2_price,
                                          f"leg 2 {second.role} "
                                          f"{'BUY' if second.side == BUY else 'SELL'}")
             self.log.info(f"leg 2 result: {leg2.detail}")
             journal.order(second.role, second.side, second.token,
-                               leg1.filled_qty, second.price, leg2)
+                               leg1.filled_qty, leg2_price, leg2)
 
             if leg2.fully_filled:
                 near_leg = leg1 if first.role == "near" else leg2
