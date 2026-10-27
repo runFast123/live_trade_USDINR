@@ -22,6 +22,7 @@ from . import reconcile
 from . import sections as sectionlib
 from . import sequencing
 from . import limits as limitlib
+from . import notify
 from . import rule
 from .broker import BUY, SELL, Broker, BrokerError, InstrumentInfo
 from .config import RollConfig
@@ -132,6 +133,11 @@ class RollEngine:
         self.reader: Optional[QuoteReader] = None
         self.feed = LiveFeed(cfg, log)
         self.quote_source = "starting"
+        notify.configure_telegram(
+            getattr(cfg, "telegram_bot_token", None),
+            getattr(cfg, "telegram_chat_id", None),
+            getattr(cfg, "telegram_alerts", True),
+        )
         # One recorder per section, built below. Sep into Oct and Sep into
         # Nov are different costs against different limits, so a single file
         # would produce a "closest approach" belonging to neither roll.
@@ -490,6 +496,11 @@ class RollEngine:
             self._state = HALTED
             self._note = reason
         self.log.alert(f"HALTED: {reason}")
+        notify.send_telegram(
+            f"🚨 <b>ROLLOVER SYSTEM HALTED</b>\n\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            "Please check Choice Broking terminal immediately."
+        )
         self.journal.halt(reason)
         self._persist()
 
@@ -678,11 +689,23 @@ class RollEngine:
         now_qualifying = bool(decision.qualifies)
         if now_qualifying and not self._was_qualifying:
             bps = decision.cost_bps
-            self.log.alert(
-                "The roll cost has come below the limit: "
-                + (f"{money(bps, 1)} bps against {money(decision.limit_bps, 1)}"
-                   if bps is not None and decision.limit_bps is not None
-                   else f"{money(decision.roll_cost)} against {money(decision.limit)}"))
+            cost_str = (f"{money(bps, 1)} bps against {money(decision.limit_bps, 1)}"
+                        if bps is not None and decision.limit_bps is not None
+                        else f"{money(decision.roll_cost)} against {money(decision.limit)}")
+            self.log.alert(f"The roll cost has come below the limit: {cost_str}")
+            sec_name = section.label() if section else "USDINR Rollover"
+            mode_str = "DRY RUN" if self.cfg.dry_run else "LIVE MODE"
+            msg = (
+                f"🔔 <b>USDINR ROLL OPPORTUNITY!</b>\n\n"
+                f"• <b>Campaign:</b> {sec_name}\n"
+                f"• <b>Roll Cost:</b> <b>{money(bps, 1)} bps</b> (carry ₹{money(decision.roll_cost)})\n"
+                f"• <b>Target Limit:</b> <b>{money(decision.limit_bps, 1)} bps</b> (carry ₹{money(decision.limit)})\n"
+                f"• <b>Near Bid:</b> {money(decision.sell_limit)}\n"
+                f"• <b>Far Ask:</b> {money(decision.buy_limit)}\n"
+                f"• <b>Engine Mode:</b> <code>{mode_str}</code>\n"
+                f"• <b>Status:</b> Qualified! Ready to roll."
+            )
+            notify.send_telegram(msg, is_opportunity=True)
         elif self._was_qualifying and not now_qualifying:
             self.log.info("The roll cost has gone back above the limit.")
         self._was_qualifying = now_qualifying
@@ -1508,6 +1531,22 @@ class RollEngine:
                     f"{near_leg.filled_qty} near, bought {far_leg.filled_qty} "
                     f"far, at a booked cost near {money(decision.roll_cost)} "
                     "per unit.")
+                lots_filled = near_leg.filled_qty // 1000
+                done_tot = section.ladder.done_total(section.ladder_progress) if section.ladder else near_leg.filled_qty
+                tot_qty = section.ladder.total_qty if section.ladder else near_leg.filled_qty
+                rem_qty = section.ladder.remaining_total(section.ladder_progress) if section.ladder else 0
+                near_tok = getattr(section.near, "token", "")
+                far_tok = getattr(section.far, "token", "")
+                exec_msg = (
+                    f"🟢 <b>ROLL EXECUTED! (LIVE ORDER)</b>\n\n"
+                    f"• <b>Campaign:</b> {section.label()}\n"
+                    f"• <b>Filled Size:</b> <b>{lots_filled} lot(s)</b> ({near_leg.filled_qty:,} units)\n"
+                    f"• <b>Near SELL:</b> {money(decision.sell_limit)} ({near_tok})\n"
+                    f"• <b>Far BUY:</b> {money(decision.buy_limit)} ({far_tok})\n"
+                    f"• <b>Booked Carry:</b> ₹{money(decision.roll_cost)} ({money(decision.cost_bps, 1)} bps)\n"
+                    f"• <b>Campaign Progress:</b> {done_tot:,} / {tot_qty:,} rolled ({rem_qty:,} left)"
+                )
+                notify.send_telegram(exec_msg)
                 journal.note(
                     "complete", "roll complete", section=section.label(),
                     near_filled=near_leg.filled_qty,

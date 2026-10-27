@@ -245,6 +245,11 @@ class RollConfig:
     record_interval_sec: float = 5.0
     alert_on_qualify: bool = True        # say something when the cost first clears
 
+    # --- telegram alerts ---------------------------------------------------
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    telegram_alerts: bool = True
+
     # --- updates -----------------------------------------------------------
     update_check: bool = True            # ask GitHub once at startup
     update_repo: str = "runFast123/live_trade_USDINR"

@@ -67,3 +67,66 @@ def for_level(level: str) -> None:
 
 def available() -> bool:
     return winsound is not None
+
+
+# ------------------------------------------------------------------ Telegram
+_telegram_cfg = {
+    "token": None,
+    "chat_id": None,
+    "enabled": False,
+}
+_last_opportunity_sent = 0.0
+
+
+def configure_telegram(token: str | None, chat_id: str | None, enabled: bool = True) -> None:
+    """Store Telegram bot credentials and enable state."""
+    _telegram_cfg["token"] = str(token).strip() if token else None
+    _telegram_cfg["chat_id"] = str(chat_id).strip() if chat_id else None
+    _telegram_cfg["enabled"] = bool(_telegram_cfg["token"] and _telegram_cfg["chat_id"] and enabled)
+
+
+def send_telegram(text: str, is_opportunity: bool = False, min_interval_sec: float = 45.0) -> None:
+    """Send a notification to Telegram in a background daemon thread.
+
+    Never blocks, never raises. Opportunity crossings are debounced to avoid spam.
+    """
+    if not _telegram_cfg.get("enabled"):
+        return
+    token = _telegram_cfg.get("token")
+    chat_id = _telegram_cfg.get("chat_id")
+    if not token or not chat_id:
+        return
+
+    global _last_opportunity_sent
+    import time
+    now = time.monotonic()
+    if is_opportunity:
+        if now - _last_opportunity_sent < min_interval_sec:
+            return
+        _last_opportunity_sent = now
+
+    def _post():
+        import json
+        import urllib.request
+        chat_ids = [c.strip() for c in str(chat_id).split(",") if c.strip()]
+        for cid in chat_ids:
+            try:
+                payload = json.dumps({
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    pass
+            except Exception:
+                pass
+
+    threading.Thread(target=_post, daemon=True).start()
+

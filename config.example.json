@@ -65,5 +65,8 @@
   "require_fresh_scrip": true,
   "require_touch_size": true,
   "alert_on_qualify": true,
+  "telegram_bot_token": null,
+  "telegram_chat_id": null,
+  "telegram_alerts": true,
   "update_repo": "runFast123/live_trade_USDINR"
 }
