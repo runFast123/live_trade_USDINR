@@ -1498,7 +1498,9 @@ class RollEngine:
                 self._count_clip(decision.qty, section)
                 self._credit_rung(decision, decision.qty, section)
                 if self.campaign_mode:
-                    rem_qty = section.ladder.remaining_total(section.ladder_progress) if section.ladder else 0
+                    rem_qty = (section.ladder.remaining_total(section.ladder_progress)
+                               if section.ladder
+                               else (section.near_position_qty or 0))
                     clips_left = self._account_clips_left()
                     can_continue = (rem_qty > 0) and (clips_left is None or clips_left > 0) and not self.halted_reason
                     if can_continue:
@@ -1601,7 +1603,9 @@ class RollEngine:
                 self._slow_refresh()
 
                 if self.campaign_mode:
-                    rem_qty = section.ladder.remaining_total(section.ladder_progress) if section.ladder else 0
+                    rem_qty = (section.ladder.remaining_total(section.ladder_progress)
+                               if section.ladder
+                               else (section.near_position_qty or 0))
                     clips_left = self._account_clips_left()
                     can_continue = (rem_qty > 0) and (clips_left is None or clips_left > 0) and not self.halted_reason
                     if can_continue:
