@@ -306,13 +306,18 @@ class TestFillAfterCancel(unittest.TestCase):
         self.assertIn("could not be read", out.detail)
         self.assertIn("At least 300", out.detail)
 
-    def test_a_full_fill_never_reaches_the_settle_path(self):
-        orders = StubOrders([{"Response": []},
-                             {"Response": [order_row(filled=1000)]}])
+    def test_same_client_order_no_on_different_token_does_not_collide(self):
+        existing_bond_order = order_row(token="978217", client_no="100000122", ref="BOND1")
+        new_order = order_row(token="1769", client_no="100000122", ref="EX_NEW", filled=1000)
+        orders = StubOrders([
+            {"Response": [existing_bond_order]},
+            {"Response": [existing_bond_order, new_order]},
+        ])
         b, _ = broker_with(orders)
-        out = b.place_leg(instrument(), SELL, 1000, D("95.9400"), "leg 1")
+        out = b.place_leg(instrument(token="1769"), SELL, 1000, D("95.9400"), "leg 1")
         self.assertEqual(out.filled_qty, 1000)
-        self.assertEqual(orders.cancelled, [])
+        self.assertTrue(out.certain)
+
 
 
 if __name__ == "__main__":

@@ -1235,7 +1235,7 @@ class Broker:
         return True
 
     # ----------------------------------------------------------------- orders
-    def _order_snapshot(self) -> set:
+    def _order_snapshot(self, target_token: Optional[str] = None) -> set:
         try:
             resp = self.client.orders.get_order_book()
         except Exception as exc:
@@ -1243,9 +1243,18 @@ class Broker:
             return set()
         refs = set()
         for record in _iter_records(resp):
+            rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
+            if target_token is not None and rec_token is not None:
+                if str(rec_token).strip() != str(target_token).strip():
+                    continue
             ref = order_identity(record)
             if ref is not None:
                 refs.add(ref)
+                if rec_token is not None:
+                    refs.add(f"{str(rec_token).strip()}:{ref}")
+            ex_no = _first(record, ("ExchangeOrderNo",))
+            if ex_no is not None and str(ex_no).strip():
+                refs.add(str(ex_no).strip())
         return refs
 
     def _find_order(self, token: str, side: int, known_before: set,
@@ -1266,6 +1275,7 @@ class Broker:
         token = str(token).strip()
         wanted = str(client_order_no) if client_order_no is not None else None
         best = None
+        has_scoped = any(":" in str(k) for k in known_before)
         for record in _iter_records(resp):
             rec_token = _first(record, ("Token", "ScripToken", "InstrumentToken"))
             if rec_token is None or str(rec_token).strip() != token:
@@ -1275,8 +1285,20 @@ class Broker:
                 if echoed is not None and str(echoed).strip() == wanted:
                     return record
             ref = order_identity(record)
-            if ref is None or ref in known_before:
+            if ref is None:
                 continue
+            # If record has an ExchangeOrderNo, check if it was known before.
+            ex_no = _first(record, ("ExchangeOrderNo",))
+            if ex_no is not None and str(ex_no).strip():
+                if str(ex_no).strip() in known_before:
+                    continue
+                # If ExchangeOrderNo is brand new, it is definitely our new order!
+            else:
+                # Before exchange acknowledges, fallback to client order identity
+                if f"{token}:{ref}" in known_before:
+                    continue
+                if not has_scoped and ref in known_before:
+                    continue
             rec_side = _first(record, ("BS", "BuySell", "TransactionType", "Side"))
             if rec_side is not None:
                 text = str(rec_side).strip().lower()
@@ -1360,7 +1382,8 @@ class Broker:
             return OrderOutcome(sent=False, filled_qty=0, requested_qty=qty,
                                 order_ref=None, certain=True, detail="dry run")
 
-        before = self._order_snapshot()
+        before = self._order_snapshot(token)
+        before_trades = self._trade_snapshot()
         number = next_client_order_no()
         self.log.info(f"Sending {summary}, client order no {number}")
         try:
@@ -1403,6 +1426,18 @@ class Broker:
         ref = str(_first(record, _ORDER_NO_KEYS)) if record else None
 
         if record is None:
+            # Fallback: check if the trade book confirms that the order filled
+            # despite order book lag or reference matching issues.
+            if before_trades is not None:
+                tr_qty, tr_detail = self.traded_since(before_trades, token, side)
+                if tr_qty is not None and tr_qty >= qty:
+                    self.log.info(
+                        f"{label}: order book reference lagged, but trade book "
+                        f"confirmed fill of {tr_qty} units.")
+                    return OrderOutcome(sent=True, filled_qty=tr_qty, requested_qty=qty,
+                                        order_ref=acknowledged, certain=True, raw=resp,
+                                        detail=f"filled {tr_qty} of {qty} (confirmed via trade book)")
+
             # Still uncertain, and so still a halt, either way. An answer with
             # no order number in it meant no order at all on 28 Sep, but that
             # is one observation; a leg that did reach the exchange and cannot
