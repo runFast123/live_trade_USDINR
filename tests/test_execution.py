@@ -465,5 +465,57 @@ class TestNothingEscapesWithoutAHalt(ExecutionCase):
         self.assertLessEqual(far_call["price"] - near_call["price"], self.decision.limit)
 
 
+    def test_arm_campaign_mode_sets_flag(self):
+        engine = self.build([])
+        engine.arm(campaign=True)
+        self.assertTrue(engine.campaign_mode)
+        self.assertTrue(engine.armed)
+        engine._publish(None, None, None, "test")
+        snap = engine.snapshot()
+        self.assertIsNotNone(snap)
+        self.assertTrue(snap.campaign_mode)
+
+        engine.disarm("test")
+        self.assertFalse(engine.campaign_mode)
+        self.assertFalse(engine.armed)
+
+    def test_campaign_mode_auto_rearms_if_budget_remaining(self):
+        """When ladder has remaining quantity, campaign_mode auto-rearms after roll complete."""
+        from decimal import Decimal
+        from rollover.ladder import Ladder, Rung
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine.arm(campaign=True)
+        section = engine.sections[0]
+        rung = Rung(Decimal("47.25"), 50000)
+        section.ladder = Ladder([rung])
+        section.ladder_progress = {rung.key: 10000}
+        views = section.ladder.evaluate(self.decision.roll_cost, Decimal("95.0000"), Decimal("95.0000"), section.ladder_progress)
+        self.decision.active_rung = views[0]
+
+        engine._execute(self.decision, self.near_q, self.far_q, section=section)
+        # After execute, since 50,000 - 10,000 - 1,000 = 39,000 > 0, engine must be auto-rearmed
+        self.assertTrue(engine.campaign_mode)
+        self.assertTrue(engine.armed)
+
+    def test_campaign_mode_disarms_when_budget_exhausted(self):
+        """When ladder finishes, campaign_mode automatically disarms."""
+        from decimal import Decimal
+        from rollover.ladder import Ladder, Rung
+        engine = self.build([outcome(1000, 1000), outcome(1000, 1000)])
+        engine.arm(campaign=True)
+        section = engine.sections[0]
+        rung = Rung(Decimal("47.25"), 1000)
+        section.ladder = Ladder([rung])
+        section.ladder_progress = {}
+        views = section.ladder.evaluate(self.decision.roll_cost, Decimal("95.0000"), Decimal("95.0000"), section.ladder_progress)
+        self.decision.active_rung = views[0]
+
+        engine._execute(self.decision, self.near_q, self.far_q, section=section)
+        # 1000 filled, 0 remaining -> must disarm cleanly
+        self.assertFalse(engine.campaign_mode)
+        self.assertFalse(engine.armed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

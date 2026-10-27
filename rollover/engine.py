@@ -99,6 +99,7 @@ class Snapshot:
     # in the engine, not worked out again in the window, so the row marked as
     # next and the section actually chosen cannot drift apart.
     next_key: Optional[str] = None
+    campaign_mode: bool = False
 
 
 class _Leg:
@@ -158,6 +159,7 @@ class RollEngine:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._armed_until: Optional[float] = None
+        self.campaign_mode: bool = False
         self._lock = threading.Lock()
         self._state = STARTING
         self._snapshot: Optional[Snapshot] = None
@@ -434,20 +436,14 @@ class RollEngine:
         self._stop.clear()
         self.start()
 
-    def arm(self) -> None:
-        """Allow the next qualifying quote to trade. Expires on its own.
+    def arm(self, campaign: bool = False) -> None:
+        """Allow qualifying quote(s) to trade.
 
-        With more than one section this is also where the allocation is
-        settled. The sections sell the same near month, so what each may roll
-        has to fit inside what is actually held -- and that is established
-        before anything is armed rather than discovered when the second order
-        is rejected.
+        If campaign is True, the engine will automatically re-arm for subsequent
+        clips until the campaign ladder is completely filled or the operator disarms.
+        If campaign is False, it arms for a single clip (or until arm_timeout_sec).
         """
         if not any(section.enabled for section in self.sections):
-            # It used to arm: the button went green, the countdown ran, and
-            # "ARMED across 0 section(s)" went in the log. An authorisation
-            # that cannot reach anything is worse than no authorisation,
-            # because it looks like one.
             self.log.alert(
                 "Cannot arm: no section is switched on, so nothing could "
                 "trade. Select one and press Enable.")
@@ -462,11 +458,13 @@ class RollEngine:
             if self.halted_reason:
                 self.log.warn("Cannot arm while halted.")
                 return
+            self.campaign_mode = bool(campaign)
             self._armed_until = time.monotonic() + self.cfg.arm_timeout_sec
 
         working = [s for s in self.sections if s.enabled]
+        mode_label = "CAMPAIGN MODE (Continuous Auto-Roll)" if self.campaign_mode else "SINGLE CLIP"
         self.log.info(
-            f"ARMED for {self.cfg.arm_timeout_sec}s across {len(working)} "
+            f"ARMED [{mode_label}] for {self.cfg.arm_timeout_sec}s across {len(working)} "
             f"section(s) "
             f"({'dry run, nothing will be sent' if self.cfg.dry_run else 'LIVE ORDERS'})"
         )
@@ -474,10 +472,15 @@ class RollEngine:
             if len(pool.claims) > 1:
                 self.log.info(f"  near {token}: {pool.describe()}")
 
+    def arm_campaign(self) -> None:
+        """Convenience method to arm in continuous campaign mode."""
+        self.arm(campaign=True)
+
     def disarm(self, reason: str = "operator") -> None:
         with self._lock:
-            was_armed = self._armed_until is not None
+            was_armed = self._armed_until is not None or self.campaign_mode
             self._armed_until = None
+            self.campaign_mode = False
         if was_armed:
             self.log.info(f"Disarmed ({reason}).")
 
@@ -489,6 +492,7 @@ class RollEngine:
         exposure is unknown.
         """
         with self._lock:
+            self.campaign_mode = False
             self.account.halted_reason = reason
             self.account.halted_at = (
                 datetime.now().astimezone().isoformat(timespec="seconds"))
@@ -1315,7 +1319,12 @@ class RollEngine:
                 self.log.info(line)
 
         section = chosen.payload
-        self.disarm("condition met, firing")
+        if not self.campaign_mode:
+            self.disarm("condition met, firing")
+        else:
+            with self._lock:
+                # Pause armed timer while order is in flight
+                self._armed_until = None
         near_q, far_q = section.quotes
         self._execute(section.decision, near_q, far_q, section=section,
                       sequence=section.sequence)
@@ -1488,6 +1497,18 @@ class RollEngine:
                 self.log.info("DRY RUN complete. No orders reached the exchange.")
                 self._count_clip(decision.qty, section)
                 self._credit_rung(decision, decision.qty, section)
+                if self.campaign_mode:
+                    rem_qty = section.ladder.remaining_total(section.ladder_progress) if section.ladder else 0
+                    clips_left = self._account_clips_left()
+                    can_continue = (rem_qty > 0) and (clips_left is None or clips_left > 0) and not self.halted_reason
+                    if can_continue:
+                        self.log.info(
+                            f"Campaign Mode (DRY RUN): clip completed. {rem_qty:,} units remaining. "
+                            f"Auto-rearming for next clip...")
+                        with self._lock:
+                            self._armed_until = time.monotonic() + self.cfg.arm_timeout_sec
+                    else:
+                        self.disarm("campaign complete")
                 return
 
             if not leg1.certain:
@@ -1501,6 +1522,9 @@ class RollEngine:
                 self.log.info(
                     f"The {first.role} leg did not fill and was cancelled. "
                     "No exposure changed. Back to watching.")
+                if self.campaign_mode and not self.halted_reason:
+                    with self._lock:
+                        self._armed_until = time.monotonic() + self.cfg.arm_timeout_sec
                 return
 
             # The second leg is sized from what the FIRST actually filled. Ask
@@ -1575,6 +1599,25 @@ class RollEngine:
                     clips_done=section.clips_done_today,
                     ladder_done=dict(section.ladder_progress))
                 self._slow_refresh()
+
+                if self.campaign_mode:
+                    rem_qty = section.ladder.remaining_total(section.ladder_progress) if section.ladder else 0
+                    clips_left = self._account_clips_left()
+                    can_continue = (rem_qty > 0) and (clips_left is None or clips_left > 0) and not self.halted_reason
+                    if can_continue:
+                        self.log.info(
+                            f"Campaign Mode: clip completed. {rem_qty:,} units remaining in campaign. "
+                            f"Auto-rearming for next clip...")
+                        with self._lock:
+                            self._armed_until = time.monotonic() + self.cfg.arm_timeout_sec
+                    else:
+                        reason = "campaign complete" if rem_qty <= 0 else "daily clip cap reached"
+                        self.log.info(f"Campaign Mode finished ({reason}). Disarming.")
+                        self.disarm(reason)
+                        if rem_qty <= 0:
+                            notify.send_telegram(
+                                f"🏁 <b>ROLLOVER CAMPAIGN COMPLETE!</b>\n\n"
+                                f"All {tot_qty:,} units successfully rolled.")
                 return
 
             short_by = leg1.filled_qty - leg2.filled_qty
@@ -1719,6 +1762,7 @@ class RollEngine:
             next_key=self._next_key,
             allocation=self._allocation_line(),
             allocation_refusal=self.allocation_refusal(),
+            campaign_mode=self.campaign_mode,
         )
         with self._lock:
             self._snapshot = snap

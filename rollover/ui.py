@@ -1519,12 +1519,16 @@ class RollWindow(tk.Toplevel):
         bar.pack(fill="x", pady=(0, self.gap))
         self.actions_bar = bar
 
-        self.arm_button = T.Button(bar, "ARM", self.engine.arm, self.fonts,
-                                   kind="success", width=170, height=42)
+        self.arm_button = T.Button(bar, "ARM (1 CLIP)", self.engine.arm, self.fonts,
+                                   kind="success", width=140, height=42)
         self.arm_button.pack(side="left")
 
+        self.arm_campaign_button = T.Button(bar, "ARM CAMPAIGN", self.engine.arm_campaign, self.fonts,
+                                            kind="success", width=160, height=42)
+        self.arm_campaign_button.pack(side="left", padx=T.PAD_S)
+
         T.Button(bar, "Disarm", lambda: self.engine.disarm("button"),
-                 self.fonts, width=120, height=42).pack(side="left", padx=T.PAD_S)
+                 self.fonts, width=100, height=42).pack(side="left", padx=T.PAD_S)
 
         self.halt_button = T.Button(bar, "Clear halt", self.engine.clear_halt,
                                     self.fonts, kind="warn", width=130, height=42)
@@ -2066,11 +2070,18 @@ class RollWindow(tk.Toplevel):
 
         if snap.armed_until:
             left = max(0, int(snap.armed_until - time.monotonic()))
-            self.arm_timer.configure(text=f"armed  {left}s" if left else "")
-            self.arm_button.set_text("ARMED")
+            if getattr(snap, "campaign_mode", False):
+                self.arm_timer.configure(text=f"CAMPAIGN AUTO  {left}s" if left else "CAMPAIGN AUTO")
+                self.arm_button.set_text("ARM (1 CLIP)")
+                self.arm_campaign_button.set_text("AUTO-ROLLING...")
+            else:
+                self.arm_timer.configure(text=f"armed  {left}s" if left else "")
+                self.arm_button.set_text("ARMED (1)")
+                self.arm_campaign_button.set_text("ARM CAMPAIGN")
         else:
             self.arm_timer.configure(text="")
-            self.arm_button.set_text("ARM")
+            self.arm_button.set_text("ARM (1 CLIP)")
+            self.arm_campaign_button.set_text("ARM CAMPAIGN")
 
     def _draw_price(self, key: str, value, delta_label, price) -> None:
         """Show a price, tinted for a moment whenever it moves.
